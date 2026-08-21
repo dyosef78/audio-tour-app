@@ -1,0 +1,244 @@
+import { AppState, type AppStateStatus } from 'react-native';
+
+import { AudioService } from '../services/audio/AudioService';
+import { TourBundleRepository } from '../services/bundle/TourBundleRepository';
+import {
+  LocationService,
+  registerBackgroundLocationTask,
+  stopOrphanedLocationUpdates,
+  type GeofenceEvent,
+} from '../services/location/LocationService';
+import { useTourSession } from './tourSessionStore';
+import type { LatLng } from '../types/domain';
+
+/**
+ * TourSessionController - the single owner of the running tour.
+ *
+ * The rule from the approved TASK-202 proposal: screens observe, they never own.
+ * This module holds the one LocationService and the one AudioService, and
+ * exposes exactly two lifecycle transitions. Nothing else may start or stop the
+ * GPS.
+ *
+ * Lifecycle decisions, per PM:
+ *   - The session survives navigating back to Discovery. It is not tied to any
+ *     component mount.
+ *   - A tour ends ONLY on an explicit endSession(). Reaching the final waypoint
+ *     sets a prompt flag and nothing more.
+ *   - On cold start, orphaned background tasks are stopped silently and never
+ *     resumed, so a killed app cannot leave a ghost draining battery.
+ */
+class TourSessionController {
+  private location: LocationService | null = null;
+  private readonly audio = new AudioService();
+  private appStateSub: { remove: () => void } | null = null;
+  /** Serialises start/end so overlapping calls cannot interleave teardown. */
+  private transition: Promise<void> = Promise.resolve();
+
+  // ---------------------------------------------------------------------------
+  // Cold start
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Call once at app entry, before any screen renders.
+   * Clears anything a previous process left running.
+   */
+  async reconcileOnColdStart(): Promise<void> {
+    const stopped = await stopOrphanedLocationUpdates();
+    if (stopped) {
+      console.warn('[TourSession] stopped orphaned background location task from a previous run');
+    }
+    useTourSession.getState().reset();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Start
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Start a tour from its downloaded bundle.
+   *
+   * Idempotent: calling it for the tour already running is a no-op. That single
+   * property is what makes it safe to call from a component effect despite
+   * React 19 StrictMode mounting, unmounting and remounting in development.
+   */
+  async startSession(tourId: string, tourTitle: string): Promise<void> {
+    this.transition = this.transition.then(() => this.doStart(tourId, tourTitle));
+    return this.transition;
+  }
+
+  private async doStart(tourId: string, tourTitle: string): Promise<void> {
+    const store = useTourSession.getState();
+
+    // Already running this exact tour - nothing to do.
+    if (store.tourId === tourId && (store.status === 'active' || store.status === 'starting')) {
+      return;
+    }
+
+    // Switching tours: tear the old one down first, or we leak a watcher.
+    if (store.tourId && store.tourId !== tourId) {
+      await this.doEnd();
+    }
+
+    useTourSession.getState().beginStart(tourId, tourTitle);
+
+    const waypoints = TourBundleRepository.loadWaypoints(tourId);
+    const transitMode = TourBundleRepository.loadTransitMode(tourId);
+
+    if (!waypoints || !transitMode) {
+      useTourSession
+        .getState()
+        .sessionFailed('This tour is not downloaded. Download it before starting.');
+      return;
+    }
+
+    const service = new LocationService(transitMode);
+    service.loadTour(waypoints, transitMode);
+    service.setCallbacks({
+      onLocation: (fix, accuracy) => useTourSession.getState().setFix(fix, accuracy),
+      onSamplingChange: (tier) => useTourSession.getState().setSamplingTier(tier),
+      onGeofence: (event) => {
+        void this.handleGeofence(event);
+      },
+    });
+
+    const permissions = await service.requestPermissions();
+    if (!permissions.foreground) {
+      useTourSession
+        .getState()
+        .sessionFailed('Location permission is required to run a tour.');
+      return;
+    }
+
+    this.location = service;
+    await this.audio.configureSession();
+    await service.start();
+
+    this.appStateSub = AppState.addEventListener('change', (next) => {
+      void this.handleAppStateChange(next);
+    });
+
+    useTourSession.getState().sessionStarted({
+      waypoints,
+      transitMode,
+      backgroundPermission: permissions.background,
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Geofence -> audio
+  // ---------------------------------------------------------------------------
+
+  private async handleGeofence(event: GeofenceEvent): Promise<void> {
+    const { waypoint } = event;
+
+    if (event.type === 'enter') {
+      useTourSession.getState().markEntered(waypoint.id);
+
+      const track = waypoint.audio;
+      // localUri is derived at read time by the bundle repository, never stored.
+      const uri = track?.localUri;
+      if (!track || !uri) return;
+
+      try {
+        await this.audio.play(track, uri, waypoint.name);
+      } catch (err) {
+        // A missing or unplayable file must not kill the tour - the user keeps
+        // walking and the next waypoint still triggers.
+        console.warn(`[TourSession] playback failed for ${waypoint.name}:`, err);
+      }
+      return;
+    }
+
+    useTourSession.getState().markExited(waypoint.id);
+    // Zone exit fades out rather than cutting (PRD Screen 4).
+    await this.audio.fadeOutAndStop();
+  }
+
+  // ---------------------------------------------------------------------------
+  // App state - exactly one location subscription at a time
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Swap the foreground watcher for the background task and back.
+   *
+   * Running both would double GPS wake-ups and deliver every fix twice, which
+   * the debounce would mask rather than fix. Backgrounding deliberately does
+   * NOT stop tracking - hands-free playback with the phone pocketed is the
+   * product.
+   *
+   * ANDROID: startBackground() has no effect while the app is backgrounded
+   * until the deferred unified foreground service lands, so tracking pauses
+   * there. iOS continues via the default background session type.
+   */
+  private async handleAppStateChange(next: AppStateStatus): Promise<void> {
+    const service = this.location;
+    if (!service) return;
+    if (useTourSession.getState().status !== 'active') return;
+
+    try {
+      if (next === 'background' || next === 'inactive') {
+        if (!useTourSession.getState().backgroundPermission) return;
+        await service.stop();
+        await service.startBackground();
+      } else if (next === 'active') {
+        await service.stopBackground();
+        await service.start();
+      }
+    } catch (err) {
+      console.warn('[TourSession] app-state transition failed:', err);
+    }
+  }
+
+  /** Background task fixes, delivered outside React entirely. */
+  onBackgroundFixes(fixes: LatLng[], timestamp: number): void {
+    const service = this.location;
+    if (!service) return;
+    for (const fix of fixes) service.onFix(fix, null, timestamp);
+  }
+
+  // ---------------------------------------------------------------------------
+  // End
+  // ---------------------------------------------------------------------------
+
+  /** The only way a tour ends. Releases every native resource it owns. */
+  async endSession(): Promise<void> {
+    this.transition = this.transition.then(() => this.doEnd());
+    return this.transition;
+  }
+
+  private async doEnd(): Promise<void> {
+    this.appStateSub?.remove();
+    this.appStateSub = null;
+
+    const service = this.location;
+    this.location = null;
+
+    if (service) {
+      // Both, unconditionally: whichever was not running is a cheap no-op, and
+      // guessing wrong is how a watcher survives the session that owned it.
+      await service.stop();
+      await service.stopBackground();
+    }
+
+    // createAudioPlayer holds native resources until remove(); stop() does that.
+    await this.audio.stop();
+
+    useTourSession.getState().reset();
+  }
+
+  /** True while hardware is held. Used by tests and debug UI. */
+  get isRunning(): boolean {
+    return this.location !== null;
+  }
+}
+
+export const tourSession = new TourSessionController();
+
+/**
+ * Registered at module scope, not inside an effect: TaskManager needs the task
+ * defined before the OS revives a cold-started JS context, and a component may
+ * never have mounted at that point.
+ */
+registerBackgroundLocationTask((fixes, timestamp) => {
+  tourSession.onBackgroundFixes(fixes, timestamp);
+});

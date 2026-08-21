@@ -1,0 +1,66 @@
+{
+  "expo": {
+    "name": "Audio Tour",
+    "slug": "audio-tour-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "scheme": "audiotour",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.audiotour.app",
+      "infoPlist": {
+        "UIBackgroundModes": [
+          "location",
+          "audio"
+        ],
+        "NSLocationWhenInUseUsageDescription": "Audio Tour uses your location to start narration when you reach a stop on the tour.",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "Audio Tour needs background location so narration keeps triggering with your screen locked and the phone in your pocket."
+      }
+    },
+    "android": {
+      "package": "com.audiotour.app",
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_LOCATION"
+      ],
+      "config": {
+        "googleMaps": {
+          "apiKey": "REPLACE_WITH_ANDROID_GOOGLE_MAPS_API_KEY"
+        }
+      }
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      [
+        "expo-audio",
+        {
+          "enableBackgroundPlayback": true
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Audio Tour needs background location so narration keeps triggering with your screen locked and the phone in your pocket.",
+          "locationWhenInUsePermission": "Audio Tour uses your location to start narration when you reach a stop on the tour.",
+          "isAndroidBackgroundLocationEnabled": true,
+          "isAndroidForegroundServiceEnabled": true
+        }
+      ],
+      "expo-asset"
+    ]
+  }
+}

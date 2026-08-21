@@ -1,0 +1,267 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { DownloadTask, File, type DownloadPauseState } from 'expo-file-system';
+
+import type { BundleProgress } from './types';
+
+/**
+ * DownloadManager - Approach B from the TASK-201 proposal.
+ *
+ * A bounded-concurrency queue of `DownloadTask`s with pause/resume state
+ * persisted across app launches.
+ *
+ * Progress is computed against a denominator taken from `audio_tracks.size_bytes`
+ * rather than from `Content-Length`, because `onProgress` reports `totalBytes`
+ * as -1 whenever the server omits that header. Using the database figure means
+ * the bar is accurate from the first byte and never jumps.
+ *
+ * PLATFORM NOTE: `sessionType` defaults to 'background', which lets iOS continue
+ * a transfer while the app is suspended. Android ignores the option entirely -
+ * the installed type definition says so - so on Android a backgrounded download
+ * stalls until the app returns. Persisted resume is what makes that survivable.
+ */
+
+export interface DownloadItem {
+  /** Bucket-relative path; also the stable identity of this item. */
+  storagePath: string;
+  url: string;
+  destination: File;
+  /** Expected size from the database, used for progress and validation. */
+  sizeBytes: number;
+}
+
+export interface DownloadManagerOptions {
+  /** Parallel transfers. Three keeps a small bundle brisk without hammering the CDN. */
+  concurrency?: number;
+  onProgress?: (progress: BundleProgress) => void;
+}
+
+type ResumeRecord = { storagePath: string; state: DownloadPauseState };
+
+const RESUME_KEY = (tourId: string): string => `bundle:resume:${tourId}`;
+
+export class DownloadManager {
+  private readonly concurrency: number;
+  private readonly onProgress?: (p: BundleProgress) => void;
+
+  private items: DownloadItem[] = [];
+  private active = new Map<string, DownloadTask>();
+  /** Bytes written per item; completed items hold their full expected size. */
+  private written = new Map<string, number>();
+  private completed = new Set<string>();
+  private paused = false;
+  private cancelled = false;
+
+  private readonly tourId: string;
+
+  // Explicit field assignment rather than a TypeScript parameter property:
+  // parameter properties are non-erasable syntax, and avoiding them keeps this
+  // module runnable under plain type-stripping, which is what lets the queue
+  // logic be tested without a bundler or a device.
+  constructor(tourId: string, options: DownloadManagerOptions = {}) {
+    this.tourId = tourId;
+    this.concurrency = Math.max(1, options.concurrency ?? 3);
+    this.onProgress = options.onProgress;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Progress
+  // ---------------------------------------------------------------------------
+
+  private totalBytes(): number {
+    return this.items.reduce((sum, i) => sum + i.sizeBytes, 0);
+  }
+
+  private snapshot(): BundleProgress {
+    const total = this.totalBytes();
+    let bytes = 0;
+    for (const v of this.written.values()) bytes += v;
+    // Clamp: a server file slightly larger than size_bytes must not push the
+    // bar past 100%, which looks broken even though the download is healthy.
+    const capped = Math.min(bytes, total);
+    return {
+      bytesWritten: capped,
+      totalBytes: total,
+      filesCompleted: this.completed.size,
+      filesTotal: this.items.length,
+      fraction: total > 0 ? capped / total : this.items.length === 0 ? 1 : 0,
+    };
+  }
+
+  private emit(): void {
+    this.onProgress?.(this.snapshot());
+  }
+
+  // ---------------------------------------------------------------------------
+  // Run
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Download every item, resuming any that were persisted from a previous run.
+   * Resolves once all have completed and passed size validation.
+   */
+  async run(items: DownloadItem[]): Promise<void> {
+    this.items = items;
+    this.cancelled = false;
+    this.paused = false;
+    this.written.clear();
+    this.completed.clear();
+
+    const resumable = await this.loadResumeState();
+    this.emit();
+
+    const queue = [...items];
+    const workers = Array.from({ length: Math.min(this.concurrency, queue.length) }, () =>
+      this.worker(queue, resumable),
+    );
+
+    try {
+      await Promise.all(workers);
+    } finally {
+      // Whatever happened, do not leave live native tasks behind.
+      for (const task of this.active.values()) task.release();
+      this.active.clear();
+    }
+
+    if (this.cancelled) throw new Error('Download cancelled');
+    await this.clearResumeState();
+  }
+
+  private async worker(queue: DownloadItem[], resumable: Map<string, DownloadPauseState>): Promise<void> {
+    for (;;) {
+      if (this.cancelled || this.paused) return;
+      const item = queue.shift();
+      if (!item) return;
+      await this.downloadOne(item, resumable.get(item.storagePath));
+    }
+  }
+
+  private async downloadOne(item: DownloadItem, resume?: DownloadPauseState): Promise<void> {
+    // Already on disk and the right size: skip. This is what makes a re-run
+    // after a partial download cheap rather than starting over.
+    if (item.destination.exists && this.sizeMatches(item)) {
+      this.markComplete(item);
+      return;
+    }
+
+    item.destination.parentDirectory.create({ intermediates: true, idempotent: true });
+
+    const onProgress = ({ bytesWritten }: { bytesWritten: number }): void => {
+      this.written.set(item.storagePath, bytesWritten);
+      this.emit();
+    };
+
+    const task = resume
+      ? DownloadTask.fromSavable(resume, { onProgress })
+      : File.createDownloadTask(item.url, item.destination, { onProgress });
+
+    this.active.set(item.storagePath, task);
+
+    // resumeAsync() both starts and continues a task - there is no start().
+    // It resolves with the File on completion, or with null if the task was
+    // paused first. Treating null as "done" would fail the size check below and
+    // report a spurious corruption error every time the user pauses.
+    let result: File | null;
+    try {
+      result = await task.resumeAsync();
+    } finally {
+      this.active.delete(item.storagePath);
+    }
+
+    if (this.cancelled || result === null) return;
+
+    // PM decision (TASK-201): size validation only, no MD5. A truncated file is
+    // the overwhelmingly common corruption mode and this catches it for one
+    // stat call. Anything else is a hard failure - a half-written track that
+    // silently "succeeds" would fail later, offline, mid-walk.
+    if (!this.sizeMatches(item)) {
+      const actual = item.destination.exists ? item.destination.info().size : 0;
+      throw new Error(
+        `Size mismatch for ${item.storagePath}: expected ${item.sizeBytes} bytes, got ${actual ?? 0}`,
+      );
+    }
+
+    this.markComplete(item);
+  }
+
+  private sizeMatches(item: DownloadItem): boolean {
+    if (!item.destination.exists) return false;
+    return item.destination.info().size === item.sizeBytes;
+  }
+
+  private markComplete(item: DownloadItem): void {
+    this.written.set(item.storagePath, item.sizeBytes);
+    this.completed.add(item.storagePath);
+    this.emit();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Pause / resume / cancel
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Pause every active transfer and persist its resume state.
+   *
+   * `savable()` is only legal while a task is actually paused, so the await on
+   * `pauseAsync()` is load-bearing - calling it on an active task loses the
+   * native resumeData and forces a restart from zero.
+   */
+  async pause(): Promise<void> {
+    this.paused = true;
+    const records: ResumeRecord[] = [];
+
+    for (const [storagePath, task] of this.active) {
+      try {
+        await task.pauseAsync();
+        records.push({ storagePath, state: task.savable() });
+      } catch {
+        // A task that finished or errored between the loop starting and here
+        // simply has nothing to save; it will be re-checked on the next run.
+      }
+    }
+
+    if (records.length > 0) await this.saveResumeState(records);
+  }
+
+  /** Abort everything and discard partial state. */
+  async cancel(): Promise<void> {
+    this.cancelled = true;
+    for (const task of this.active.values()) {
+      try {
+        task.cancel();
+      } catch {
+        /* already finished */
+      }
+    }
+    this.active.clear();
+    await this.clearResumeState();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Resume persistence
+  // ---------------------------------------------------------------------------
+
+  private async saveResumeState(records: ResumeRecord[]): Promise<void> {
+    await AsyncStorage.setItem(RESUME_KEY(this.tourId), JSON.stringify(records));
+  }
+
+  private async loadResumeState(): Promise<Map<string, DownloadPauseState>> {
+    const map = new Map<string, DownloadPauseState>();
+    try {
+      const raw = await AsyncStorage.getItem(RESUME_KEY(this.tourId));
+      if (!raw) return map;
+      const parsed: unknown = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return map;
+      for (const rec of parsed as ResumeRecord[]) {
+        if (rec?.storagePath && rec?.state?.url) map.set(rec.storagePath, rec.state);
+      }
+    } catch {
+      // Corrupt resume state is not worth failing a download over - the worst
+      // case is re-downloading from zero, which is what we would do anyway.
+    }
+    return map;
+  }
+
+  private async clearResumeState(): Promise<void> {
+    await AsyncStorage.removeItem(RESUME_KEY(this.tourId));
+  }
+}

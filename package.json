@@ -1,0 +1,31 @@
+{
+  "name": "audio-tour-app",
+  "version": "1.0.0",
+  "description": "Geofenced audio tour app - Supabase backend",
+  "private": true,
+  "type": "module",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "db:start": "supabase start",
+    "db:stop": "supabase stop",
+    "db:reset": "supabase db reset",
+    "db:push": "supabase db push",
+    "db:diff": "supabase db diff",
+    "typecheck": "tsc --noEmit",
+    "types:generate": "supabase gen types typescript --linked > backend/types/supabase.ts",
+    "test:db": "node --env-file-if-exists=.env backend/scripts/test-connection.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "supabase": "^2.115.0",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.112.3"
+  }
+}
