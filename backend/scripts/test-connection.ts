@@ -170,8 +170,8 @@ async function main(): Promise<void> {
   // behind, since anon cannot delete it either.
   const { error: uploadError } = await supabase.storage
     .from(BUCKET)
-    .upload('rls-probe/should-not-exist.opus', new Blob([new Uint8Array([0])]), {
-      contentType: 'audio/ogg',
+    .upload('rls-probe/should-not-exist.m4a', new Blob([new Uint8Array([0])]), {
+      contentType: 'audio/mp4',
     });
 
   const uploadBlocked = uploadError !== null;

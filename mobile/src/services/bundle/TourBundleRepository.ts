@@ -209,7 +209,7 @@ export class TourBundleRepository {
       waypointId: w.waypoint_id,
       storagePath: m.storage_path,
       durationSeconds: m.duration_seconds,
-      format: m.format ?? 'Opus',
+      format: m.format ?? 'AAC',
       sizeBytes: m.size_bytes,
       // Derived, never stored.
       localUri: resolveLocalUri(tourId, m.storage_path),

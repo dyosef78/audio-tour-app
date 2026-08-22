@@ -110,6 +110,20 @@ class TourSessionController {
     }
 
     this.location = service;
+
+    // Mirror the player's own status into the store so the transport UI is
+    // honest about state we did not initiate - a track ending, or the OS
+    // pausing us for an interruption.
+    this.audio.setOnStatus(({ isPlaying, positionSeconds, durationSeconds }) => {
+      useTourSession.getState().setPlayback({ isPlaying, positionSeconds, durationSeconds });
+    });
+
+    // A decode failure must reach the UI, not just the console. setPlaybackError
+    // resets the transport as well, so the panel cannot keep claiming "playing".
+    this.audio.setOnError((err) => {
+      useTourSession.getState().setPlaybackError(err.message);
+    });
+
     await this.audio.configureSession();
     await service.start();
 
@@ -141,10 +155,23 @@ class TourSessionController {
 
       try {
         await this.audio.play(track, uri, waypoint.name);
+        // Report playing immediately rather than waiting for the first
+        // playbackStatusUpdate. Otherwise the transport button shows "paused"
+        // for the gap between tapping and the first event - and stays wrong if
+        // that event is delayed. The status feed corrects this either way.
+        const s = useTourSession.getState();
+        s.setPlayback({
+          isPlaying: true,
+          positionSeconds: 0,
+          durationSeconds: track.durationSeconds ?? 0,
+        });
       } catch (err) {
         // A missing or unplayable file must not kill the tour - the user keeps
         // walking and the next waypoint still triggers.
         console.warn(`[TourSession] playback failed for ${waypoint.name}:`, err);
+        useTourSession
+          .getState()
+          .setPlaybackError(err instanceof Error ? err.message : 'Could not play this track.');
       }
       return;
     }
@@ -152,6 +179,68 @@ class TourSessionController {
     useTourSession.getState().markExited(waypoint.id);
     // Zone exit fades out rather than cutting (PRD Screen 4).
     await this.audio.fadeOutAndStop();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Manual trigger - for testing without walking to Jerusalem
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Fire a waypoint's narration by hand, bypassing the distance check.
+   *
+   * Deliberately synthesises the exact event a real zone entry would produce and
+   * pushes it through the SAME handler, rather than calling the audio service
+   * directly. Everything downstream of the event runs for real: visit tracking,
+   * the completion prompt, local-file resolution, lock-screen metadata and the
+   * playback status feed.
+   *
+   * What it skips, precisely: this never reaches LocationService, so the
+   * distance test, the re-trigger cooldown and the exit hysteresis are all
+   * bypassed. Repeat taps therefore replay immediately rather than being
+   * suppressed by the cooldown - convenient for testing, but it means this is
+   * not a test of the debounce logic. LocationService's own zone state is
+   * untouched, so a genuine entry later still behaves normally.
+   */
+  async triggerWaypoint(waypointId: string): Promise<void> {
+    const waypoint = useTourSession.getState().waypoints.find((w) => w.id === waypointId);
+    if (!waypoint) return;
+
+    await this.handleGeofence({
+      type: 'enter',
+      waypoint,
+      at: waypoint.coordinate,
+      timestamp: Date.now(),
+    });
+  }
+
+  /** Stop narration as a zone exit would, with the same fade-out. */
+  async releaseWaypoint(waypointId: string): Promise<void> {
+    const waypoint = useTourSession.getState().waypoints.find((w) => w.id === waypointId);
+    if (!waypoint) return;
+
+    await this.handleGeofence({
+      type: 'exit',
+      waypoint,
+      at: waypoint.coordinate,
+      timestamp: Date.now(),
+    });
+  }
+
+  /** Transport control for the on-screen player. */
+  togglePlayPause(): void {
+    if (this.audio.isPlaying) {
+      this.audio.pause();
+      const s = useTourSession.getState();
+      s.setPlayback({ isPlaying: false, positionSeconds: s.positionSeconds, durationSeconds: s.durationSeconds });
+    } else {
+      this.audio.resume();
+      const s = useTourSession.getState();
+      s.setPlayback({
+        isPlaying: true,
+        positionSeconds: s.positionSeconds,
+        durationSeconds: s.durationSeconds,
+      });
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -222,6 +311,8 @@ class TourSessionController {
 
     // createAudioPlayer holds native resources until remove(); stop() does that.
     await this.audio.stop();
+    this.audio.setOnStatus(null);
+    this.audio.setOnError(null);
 
     useTourSession.getState().reset();
   }

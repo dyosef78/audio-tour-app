@@ -9,18 +9,19 @@
     "scheme": "audiotour",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.audiotour.app",
+      "bundleIdentifier": "com.davidyosef.audiotour",
       "infoPlist": {
         "UIBackgroundModes": [
           "location",
           "audio"
         ],
         "NSLocationWhenInUseUsageDescription": "Audio Tour uses your location to start narration when you reach a stop on the tour.",
-        "NSLocationAlwaysAndWhenInUseUsageDescription": "Audio Tour needs background location so narration keeps triggering with your screen locked and the phone in your pocket."
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "Audio Tour needs background location so narration keeps triggering with your screen locked and the phone in your pocket.",
+        "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {
-      "package": "com.audiotour.app",
+      "package": "com.davidyosef.audiotour",
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/android-icon-foreground.png",
@@ -34,12 +35,7 @@
         "ACCESS_BACKGROUND_LOCATION",
         "FOREGROUND_SERVICE",
         "FOREGROUND_SERVICE_LOCATION"
-      ],
-      "config": {
-        "googleMaps": {
-          "apiKey": "REPLACE_WITH_ANDROID_GOOGLE_MAPS_API_KEY"
-        }
-      }
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -61,6 +57,11 @@
         }
       ],
       "expo-asset"
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "7efb4c6b-33dd-4093-8c55-6116fd20a09e"
+      }
+    }
   }
 }

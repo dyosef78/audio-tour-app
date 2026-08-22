@@ -62,7 +62,7 @@ export interface AudioTrack {
   waypointId: string;
   /**
    * Path RELATIVE to the `audio-tracks` Supabase Storage bucket, e.g.
-   * `tours/<tour_id>/wp01_jaffa_gate.opus`. Never an absolute URL - resolve
+   * `tours/<tour_id>/wp01_jaffa_gate.m4a`. Never an absolute URL - resolve
    * with getPublicUrl(), or map to a local file URI once downloaded.
    */
   storagePath: string;

@@ -72,16 +72,16 @@ INSERT INTO public.audio_tracks
     (id, waypoint_id, storage_path, format, size_bytes, duration_seconds, lufs_normalization) VALUES
     ('eeeeeeee-0003-4000-8000-000000000001',
      'eeeeeeee-0001-4000-8000-000000000001',
-     'tours/eeeeeeee-0000-4000-8000-000000000001/wp01_jaffa_gate.opus',
-     'Opus',
+     'tours/eeeeeeee-0000-4000-8000-000000000001/wp01_jaffa_gate.m4a',
+     'AAC',
      6,      -- PLACEHOLDER - correct with the real byte size
      15,
      -16),
 
     ('eeeeeeee-0003-4000-8000-000000000002',
      'eeeeeeee-0001-4000-8000-000000000002',
-     'tours/eeeeeeee-0000-4000-8000-000000000001/wp02_tower_of_david.opus',
-     'Opus',
+     'tours/eeeeeeee-0000-4000-8000-000000000001/wp02_tower_of_david.m4a',
+     'AAC',
      6,      -- PLACEHOLDER - correct with the real byte size
      15,
      -16);
@@ -90,12 +90,17 @@ INSERT INTO public.audio_tracks
 -- STEP 2 - upload the audio, then correct size_bytes
 --
 -- The rows above are useless on their own: Screen 2 will not unlock "Start Tour"
--- until every track downloads AND matches its recorded size. Two short .opus
+-- until every track downloads AND matches its recorded size. Two short .m4a
 -- files (any content) are enough.
 --
+-- FORMAT: AAC-LC in .m4a only. iOS cannot decode Opus and fails silently -
+-- the player reports "playing" while stuck at 0:00. See architecture_schema.md
+-- section 2. The bucket allowlist must permit audio/mp4, audio/m4a and
+-- audio/x-m4a, or the upload is rejected before playback is ever attempted.
+--
 --   Dashboard > Storage > audio-tracks, create this folder path and upload:
---     tours/eeeeeeee-0000-4000-8000-000000000001/wp01_jaffa_gate.opus
---     tours/eeeeeeee-0000-4000-8000-000000000001/wp02_tower_of_david.opus
+--     tours/eeeeeeee-0000-4000-8000-000000000001/wp01_jaffa_gate.m4a
+--     tours/eeeeeeee-0000-4000-8000-000000000001/wp02_tower_of_david.m4a
 --
 -- Then run this, substituting the real size in bytes for each file (Storage shows it):
 --

@@ -48,6 +48,8 @@ export class DownloadManager {
   /** Bytes written per item; completed items hold their full expected size. */
   private written = new Map<string, number>();
   private completed = new Set<string>();
+  /** Resume points for items paused during this run, keyed by storagePath. */
+  private captured = new Map<string, DownloadPauseState>();
   private paused = false;
   private cancelled = false;
 
@@ -105,6 +107,7 @@ export class DownloadManager {
     this.paused = false;
     this.written.clear();
     this.completed.clear();
+    this.captured.clear();
 
     const resumable = await this.loadResumeState();
     this.emit();
@@ -123,7 +126,37 @@ export class DownloadManager {
     }
 
     if (this.cancelled) throw new Error('Download cancelled');
+
+    // A paused item leaves the queue without completing. Resolving normally
+    // here would let TourBundleRepository write the manifest and commit a
+    // bundle with a missing track - the manifest is the completion marker, so
+    // it must never be reached unless every item verified.
+    if (this.completed.size < this.items.length) {
+      await this.persistCaptured();
+      throw new Error(
+        `Download incomplete: ${this.completed.size} of ${this.items.length} tracks finished. Resume to continue.`,
+      );
+    }
+
     await this.clearResumeState();
+  }
+
+  /**
+   * Record a paused task's resume point.
+   *
+   * Called both from pause() and from downloadOne() when a transfer resolves
+   * null. The latter matters: the download promise resolving removes the task
+   * from `active`, so waiting for pause() to capture it races with that and
+   * would silently lose the resume point.
+   */
+  private capturePause(storagePath: string, task: DownloadTask): void {
+    try {
+      const state = task.savable();
+      // Only a state carrying resumeData can actually be restored.
+      if (state.resumeData) this.captured.set(storagePath, state);
+    } catch {
+      // savable() asserts the task is paused; anything else has nothing to save.
+    }
   }
 
   private async worker(queue: DownloadItem[], resumable: Map<string, DownloadPauseState>): Promise<void> {
@@ -150,24 +183,47 @@ export class DownloadManager {
       this.emit();
     };
 
-    const task = resume
-      ? DownloadTask.fromSavable(resume, { onProgress })
-      : File.createDownloadTask(item.url, item.destination, { onProgress });
+    // Restoring a pause requires native resumeData. fromSavable() throws
+    // without it - which happens when a task was paused before any bytes
+    // arrived - so fall back to a fresh download rather than failing the bundle.
+    let task: DownloadTask;
+    if (resume?.resumeData) {
+      try {
+        task = DownloadTask.fromSavable(resume, { onProgress });
+      } catch {
+        task = File.createDownloadTask(item.url, item.destination, { onProgress });
+      }
+    } else {
+      task = File.createDownloadTask(item.url, item.destination, { onProgress });
+    }
 
     this.active.set(item.storagePath, task);
 
-    // resumeAsync() both starts and continues a task - there is no start().
-    // It resolves with the File on completion, or with null if the task was
+    // The native task is a strict state machine and asserts on entry:
+    //   downloadAsync() requires state 'idle'   - starts a fresh transfer
+    //   resumeAsync()   requires state 'paused' - continues a saved one
+    // Calling the wrong one throws `Cannot call X() in state "Y"`, which is a
+    // hard native crash rather than a rejected promise on iOS.
+    //
+    // Both resolve with the File on completion, or with null if the task was
     // paused first. Treating null as "done" would fail the size check below and
-    // report a spurious corruption error every time the user pauses.
+    // report spurious corruption every time the user pauses.
     let result: File | null;
     try {
-      result = await task.resumeAsync();
+      result = task.state === 'paused' ? await task.resumeAsync() : await task.downloadAsync();
     } finally {
       this.active.delete(item.storagePath);
     }
 
-    if (this.cancelled || result === null) return;
+    if (this.cancelled) return;
+
+    // null means the transfer was paused before finishing. Capture the resume
+    // point now: this promise resolving is what removes the task from `active`,
+    // so leaving it to pause() would race with that and lose the resume data.
+    if (result === null) {
+      this.capturePause(item.storagePath, task);
+      return;
+    }
 
     // PM decision (TASK-201): size validation only, no MD5. A truncated file is
     // the overwhelmingly common corruption mode and this catches it for one
@@ -207,19 +263,18 @@ export class DownloadManager {
    */
   async pause(): Promise<void> {
     this.paused = true;
-    const records: ResumeRecord[] = [];
 
     for (const [storagePath, task] of this.active) {
       try {
         await task.pauseAsync();
-        records.push({ storagePath, state: task.savable() });
       } catch {
-        // A task that finished or errored between the loop starting and here
-        // simply has nothing to save; it will be re-checked on the next run.
+        // Finished or errored between the loop starting and here; nothing to
+        // pause, and capturePause below will find nothing to save either.
       }
+      this.capturePause(storagePath, task);
     }
 
-    if (records.length > 0) await this.saveResumeState(records);
+    await this.persistCaptured();
   }
 
   /** Abort everything and discard partial state. */
@@ -240,7 +295,13 @@ export class DownloadManager {
   // Resume persistence
   // ---------------------------------------------------------------------------
 
-  private async saveResumeState(records: ResumeRecord[]): Promise<void> {
+  /** Write every captured resume point for this tour. */
+  private async persistCaptured(): Promise<void> {
+    if (this.captured.size === 0) return;
+    const records: ResumeRecord[] = [...this.captured].map(([storagePath, state]) => ({
+      storagePath,
+      state,
+    }));
     await AsyncStorage.setItem(RESUME_KEY(this.tourId), JSON.stringify(records));
   }
 
@@ -252,7 +313,12 @@ export class DownloadManager {
       const parsed: unknown = JSON.parse(raw);
       if (!Array.isArray(parsed)) return map;
       for (const rec of parsed as ResumeRecord[]) {
-        if (rec?.storagePath && rec?.state?.url) map.set(rec.storagePath, rec.state);
+        // resumeData is mandatory: DownloadTask.fromSavable() throws without it.
+        // A record lacking it is not a usable resume point, so drop it here and
+        // let the item restart cleanly.
+        if (rec?.storagePath && rec?.state?.url && rec.state.resumeData) {
+          map.set(rec.storagePath, rec.state);
+        }
       }
     } catch {
       // Corrupt resume state is not worth failing a download over - the worst

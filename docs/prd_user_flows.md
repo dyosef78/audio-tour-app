@@ -1,5 +1,5 @@
 # Product Requirements Document (PRD) & User Flows
-**Version:** 2.0.0 (Updated & Finalized for Mobile Dev)
+**Version:** 2.1.0 (Audio standard fixed to AAC-LC)
 **Status:** Approved for Development
 
 ## 1. Core Vision & Experience
@@ -14,7 +14,7 @@ The application delivers hands-free, hyper-personalized, location-based audio to
 
 ### Screen 2: Tour Detail & Pre-fetch (Offline Bundle)
 * **UI Elements:** Tour description, map preview, and a prominent "Download Tour" button.
-* **Logic (TASK-201):** Tapping download fetches the tour metadata, POI coordinates, and all associated audio files (Opus/AAC-LC) from the Supabase Storage public CDN into the device's local file system[cite: 2, 3].
+* **Logic (TASK-201):** Tapping download fetches the tour metadata, POI coordinates, and all associated audio files (AAC-LC `.m4a`) from the Supabase Storage public CDN into the device's local file system[cite: 2, 3].
 * **State:** Displays a progress bar. Once 100% downloaded, the "Start Tour" button unlocks.
 
 ### Screen 3: Active Map & Geofencing Engine (TASK-101 & 102)
@@ -30,3 +30,14 @@ The application delivers hands-free, hyper-personalized, location-based audio to
   * Audio Ducking: Lowers volume to 20% during OS navigation alerts[cite: 3].
   * Debounce/Cooldown: Prevents re-triggering the same audio if the user steps in and out of the boundary[cite: 2, 3].
   * Zone Exit: Gradual fade-out/pause if the user strays far from the POI[cite: 3].
+---
+
+## 4. Audio Format Constraint (added v2.1.0)
+
+All narration ships as **AAC-LC in `.m4a`**. Opus is not used for client delivery.
+
+iOS cannot decode Opus natively, and — importantly for QA — it fails *silently*:
+the player reports as playing while the position stays at 0:00. If a stop
+produces no sound, check the file format before suspecting the geofence engine.
+
+Full rationale and the encoding rules are in `architecture_schema.md` section 2.

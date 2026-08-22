@@ -113,8 +113,8 @@ INSERT INTO public.geofence_zones (id, waypoint_id, zone_type, trigger_radius_me
          4326));
 
 -- --- Audio tracks -------------------------------------------------------------
--- size_bytes assume Opus mono voice at ~48 kbps (6,000 bytes/sec) and are
--- consistent with duration_seconds: 870000 / 6000 = 145 s, and so on. Both feed
+-- size_bytes assume AAC-LC mono voice at ~64 kbps (8,000 bytes/sec) and are
+-- consistent with duration_seconds: 1160000 / 8000 = 145 s, and so on. Both feed
 -- the Screen 4 bundle estimate. Anchors get the 90-150 s deep dive from PRD
 -- Section 3; the transition gets a short cue.
 --
@@ -128,20 +128,20 @@ INSERT INTO public.geofence_zones (id, waypoint_id, zone_type, trigger_radius_me
 INSERT INTO public.audio_tracks (id, waypoint_id, storage_path, format, size_bytes, duration_seconds, lufs_normalization) VALUES
     ('dddddddd-0000-4000-8000-000000000001',
      'bbbbbbbb-0000-4000-8000-000000000001',
-     'tours/aaaaaaaa-0000-4000-8000-000000000001/wp01_jaffa_gate.opus',
-     'Opus', 870000, 145, -16),
+     'tours/aaaaaaaa-0000-4000-8000-000000000001/wp01_jaffa_gate.m4a',
+     'AAC', 1160000, 145, -16),
 
     ('dddddddd-0000-4000-8000-000000000002',
      'bbbbbbbb-0000-4000-8000-000000000002',
-     'tours/aaaaaaaa-0000-4000-8000-000000000001/wp02_tower_of_david.opus',
-     'Opus', 720000, 120, -16),
+     'tours/aaaaaaaa-0000-4000-8000-000000000001/wp02_tower_of_david.m4a',
+     'AAC',  960000, 120, -16),
 
     ('dddddddd-0000-4000-8000-000000000003',
      'bbbbbbbb-0000-4000-8000-000000000003',
-     'tours/aaaaaaaa-0000-4000-8000-000000000001/wp03_cardo_transition.opus',
-     'Opus', 210000,  35, -16),
+     'tours/aaaaaaaa-0000-4000-8000-000000000001/wp03_cardo_transition.m4a',
+     'AAC',  280000,  35, -16),
 
     ('dddddddd-0000-4000-8000-000000000004',
      'bbbbbbbb-0000-4000-8000-000000000004',
-     'tours/aaaaaaaa-0000-4000-8000-000000000001/wp04_western_wall.opus',
-     'Opus', 900000, 150, -16);
+     'tours/aaaaaaaa-0000-4000-8000-000000000001/wp04_western_wall.m4a',
+     'AAC', 1200000, 150, -16);

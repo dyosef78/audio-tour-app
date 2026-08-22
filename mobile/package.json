@@ -10,6 +10,7 @@
     "expo": "~57.0.15",
     "expo-asset": "~57.0.13",
     "expo-audio": "~57.0.4",
+    "expo-dev-client": "~57.0.14",
     "expo-file-system": "~57.0.5",
     "expo-location": "~57.0.12",
     "expo-status-bar": "~57.0.1",

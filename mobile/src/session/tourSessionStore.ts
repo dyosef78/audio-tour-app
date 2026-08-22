@@ -31,6 +31,20 @@ export interface TourSessionState {
   accuracyMeters: number | null;
   samplingTier: 'coarse' | 'fine';
 
+  /** Live transport state, mirrored from the audio player itself. */
+  isPlaying: boolean;
+  positionSeconds: number;
+  durationSeconds: number;
+
+  /**
+   * Last playback failure, shown on the transport.
+   *
+   * expo-audio has no error event, so a track that cannot be decoded otherwise
+   * looks identical to one that has not started. This is what stops the UI
+   * claiming "playing" at 0:00 forever.
+   */
+  playbackError: string | null;
+
   /** Waypoint currently narrating, if any. Drives the player sheet. */
   activeWaypointId: string | null;
   /** Waypoints whose geofence has been entered at least once. */
@@ -60,6 +74,8 @@ export interface TourSessionActions {
   setFix: (fix: LatLng, accuracyMeters: number | null) => void;
   setSamplingTier: (tier: 'coarse' | 'fine') => void;
 
+  setPlaybackError: (message: string | null) => void;
+  setPlayback: (snapshot: { isPlaying: boolean; positionSeconds: number; durationSeconds: number }) => void;
   markEntered: (waypointId: string) => void;
   markExited: (waypointId: string) => void;
   dismissCompletionPrompt: () => void;
@@ -74,6 +90,10 @@ const initial: TourSessionState = {
   currentFix: null,
   accuracyMeters: null,
   samplingTier: 'coarse',
+  playbackError: null,
+  isPlaying: false,
+  positionSeconds: 0,
+  durationSeconds: 0,
   activeWaypointId: null,
   visitedWaypointIds: [],
   completionPrompted: false,
@@ -98,6 +118,18 @@ export const useTourSession = create<TourSessionState & TourSessionActions>((set
 
   setSamplingTier: (samplingTier) => set({ samplingTier }),
 
+  setPlayback: ({ isPlaying, positionSeconds, durationSeconds }) =>
+    set({ isPlaying, positionSeconds, durationSeconds }),
+
+  setPlaybackError: (playbackError) =>
+    // A failure always resets the transport too, so the UI can never sit at
+    // "playing 0:00" with an error underneath it.
+    set(
+      playbackError === null
+        ? { playbackError: null }
+        : { playbackError, isPlaying: false, positionSeconds: 0, durationSeconds: 0 },
+    ),
+
   markEntered: (waypointId) =>
     set((s) => {
       const visited = s.visitedWaypointIds.includes(waypointId)
@@ -112,11 +144,17 @@ export const useTourSession = create<TourSessionState & TourSessionActions>((set
         activeWaypointId: waypointId,
         visitedWaypointIds: visited,
         completionPrompted: s.completionPrompted || allVisited,
+        // A new stop clears the previous stop's failure.
+        playbackError: null,
       };
     }),
 
   markExited: (waypointId) =>
-    set((s) => (s.activeWaypointId === waypointId ? { activeWaypointId: null } : {})),
+    set((s) =>
+      s.activeWaypointId === waypointId
+        ? { activeWaypointId: null, isPlaying: false, positionSeconds: 0, durationSeconds: 0 }
+        : {},
+    ),
 
   dismissCompletionPrompt: () => set({ completionPrompted: false }),
 }));

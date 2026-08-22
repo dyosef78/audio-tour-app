@@ -15,7 +15,7 @@ import { Directory, File, Paths } from 'expo-file-system';
  * Layout, one directory per tour so a bundle can be committed or evicted whole:
  *
  *   <document>/bundles/<tourId>/manifest.json
- *   <document>/bundles/<tourId>/media/tours/<tourId>/wp01_jaffa_gate.opus
+ *   <document>/bundles/<tourId>/media/tours/<tourId>/wp01_jaffa_gate.m4a
  *                               ^^^^^ the bucket path, preserved verbatim
  */
 
