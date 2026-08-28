@@ -15,7 +15,15 @@
     "db:diff": "supabase db diff",
     "typecheck": "tsc --noEmit",
     "types:generate": "supabase gen types typescript --linked > backend/types/supabase.ts",
-    "test:db": "node --env-file-if-exists=.env backend/scripts/test-connection.ts"
+    "test:db": "node --env-file-if-exists=.env backend/scripts/test-connection.ts",
+    "verify:bundle": "node --env-file-if-exists=.env backend/scripts/verify-bundle.ts",
+    "ci:db": "supabase db reset && npm run verify:bundle",
+    "media:doctor": "node backend/scripts/process-audio.ts doctor",
+    "media:process": "node backend/scripts/process-audio.ts",
+    "cms:ingest": "node --env-file-if-exists=.env backend/scripts/ingest-audio.ts",
+    "sim:walk": "node --env-file-if-exists=.env --import ./mobile/scripts/register-stubs.mjs mobile/scripts/simulate-walk.ts",
+    "test:telemetry": "node --env-file-if-exists=.env --import ./mobile/scripts/register-stubs.mjs mobile/scripts/test-telemetry.ts",
+    "seed:telaviv": "node --env-file-if-exists=.env backend/scripts/seed-tel-aviv-qa.ts"
   },
   "keywords": [],
   "author": "",
