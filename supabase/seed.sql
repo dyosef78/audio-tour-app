@@ -22,6 +22,19 @@ SET search_path = public, extensions;
 --   Route        : Jaffa Gate -> Tower of David -> Cardo -> Western Wall
 --                  (677 m total, ~9 min moving time)
 --
+-- SPACING RULE (TASK-505): waypoint gaps must clear the sum of the EXIT radii,
+-- not the entry radii. Exit hysteresis widens every zone by
+-- exitHysteresisFactor (walking x1.6 - see mobile/src/config/transitProfiles.ts),
+-- so zones whose trigger radii are comfortably clear can still overlap on exit.
+--
+-- This seed contains such a pair, deliberately left in place because it is
+-- useful coverage: Jaffa Gate and the Tower of David sit 58.7 m apart, entry
+-- radii sum to 45 m (clear) but exit radii sum to 72 m (overlapping). One GPS
+-- fix can therefore enter one zone and exit the other in the same evaluation.
+-- The engine handles it - TourSessionController stops only the track the
+-- exiting waypoint owns - and Phase E of `npm run sim:walk` regression-tests it.
+-- When adding NEW waypoints, require gap > (r_a + r_b) * exitHysteresisFactor.
+--
 -- Trigger radii follow the PRD walking envelope (15-30 m). Names are
 -- transliterated rather than Hebrew to stay encoding-safe on Windows clients.
 -- Coordinates approximate the real landmarks: fine for exercising the spatial
@@ -32,12 +45,13 @@ SET search_path = public, extensions;
 DELETE FROM public.tours WHERE id = 'aaaaaaaa-0000-4000-8000-000000000001';
 
 -- --- Tour ---------------------------------------------------------------------
-INSERT INTO public.tours (id, title, topology, transit_mode, duration_minutes) VALUES
+INSERT INTO public.tours (id, title, topology, transit_mode, duration_minutes, status) VALUES
     ('aaaaaaaa-0000-4000-8000-000000000001',
      'Jerusalem Old City - Historic Morning Walk',
      'in_city',
      'walking',
-     90);
+     90,
+     'published');
 
 -- --- Waypoints ----------------------------------------------------------------
 -- Mixed anchors and one transition. sort_order drives the Screen 3 timeline.
@@ -47,7 +61,7 @@ INSERT INTO public.waypoints (id, tour_id, name, poi_type, geom, sort_order) VAL
     ('bbbbbbbb-0000-4000-8000-000000000001',
      'aaaaaaaa-0000-4000-8000-000000000001',
      'Jaffa Gate',
-     'historic_site',
+     'anchor',
      ST_SetSRID(ST_MakePoint(35.2279, 31.7766), 4326),
      1),
 
@@ -55,7 +69,7 @@ INSERT INTO public.waypoints (id, tour_id, name, poi_type, geom, sort_order) VAL
     ('bbbbbbbb-0000-4000-8000-000000000002',
      'aaaaaaaa-0000-4000-8000-000000000001',
      'Tower of David Citadel',
-     'historic_site',
+     'anchor',
      ST_SetSRID(ST_MakePoint(35.2281, 31.7761), 4326),
      2),
 
@@ -71,7 +85,7 @@ INSERT INTO public.waypoints (id, tour_id, name, poi_type, geom, sort_order) VAL
     ('bbbbbbbb-0000-4000-8000-000000000004',
      'aaaaaaaa-0000-4000-8000-000000000001',
      'Western Wall Plaza',
-     'historic_site',
+     'anchor',
      ST_SetSRID(ST_MakePoint(35.2344, 31.7767), 4326),
      4);
 
@@ -119,12 +133,12 @@ INSERT INTO public.geofence_zones (id, waypoint_id, zone_type, trigger_radius_me
 -- Section 3; the transition gets a short cue.
 --
 -- storage_path is RELATIVE to the `audio-tracks` bucket - no host, no project
--- ref, so these rows are environment-agnostic. Clients resolve a playable URL
--- at read time:
---   supabase.storage.from('audio-tracks').getPublicUrl(storage_path)
+-- ref, so these rows are environment-agnostic. The bucket is PRIVATE, so
+-- clients mint a short-lived URL at download time:
+--   supabase.storage.from('audio-tracks').createSignedUrls([storage_path], 3600)
 --
--- Paths resolve to 404 until audio is actually uploaded to the bucket; the rows
--- exist to exercise the schema, not to stream.
+-- Signing fails with "Object not found" until audio is actually uploaded to the
+-- bucket; these rows exist to exercise the schema, not to stream.
 INSERT INTO public.audio_tracks (id, waypoint_id, storage_path, format, size_bytes, duration_seconds, lufs_normalization) VALUES
     ('dddddddd-0000-4000-8000-000000000001',
      'bbbbbbbb-0000-4000-8000-000000000001',

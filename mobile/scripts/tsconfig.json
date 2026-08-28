@@ -1,4 +1,5 @@
 {
+  "//": "The walk simulator is Node code living inside the mobile app, so it needs a Node lib/types config rather than the React Native one. mobile/tsconfig.json excludes this directory.",
   "compilerOptions": {
     "target": "ES2023",
     "lib": ["ES2023"],
@@ -7,16 +8,11 @@
     "types": ["node"],
     "strict": true,
     "noUncheckedIndexedAccess": true,
-    "verbatimModuleSyntax": true,
-    // backend/media imports siblings as "./probe.ts". Node 24 runs TypeScript
-    // directly by stripping types, and its resolver takes the specifier
-    // literally - so the extension has to be the real one. This option is what
-    // lets tsc agree; it is only legal alongside noEmit, which is set below.
     "allowImportingTsExtensions": true,
     "erasableSyntaxOnly": true,
     "noEmit": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["backend/**/*.ts"]
+  "include": ["**/*.ts"]
 }

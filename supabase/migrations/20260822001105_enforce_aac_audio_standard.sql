@@ -33,15 +33,31 @@ COMMENT ON COLUMN public.audio_tracks.storage_path IS
 
 -- -----------------------------------------------------------------------------
 -- 2. Bucket MIME allowlist
+--
 -- Different tools label .m4a differently, so all three spellings are accepted.
 -- A wrong MIME type is rejected at UPLOAD, which surfaces in the CMS rather
 -- than as a silent playback failure on a device - the better failure mode.
+--
+-- This statement REPLACES the array rather than appending to it, so the list
+-- below must be the complete intended allowlist, not a delta. Anything live but
+-- absent here is dropped.
+--
+-- audio/mpeg was added on PM instruction (TASK-301 review, 27 Aug 2026). It
+-- unblocks the MP3 fallback that architecture_schema.md section 2 sanctions for
+-- sources that cannot be re-encoded - that section explicitly notes MP3 needs
+-- audio/mpeg on the allowlist first, and until now it was missing, so the
+-- fallback was documented but not actually usable.
+--
+-- MP3 remains a fallback, not a second standard: it has no gapless playback,
+-- which matters for the transition cues in PRD section 3. AAC-LC stays the
+-- default and the column default below still says so.
 -- -----------------------------------------------------------------------------
 UPDATE storage.buckets
    SET allowed_mime_types = ARRAY[
          'audio/mp4',
          'audio/m4a',
          'audio/x-m4a',
+         'audio/mpeg',
          'audio/aac'
        ]
  WHERE id = 'audio-tracks';

@@ -10,7 +10,7 @@ export type Database = {
   // Allows to automatically instantiate createClient with right options
   // instead of createClient<Database, { PostgrestVersion: 'XX' }>(URL, KEY)
   __InternalSupabase: {
-    PostgrestVersion: "14.15"
+    PostgrestVersion: "14.17"
   }
   graphql_public: {
     Tables: {
@@ -39,33 +39,63 @@ export type Database = {
   }
   public: {
     Tables: {
+      app_admins: {
+        Row: {
+          email: string | null
+          granted_at: string
+          granted_by: string | null
+          note: string | null
+          user_id: string
+        }
+        Insert: {
+          email?: string | null
+          granted_at?: string
+          granted_by?: string | null
+          note?: string | null
+          user_id: string
+        }
+        Update: {
+          email?: string | null
+          granted_at?: string
+          granted_by?: string | null
+          note?: string | null
+          user_id?: string
+        }
+        Relationships: []
+      }
       audio_tracks: {
         Row: {
+          created_at: string
           duration_seconds: number | null
           format: string | null
           id: string
           lufs_normalization: number | null
           size_bytes: number
           storage_path: string
-          waypoint_id: string | null
+          updated_at: string
+          waypoint_id: string
         }
         Insert: {
+          created_at?: string
           duration_seconds?: number | null
           format?: string | null
           id?: string
           lufs_normalization?: number | null
           size_bytes: number
           storage_path: string
-          waypoint_id?: string | null
+          updated_at?: string
+          waypoint_id: string
         }
         Update: {
+          created_at?: string
           duration_seconds?: number | null
           format?: string | null
           id?: string
           lufs_normalization?: number | null
           size_bytes?: number
           storage_path?: string
-          waypoint_id?: string | null
+          updated_at?: string
+          waypoint_id?: string
         }
         Relationships: [
           {
@@ -79,24 +109,30 @@ export type Database = {
       }
       geofence_zones: {
         Row: {
+          created_at: string
           geom: unknown
           id: string
           trigger_radius_meters: number | null
-          waypoint_id: string | null
+          updated_at: string
+          waypoint_id: string
           zone_type: string
         }
         Insert: {
+          created_at?: string
           geom: unknown
           id?: string
           trigger_radius_meters?: number | null
-          waypoint_id?: string | null
+          updated_at?: string
+          waypoint_id: string
           zone_type: string
         }
         Update: {
+          created_at?: string
           geom?: unknown
           id?: string
           trigger_radius_meters?: number | null
-          waypoint_id?: string | null
+          updated_at?: string
+          waypoint_id?: string
           zone_type?: string
         }
         Relationships: [
@@ -109,54 +145,228 @@ export type Database = {
           },
         ]
       }
-      tours: {
+      telemetry_events: {
         Row: {
-          duration_minutes: number
-          id: string
-          title: string
-          topology: string
-          transit_mode: string
+          app_version: string | null
+          audio_track_id: string | null
+          client_event_id: string
+          device_id: string
+          event_type: string
+          id: number
+          meta: Json | null
+          occurred_at: string
+          platform: string | null
+          position_seconds: number | null
+          received_at: string
+          tour_id: string | null
+          track_seconds: number | null
+          waypoint_id: string | null
         }
         Insert: {
+          app_version?: string | null
+          audio_track_id?: string | null
+          client_event_id: string
+          device_id: string
+          event_type: string
+          id?: never
+          meta?: Json | null
+          occurred_at: string
+          platform?: string | null
+          position_seconds?: number | null
+          received_at?: string
+          tour_id?: string | null
+          track_seconds?: number | null
+          waypoint_id?: string | null
+        }
+        Update: {
+          app_version?: string | null
+          audio_track_id?: string | null
+          client_event_id?: string
+          device_id?: string
+          event_type?: string
+          id?: never
+          meta?: Json | null
+          occurred_at?: string
+          platform?: string | null
+          position_seconds?: number | null
+          received_at?: string
+          tour_id?: string | null
+          track_seconds?: number | null
+          waypoint_id?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "telemetry_events_audio_track_id_fkey"
+            columns: ["audio_track_id"]
+            isOneToOne: false
+            referencedRelation: "audio_tracks"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "telemetry_events_tour_id_fkey"
+            columns: ["tour_id"]
+            isOneToOne: false
+            referencedRelation: "tours"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "telemetry_events_waypoint_id_fkey"
+            columns: ["waypoint_id"]
+            isOneToOne: false
+            referencedRelation: "waypoints"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      tours: {
+        Row: {
+          created_at: string
           duration_minutes: number
-          id?: string
+          id: string
+          start_point: unknown
+          status: string
           title: string
           topology: string
           transit_mode: string
+          updated_at: string
+        }
+        Insert: {
+          created_at?: string
+          duration_minutes: number
+          id?: string
+          start_point?: unknown
+          status?: string
+          title: string
+          topology: string
+          transit_mode: string
+          updated_at?: string
         }
         Update: {
+          created_at?: string
           duration_minutes?: number
           id?: string
+          start_point?: unknown
+          status?: string
           title?: string
           topology?: string
           transit_mode?: string
+          updated_at?: string
         }
         Relationships: []
       }
+      user_itineraries: {
+        Row: {
+          created_at: string
+          deleted_at: string | null
+          id: string
+          notes: string | null
+          planned_for: string | null
+          title: string | null
+          tour_id: string
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          created_at?: string
+          deleted_at?: string | null
+          id?: string
+          notes?: string | null
+          planned_for?: string | null
+          title?: string | null
+          tour_id: string
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          created_at?: string
+          deleted_at?: string | null
+          id?: string
+          notes?: string | null
+          planned_for?: string | null
+          title?: string | null
+          tour_id?: string
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "user_itineraries_tour_id_fkey"
+            columns: ["tour_id"]
+            isOneToOne: false
+            referencedRelation: "tours"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      user_itinerary_waypoints: {
+        Row: {
+          included: boolean
+          itinerary_id: string
+          sort_order: number | null
+          updated_at: string
+          waypoint_id: string
+        }
+        Insert: {
+          included?: boolean
+          itinerary_id: string
+          sort_order?: number | null
+          updated_at?: string
+          waypoint_id: string
+        }
+        Update: {
+          included?: boolean
+          itinerary_id?: string
+          sort_order?: number | null
+          updated_at?: string
+          waypoint_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "user_itinerary_waypoints_itinerary_id_fkey"
+            columns: ["itinerary_id"]
+            isOneToOne: false
+            referencedRelation: "user_itineraries"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "user_itinerary_waypoints_waypoint_id_fkey"
+            columns: ["waypoint_id"]
+            isOneToOne: false
+            referencedRelation: "waypoints"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       waypoints: {
         Row: {
+          created_at: string
           geom: unknown
           id: string
           name: string
           poi_type: string
           sort_order: number
-          tour_id: string | null
+          tour_id: string
+          updated_at: string
         }
         Insert: {
+          created_at?: string
           geom: unknown
           id?: string
           name: string
           poi_type: string
           sort_order: number
-          tour_id?: string | null
+          tour_id: string
+          updated_at?: string
         }
         Update: {
+          created_at?: string
           geom?: unknown
           id?: string
           name?: string
           poi_type?: string
           sort_order?: number
-          tour_id?: string | null
+          tour_id?: string
+          updated_at?: string
         }
         Relationships: [
           {
@@ -170,10 +380,168 @@ export type Database = {
       }
     }
     Views: {
-      [_ in never]: never
+      v_kpi_audio_completion: {
+        Row: {
+          completion_rate: number | null
+          devices_completed: number | null
+          devices_skipped: number | null
+          devices_started: number | null
+          skip_rate: number | null
+          sort_order: number | null
+          tour_id: string | null
+          tour_title: string | null
+          waypoint_id: string | null
+          waypoint_name: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "telemetry_events_tour_id_fkey"
+            columns: ["tour_id"]
+            isOneToOne: false
+            referencedRelation: "tours"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "telemetry_events_waypoint_id_fkey"
+            columns: ["waypoint_id"]
+            isOneToOne: false
+            referencedRelation: "waypoints"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      v_kpi_audio_dropoff: {
+        Row: {
+          abandoned_early: number | null
+          avg_progress_at_stop: number | null
+          median_progress_at_stop: number | null
+          stop_events: number | null
+          tour_id: string | null
+          tour_title: string | null
+          waypoint_id: string | null
+          waypoint_name: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "telemetry_events_tour_id_fkey"
+            columns: ["tour_id"]
+            isOneToOne: false
+            referencedRelation: "tours"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "telemetry_events_waypoint_id_fkey"
+            columns: ["waypoint_id"]
+            isOneToOne: false
+            referencedRelation: "waypoints"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
     }
     Functions: {
-      [_ in never]: never
+      assert_cms_admin: { Args: never; Returns: undefined }
+      audio_object_is_published: {
+        Args: { p_object_name: string }
+        Returns: boolean
+      }
+      cms_publish_tour: {
+        Args: { p_tour_id: string }
+        Returns: {
+          created_at: string
+          duration_minutes: number
+          id: string
+          start_point: unknown
+          status: string
+          title: string
+          topology: string
+          transit_mode: string
+          updated_at: string
+        }
+        SetofOptions: {
+          from: "*"
+          to: "tours"
+          isOneToOne: true
+          isSetofReturn: false
+        }
+      }
+      cms_register_audio_track: {
+        Args: {
+          p_duration_seconds: number
+          p_lufs_normalization?: number
+          p_size_bytes: number
+          p_storage_path: string
+          p_waypoint_id: string
+        }
+        Returns: Json
+      }
+      cms_replace_tour_waypoints: {
+        Args: { p_tour_id: string; p_waypoints: Json }
+        Returns: Json
+      }
+      cms_set_tour_status: {
+        Args: { p_status: string; p_tour_id: string }
+        Returns: {
+          created_at: string
+          duration_minutes: number
+          id: string
+          start_point: unknown
+          status: string
+          title: string
+          topology: string
+          transit_mode: string
+          updated_at: string
+        }
+        SetofOptions: {
+          from: "*"
+          to: "tours"
+          isOneToOne: true
+          isSetofReturn: false
+        }
+      }
+      cms_upsert_tour: {
+        Args: {
+          p_duration_minutes: number
+          p_title: string
+          p_topology: string
+          p_tour_id: string
+          p_transit_mode: string
+        }
+        Returns: {
+          created_at: string
+          duration_minutes: number
+          id: string
+          start_point: unknown
+          status: string
+          title: string
+          topology: string
+          transit_mode: string
+          updated_at: string
+        }
+        SetofOptions: {
+          from: "*"
+          to: "tours"
+          isOneToOne: true
+          isSetofReturn: false
+        }
+      }
+      cms_validate_tour: {
+        Args: { p_tour_id: string }
+        Returns: {
+          code: string
+          detail: string
+          severity: string
+          waypoint_id: string
+        }[]
+      }
+      get_tour_bundle: { Args: { p_tour_id: string }; Returns: Json }
+      is_cms_admin: { Args: never; Returns: boolean }
+      sync_pull_itineraries: { Args: { p_since?: string }; Returns: Json }
+      tour_is_published: { Args: { p_tour_id: string }; Returns: boolean }
+      waypoint_is_published: {
+        Args: { p_waypoint_id: string }
+        Returns: boolean
+      }
     }
     Enums: {
       [_ in never]: never

@@ -1,0 +1,4 @@
+{
+  "//": "Marks the Node harness as ESM. Without it .ts here resolves as CommonJS, which forbids import.meta and warns at runtime. Scoped to scripts/ so the Expo app is untouched.",
+  "type": "module"
+}

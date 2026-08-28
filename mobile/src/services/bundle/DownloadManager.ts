@@ -18,6 +18,12 @@ import type { BundleProgress } from './types';
  * a transfer while the app is suspended. Android ignores the option entirely -
  * the installed type definition says so - so on Android a backgrounded download
  * stalls until the app returns. Persisted resume is what makes that survivable.
+ *
+ * URL NOTE (TASK-400): `DownloadItem.url` is a SIGNED, EXPIRING URL, because the
+ * audio bucket is private. It is a capability with an hour's life, not a stable
+ * address - so it must never be persisted as identity (`storagePath` is that),
+ * and a resume that fails on a dead token falls back to a fresh transfer rather
+ * than failing the bundle. See downloadOne().
  */
 
 export interface DownloadItem {
@@ -144,7 +150,7 @@ export class DownloadManager {
   /**
    * Record a paused task's resume point.
    *
-   * Called both from pause() and from downloadOne() when a transfer resolves
+   * Called both from pause() and from transfer() when a download resolves
    * null. The latter matters: the download promise resolving removes the task
    * from `active`, so waiting for pause() to capture it races with that and
    * would silently lose the resume point.
@@ -178,6 +184,51 @@ export class DownloadManager {
 
     item.destination.parentDirectory.create({ intermediates: true, idempotent: true });
 
+    // EXPIRED-TOKEN FALLBACK (TASK-400).
+    //
+    // A persisted resume point carries the URL that was live when the transfer
+    // first started, baked into native resumeData where nothing can rewrite it.
+    // Now that the audio bucket is private that URL is a signed token with an
+    // hour to live, so a download paused overnight resumes against a dead one.
+    // Storage answers 400 with a small JSON body, the transfer "completes", and
+    // the size check in transfer() rejects those few hundred bytes.
+    //
+    // Without this fallback that state is PERMANENT: the resume record outlives
+    // the failure in AsyncStorage, so every retry replays the same expired
+    // token and the bundle can never be downloaded again. So a failed resume
+    // gets exactly one clean attempt on `item.url`, which TourBundleRepository
+    // re-signs on every download() call.
+    if (resume?.resumeData) {
+      try {
+        await this.transfer(item, resume);
+        return;
+      } catch {
+        // Swallowed on purpose - the fresh attempt below is the real verdict.
+        // A cancel or a pause is not a stale token, so do not burn the retry.
+        if (this.cancelled || this.paused) return;
+      }
+
+      // Whatever the dead resume appended is not part of the file we want.
+      if (item.destination.exists) item.destination.delete();
+      this.written.set(item.storagePath, 0);
+      this.emit();
+    }
+
+    await this.transfer(item, undefined);
+  }
+
+  /**
+   * A single transfer attempt.
+   *
+   * Resolves when the file is complete and has passed size validation, or when
+   * the task was paused - having captured its resume point first. Throws on a
+   * size mismatch, which is what catches both a truncated transfer and an error
+   * body written to disk in place of audio.
+   */
+  private async transfer(
+    item: DownloadItem,
+    resume: DownloadPauseState | undefined,
+  ): Promise<void> {
     const onProgress = ({ bytesWritten }: { bytesWritten: number }): void => {
       this.written.set(item.storagePath, bytesWritten);
       this.emit();

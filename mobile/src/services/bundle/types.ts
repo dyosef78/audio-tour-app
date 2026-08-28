@@ -15,6 +15,15 @@ export type WireGeofence =
   | { type: 'polygon'; ring: LonLat[] };
 
 export interface WireMedia {
+  /**
+   * `audio_tracks.id`. Added by migration 20260828150000 (TASK-507).
+   *
+   * OPTIONAL, and it must stay optional: the migration keeps this field out of
+   * bundle_version_hash so that adding it did not force every user to
+   * re-download every byte of audio they already held. A manifest written before
+   * TASK-507 therefore has no such key, and parsing must not reject it.
+   */
+  audio_track_id?: string | null;
   /** Relative to the `audio-tracks` bucket. Never an absolute URL. */
   storage_path: string;
   duration_seconds: number | null;

@@ -1,3 +1,4 @@
+import Constants from 'expo-constants';
 import { AppState, type AppStateStatus } from 'react-native';
 
 import { AudioService } from '../services/audio/AudioService';
@@ -8,6 +9,7 @@ import {
   stopOrphanedLocationUpdates,
   type GeofenceEvent,
 } from '../services/location/LocationService';
+import { telemetry } from '../services/telemetry/TelemetryService';
 import { useTourSession } from './tourSessionStore';
 import type { LatLng } from '../types/domain';
 
@@ -27,6 +29,22 @@ import type { LatLng } from '../types/domain';
  *   - On cold start, orphaned background tasks are stopped silently and never
  *     resumed, so a killed app cannot leave a ghost draining battery.
  */
+/**
+ * Stamped onto every telemetry event.
+ *
+ * Read from the Expo manifest rather than hardcoded, so a KPI regression can be
+ * attributed to a specific build. Falls back to 'unknown' rather than throwing:
+ * expo-constants shapes differ between dev client and release, and telemetry
+ * must never be able to prevent an app from starting.
+ */
+const APP_VERSION: string = (() => {
+  try {
+    return Constants.expoConfig?.version ?? 'unknown';
+  } catch {
+    return 'unknown';
+  }
+})();
+
 class TourSessionController {
   private location: LocationService | null = null;
   private readonly audio = new AudioService();
@@ -48,6 +66,13 @@ class TourSessionController {
       console.warn('[TourSession] stopped orphaned background location task from a previous run');
     }
     useTourSession.getState().reset();
+
+    // Telemetry starts with the app, not with a tour (TASK-506). The commonest
+    // delivery moment is an app opened on hotel WiFi hours AFTER the walk, so a
+    // queue that only drained during a session would strand exactly the events
+    // a dead-zone tour produced. start() flushes immediately and then listens
+    // for foreground transitions.
+    void telemetry.start(APP_VERSION);
   }
 
   // ---------------------------------------------------------------------------
@@ -124,6 +149,12 @@ class TourSessionController {
       useTourSession.getState().setPlaybackError(err.message);
     });
 
+    // Telemetry is attached before the first geofence can fire, and detached in
+    // doEnd(). audio_started is the denominator of the completion KPI, so a
+    // waypoint triggering between start() and this line would skew the rate.
+    this.audio.setTelemetry(telemetry);
+    void telemetry.record('tour_started', { tourId });
+
     await this.audio.configureSession();
     await service.start();
 
@@ -154,7 +185,7 @@ class TourSessionController {
       if (!track || !uri) return;
 
       try {
-        await this.audio.play(track, uri, waypoint.name);
+        await this.audio.play(track, uri, waypoint);
         // Report playing immediately rather than waiting for the first
         // playbackStatusUpdate. Otherwise the transport button shows "paused"
         // for the gap between tapping and the first event - and stays wrong if
@@ -177,8 +208,23 @@ class TourSessionController {
     }
 
     useTourSession.getState().markExited(waypoint.id);
-    // Zone exit fades out rather than cutting (PRD Screen 4).
-    await this.audio.fadeOutAndStop();
+
+    // Only silence the track THIS waypoint owns.
+    //
+    // fadeOutAndStop() used to be unconditional, which made an exit stop
+    // whatever happened to be playing. That is wrong whenever one fix both
+    // enters a zone and exits another - and with exit hysteresis, that is
+    // reachable on the shipped test tour: the entry radii (20 m + 25 m = 45 m)
+    // clear the 58.7 m gap, but the EXIT radii (x1.6, so 32 m + 40 m = 72 m) do
+    // not. evaluateGeofences() walks waypoints in sort order, so arriving at
+    // stop 1 from stop 2 emitted enter(1) then exit(2), and exit(2) cut off the
+    // narration enter(1) had just started. The user stands at Jaffa Gate in
+    // silence. Reproduced by Phase E of npm run sim:walk.
+    const exiting = waypoint.audio;
+    if (exiting && this.audio.playingTrackId === exiting.id) {
+      // Zone exit fades out rather than cutting (PRD Screen 4).
+      await this.audio.fadeOutAndStop();
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -310,7 +356,10 @@ class TourSessionController {
     }
 
     // createAudioPlayer holds native resources until remove(); stop() does that.
-    await this.audio.stop();
+    // 'audio_stopped' so a tour ended mid-narration is recorded as a drop-off
+    // rather than vanishing from the funnel.
+    await this.audio.stop('audio_stopped');
+    this.audio.setTelemetry(null);
     this.audio.setOnStatus(null);
     this.audio.setOnError(null);
 

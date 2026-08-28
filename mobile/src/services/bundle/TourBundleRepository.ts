@@ -1,6 +1,6 @@
 import { Directory } from 'expo-file-system';
 
-import { publicAudioUrl } from '../supabase/client';
+import { signedAudioUrls } from '../supabase/client';
 import { fetchTourBundle } from '../supabase/bundle';
 import { DownloadManager, type DownloadItem } from './DownloadManager';
 import {
@@ -73,19 +73,43 @@ export class TourBundleRepository {
       return local;
     }
 
+    const tracks = remote.waypoints
+      .map((w) => w.media)
+      .filter((m): m is NonNullable<WireWaypoint['media']> => m !== null);
+
+    // Signed in one batch, and deliberately BEFORE any directory is created:
+    // an unpublished tour should fail here, having written nothing, rather than
+    // leave an empty staging directory behind for the resume path to find.
+    //
+    // These tokens are minted fresh on every call, which is what makes a
+    // resumed download work after its previous URLs have expired.
+    const urls = await signedAudioUrls(tracks.map((m) => m.storage_path));
+
     bundlesRoot().create({ intermediates: true, idempotent: true });
 
     const staging = partialDir(tourId);
     staging.create({ intermediates: true, idempotent: true });
 
-    const items: DownloadItem[] = remote.waypoints
-      .filter((w): w is WireWaypoint & { media: NonNullable<WireWaypoint['media']> } => w.media !== null)
-      .map((w) => ({
-        storagePath: w.media.storage_path,
-        url: publicAudioUrl(w.media.storage_path),
-        destination: mediaFile(staging, w.media.storage_path),
-        sizeBytes: w.media.size_bytes,
-      }));
+    const items: DownloadItem[] = tracks.map((m) => {
+      const url = urls.get(m.storage_path);
+      if (url === undefined) {
+        // The bundle metadata and the storage objects are gated on the same
+        // tours.status, so the realistic cause is an unpublish between the RPC
+        // above and this call. Fail loudly: committing a manifest whose media
+        // is unreachable is precisely what the atomic-commit design prevents.
+        throw new Error(
+          `No audio URL was issued for ${m.storage_path}. ` +
+            'The tour may have been unpublished since its metadata was fetched.',
+        );
+      }
+
+      return {
+        storagePath: m.storage_path,
+        url,
+        destination: mediaFile(staging, m.storage_path),
+        sizeBytes: m.size_bytes,
+      };
+    });
 
     const manager = new DownloadManager(tourId, {
       concurrency: options.concurrency,
@@ -208,12 +232,14 @@ export class TourBundleRepository {
       id: `${w.waypoint_id}:audio`,
       waypointId: w.waypoint_id,
       storagePath: m.storage_path,
+      // Absent from pre-TASK-507 manifests; null rather than undefined so the
+      // telemetry payload shape is identical either way.
+      audioTrackId: m.audio_track_id ?? null,
       durationSeconds: m.duration_seconds,
       format: m.format ?? 'AAC',
       sizeBytes: m.size_bytes,
       // Derived, never stored.
       localUri: resolveLocalUri(tourId, m.storage_path),
-      lufsNormalization: -16,
     };
   }
 }

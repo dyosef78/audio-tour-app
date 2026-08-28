@@ -1,0 +1,93 @@
+# =============================================================================
+# Seed/migration drift gate
+#
+# Three migrations in a row shipped correct SQL with a seed file that had
+# silently stopped matching it, and two of the three produced no error anywhere
+# - the reset succeeded and the catalogue simply loaded invisible.
+#
+# This job is the answer: bring up a real stack, apply every migration in order,
+# load the seed, and assert as ANON that a complete bundle comes back.
+#
+# It runs on any change to migrations, seeds or the verifier, which is exactly
+# the set of files that can cause the drift.
+# =============================================================================
+
+name: Verify database
+
+on:
+  push:
+    paths:
+      - 'supabase/migrations/**'
+      - 'supabase/seed.sql'
+      - 'supabase/config.toml'
+      - 'backend/scripts/verify-bundle.ts'
+      - '.github/workflows/db-verify.yml'
+  pull_request:
+    paths:
+      - 'supabase/migrations/**'
+      - 'supabase/seed.sql'
+      - 'supabase/config.toml'
+      - 'backend/scripts/verify-bundle.ts'
+      - '.github/workflows/db-verify.yml'
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    # A cold `supabase start` pulls a lot of images. Generous, but a hang should
+    # still fail rather than burn a runner for six hours.
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      # Starts Postgres, PostGIS, GoTrue, PostgREST and Storage, then applies
+      # every migration in order. A migration that cannot apply from scratch
+      # fails here - which is the check that the remote `db push` never performs,
+      # since it only ever applies the newest file to an existing database.
+      - name: Start Supabase
+        run: supabase start
+
+      # Migrations, then seed - `db reset` does both, in that order. That
+      # ordering is the whole point: it is what exposes a seed which no longer
+      # satisfies a constraint the migrations add.
+      - name: Reset and seed
+        run: supabase db reset
+
+      # `status -o env` emits shell-style KEY="value" lines. Sourced rather than
+      # written to GITHUB_ENV because GITHUB_ENV only takes effect in LATER
+      # steps, not the one that writes it.
+      - name: Verify bundle as anon
+        run: |
+          set -euo pipefail
+          eval "$(supabase status -o env)"
+          export SUPABASE_URL="${API_URL:?supabase status did not report API_URL}"
+          export SUPABASE_ANON_KEY="${ANON_KEY:?supabase status did not report ANON_KEY}"
+          node backend/scripts/verify-bundle.ts
+
+      # Generated types are committed, and a schema change that does not
+      # regenerate them breaks the next person's build rather than this one.
+      - name: Types are up to date
+        run: |
+          supabase gen types typescript --local > /tmp/supabase.ts
+          if ! diff -q /tmp/supabase.ts backend/types/supabase.ts > /dev/null; then
+            echo "backend/types/supabase.ts is stale. Run: npm run types:generate"
+            diff /tmp/supabase.ts backend/types/supabase.ts || true
+            exit 1
+          fi
+
+      - name: Stop Supabase
+        if: always()
+        run: supabase stop

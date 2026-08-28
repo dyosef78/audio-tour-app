@@ -8,9 +8,11 @@ import { distanceMeters, distanceToZone, isInsideZone } from './geometry';
 /**
  * LocationService - Adaptive GPS + local geofencing (TASK-101 / TASK-102).
  *
- * SKELETON: the pure decision logic is implemented and unit-testable; the parts
- * that touch the OS are marked TODO and throw or no-op rather than pretending
- * to work. Nothing here has run on a device yet.
+ * The pure decision logic is unit-testable and is exercised end to end by
+ * `npm run sim:walk`, which drives this class directly. The OS-facing parts -
+ * watcher restarts, the background task - are implemented but have NOT yet run
+ * on a device; the sampling intervals in transitProfiles.ts are due to be tuned
+ * during field QA.
  *
  * Two responsibilities, deliberately kept separate:
  *
@@ -49,6 +51,27 @@ export interface LocationServiceCallbacks {
   onSamplingChange?: (tier: 'coarse' | 'fine', sampling: GpsSampling) => void;
 }
 
+/**
+ * Minimum time between two APPLIED tier changes (TASK-505).
+ *
+ * Restarting a native watcher is not free - it drops the current fix stream and
+ * re-acquires - so a change requested inside this window is deferred rather than
+ * applied. Paired with the distance hysteresis below, not a substitute for it:
+ * this bounds how OFTEN the hardware can be reconfigured, while the hysteresis
+ * bounds how often a change is asked for at all.
+ */
+const TIER_DWELL_MS = 20_000;
+
+/**
+ * De-escalation needs this much more distance than escalation did.
+ *
+ * The same asymmetry the geofences themselves use. Escalate at
+ * escalateWithinMeters, but do not fall back until 25% beyond it, so a user
+ * pacing the escalation boundary - or a fix jittering across it - cannot flip
+ * the GPS between tiers on alternate samples.
+ */
+const TIER_DEESCALATE_FACTOR = 1.25;
+
 /** Per-waypoint bookkeeping for debounce and hysteresis. */
 interface ZoneState {
   inside: boolean;
@@ -64,6 +87,23 @@ export class LocationService {
   private zoneStates = new Map<string, ZoneState>();
   private currentTier: 'coarse' | 'fine' = 'coarse';
   private watcher: Location.LocationSubscription | null = null;
+
+  /**
+   * Which transport is live, so a tier change reconfigures the RIGHT one.
+   *
+   * Without this the service cannot tell a foreground watcher from a background
+   * task, and an escalation would either restart nothing or restart the thing
+   * that is not running - silently leaving the user on coarse.
+   */
+  private trackingMode: 'idle' | 'foreground' | 'background' = 'idle';
+
+  /** Last fix seen, so a deferred tier change re-decides rather than replays. */
+  private lastFix: LatLng | null = null;
+  /** Timestamp of the last APPLIED tier change, for the dwell check. */
+  private lastTierChangeAt = 0;
+  private tierTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Serialises watcher restarts so overlapping changes cannot interleave. */
+  private applying: Promise<void> = Promise.resolve();
 
   constructor(mode: TransitMode = 'walking') {
     this.profile = profileFor(mode);
@@ -81,6 +121,11 @@ export class LocationService {
       this.waypoints.map((w) => [w.id, { inside: false, lastTriggeredAt: null }]),
     );
     this.currentTier = 'coarse';
+
+    // Adaptive GPS state belongs to the tour that is loaded, not to the service.
+    this.clearTierTimer();
+    this.lastFix = null;
+    this.lastTierChangeAt = 0;
   }
 
   setCallbacks(callbacks: LocationServiceCallbacks): void {
@@ -113,7 +158,21 @@ export class LocationService {
 
   /** Start watching in the foreground at the current sampling tier. */
   async start(): Promise<void> {
-    await this.stop();
+    this.trackingMode = 'foreground';
+    await this.openWatcher();
+  }
+
+  /**
+   * (Re)open the foreground watcher at whatever tier is current.
+   *
+   * Separate from start() because an Adaptive GPS escalation has to reopen the
+   * watcher WITHOUT changing trackingMode - going through start() would be
+   * harmless today but would silently resurrect a foreground watcher if the tier
+   * changed while the app was backgrounded.
+   */
+  private async openWatcher(): Promise<void> {
+    this.watcher?.remove();
+    this.watcher = null;
     this.watcher = await Location.watchPositionAsync(
       this.samplingOptions(this.currentTier),
       (loc) => {
@@ -127,6 +186,13 @@ export class LocationService {
   }
 
   async stop(): Promise<void> {
+    // Order matters. Cancel the deferred escalation, go idle so any restart
+    // already queued becomes a no-op, drain the queue, and only then drop the
+    // watcher - otherwise a restart in flight would hand back a fresh watcher
+    // after the caller believes tracking has stopped.
+    this.clearTierTimer();
+    if (this.trackingMode === 'foreground') this.trackingMode = 'idle';
+    await this.settled();
     this.watcher?.remove();
     this.watcher = null;
   }
@@ -138,9 +204,14 @@ export class LocationService {
    * scope before this runs.
    */
   async startBackground(): Promise<void> {
+    this.trackingMode = 'background';
     const already = await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME);
     if (already) return;
+    await this.openBackgroundUpdates();
+  }
 
+  /** (Re)start the background task at whatever tier is current. See openWatcher. */
+  private async openBackgroundUpdates(): Promise<void> {
     await Location.startLocationUpdatesAsync(LOCATION_TASK_NAME, {
       ...this.samplingOptions(this.currentTier),
       // Android requires a visible notification for a foreground service.
@@ -154,6 +225,13 @@ export class LocationService {
   }
 
   async stopBackground(): Promise<void> {
+    // Same ordering as stop(), and for the same reason - except here a late
+    // restart would leave a background task running with no session behind it,
+    // which is the exact battery drain stopOrphanedLocationUpdates() exists to
+    // clean up on the next cold start.
+    this.clearTierTimer();
+    if (this.trackingMode === 'background') this.trackingMode = 'idle';
+    await this.settled();
     const running = await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME);
     if (running) await Location.stopLocationUpdatesAsync(LOCATION_TASK_NAME);
   }
@@ -173,7 +251,7 @@ export class LocationService {
   onFix(fix: LatLng, accuracyMeters: number | null, timestamp: number = Date.now()): void {
     this.callbacks.onLocation?.(fix, accuracyMeters);
     this.evaluateGeofences(fix, timestamp);
-    void this.applyAdaptiveGps(fix);
+    this.applyAdaptiveGps(fix, timestamp);
   }
 
   private evaluateGeofences(fix: LatLng, timestamp: number): void {
@@ -218,29 +296,126 @@ export class LocationService {
 
   /**
    * Escalate to fine sampling near a waypoint, fall back to coarse when clear
-   * of all of them. Restarting the watcher is not free, so the tier is only
-   * re-applied when it actually changes.
+   * (TASK-505 - this was the TODO(TASK-102) stub).
+   *
+   * Three defences against thrashing the GPS subsystem, because reconfiguring it
+   * is the expensive part and a walker pacing a boundary is the realistic case:
+   *
+   *   1. DISTANCE HYSTERESIS - desiredTier() widens the fall-back threshold by
+   *      TIER_DEESCALATE_FACTOR, so the tier cannot flip on jitter alone.
+   *   2. DWELL TIME - a change requested within TIER_DWELL_MS of the last
+   *      applied one is deferred, not applied.
+   *   3. SERIALISED RESTARTS - every restart is chained onto `applying`, so two
+   *      changes in flight cannot interleave a stop with the wrong start.
+   *
+   * A deferred change re-decides from the latest fix when its timer fires rather
+   * than replaying a stale decision, which matters because the user has usually
+   * kept walking in the meantime.
    */
-  private async applyAdaptiveGps(fix: LatLng): Promise<void> {
+  private applyAdaptiveGps(fix: LatLng, timestamp: number): void {
+    this.lastFix = fix;
+
     const tier = this.desiredTier(fix);
-    if (tier === this.currentTier) return;
 
-    this.currentTier = tier;
-    const sampling = this.profile[tier];
-    this.callbacks.onSamplingChange?.(tier, sampling);
+    if (tier === this.currentTier) {
+      // The user came back before a pending change fired, so it is no longer
+      // wanted. Dropping it here is what stops a boundary-pacer queueing an
+      // endless chain of restarts.
+      this.clearTierTimer();
+      return;
+    }
 
-    // TODO(TASK-102): re-apply to the live subscription. watchPositionAsync has
-    // no mutate-in-place, so this means tearing down and restarting the watcher
-    // - and doing the same for the background task via
-    // stopLocationUpdatesAsync + startLocationUpdatesAsync. Both need to be
-    // debounced so a user pacing the escalation boundary cannot thrash the GPS
-    // subsystem. Not wired up until it can be measured on a real device.
+    const sinceLastChange = timestamp - this.lastTierChangeAt;
+    if (sinceLastChange >= TIER_DWELL_MS) {
+      this.commitTier(tier, timestamp);
+      return;
+    }
+
+    this.scheduleTierChange(TIER_DWELL_MS - sinceLastChange);
   }
 
-  /** Fine when the nearest zone is within the profile's escalation range. */
+  /**
+   * Adopt a tier and push it to whichever transport is actually running.
+   *
+   * onSamplingChange fires before the restart, not after: the debug overlay
+   * should show the tier the service has decided on, and awaiting a native
+   * restart before reporting it would make the UI lag the engine.
+   */
+  private commitTier(tier: 'coarse' | 'fine', timestamp: number): void {
+    this.clearTierTimer();
+    this.currentTier = tier;
+    this.lastTierChangeAt = timestamp;
+    this.callbacks.onSamplingChange?.(tier, this.profile[tier]);
+
+    this.applying = this.applying
+      .then(() => this.restartTracking())
+      .catch((err: unknown) => {
+        // A failed restart must not kill the tour. The previous watcher is gone,
+        // so this is reported loudly - but the session survives, and the next
+        // tier change gets another attempt.
+        console.warn('[LocationService] could not re-apply sampling tier:', err);
+      });
+  }
+
+  /** Re-open whichever transport is live so the new tier reaches the OS. */
+  private async restartTracking(): Promise<void> {
+    if (this.trackingMode === 'foreground') {
+      await this.openWatcher();
+      return;
+    }
+
+    if (this.trackingMode === 'background') {
+      // startLocationUpdatesAsync does not reconfigure a running task, so the
+      // stop is mandatory rather than defensive.
+      const running = await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME);
+      if (running) await Location.stopLocationUpdatesAsync(LOCATION_TASK_NAME);
+      await this.openBackgroundUpdates();
+    }
+
+    // 'idle': nothing is tracking, and the tier will be picked up by whichever
+    // start() runs next - both read currentTier.
+  }
+
+  private scheduleTierChange(delayMs: number): void {
+    // An existing timer is already going to re-decide, so leave it alone rather
+    // than pushing the deadline out on every fix - that would starve the change.
+    if (this.tierTimer !== null) return;
+
+    this.tierTimer = setTimeout(() => {
+      this.tierTimer = null;
+      const fix = this.lastFix;
+      if (fix === null) return;
+
+      // Re-decide from the newest fix. The user has been walking.
+      const tier = this.desiredTier(fix);
+      if (tier !== this.currentTier) this.commitTier(tier, Date.now());
+    }, delayMs);
+  }
+
+  private clearTierTimer(): void {
+    if (this.tierTimer === null) return;
+    clearTimeout(this.tierTimer);
+    this.tierTimer = null;
+  }
+
+  /**
+   * Fine when the nearest zone is within the profile's escalation range.
+   *
+   * Asymmetric on purpose: once fine, the fall-back threshold is widened by
+   * TIER_DEESCALATE_FACTOR. Escalating at 120 m but de-escalating only past
+   * 150 m means a fix wandering either side of 120 m holds its tier instead of
+   * alternating - the same trick that keeps zone entry and exit stable.
+   */
   private desiredTier(fix: LatLng): 'coarse' | 'fine' {
     const nearest = this.distanceToNearestZone(fix);
-    return nearest !== null && nearest <= this.profile.escalateWithinMeters ? 'fine' : 'coarse';
+    if (nearest === null) return 'coarse';
+
+    const threshold =
+      this.currentTier === 'fine'
+        ? this.profile.escalateWithinMeters * TIER_DEESCALATE_FACTOR
+        : this.profile.escalateWithinMeters;
+
+    return nearest <= threshold ? 'fine' : 'coarse';
   }
 
   /** Metres to the closest zone edge, or null when the tour has no zones. */
@@ -267,6 +442,17 @@ export class LocationService {
   // ---------------------------------------------------------------------------
   // Introspection - for the debug geofence visualiser (PRD Screen 3)
   // ---------------------------------------------------------------------------
+
+  /**
+   * Resolves once every queued sampling restart has finished.
+   *
+   * Tier changes are fire-and-forget from onFix()'s point of view - a GPS fix
+   * must never block on a native restart - so this is the seam that lets a test,
+   * or an orderly teardown, wait for the hardware to have caught up.
+   */
+  async settled(): Promise<void> {
+    await this.applying;
+  }
 
   getTier(): 'coarse' | 'fine' {
     return this.currentTier;

@@ -5,3 +5,6 @@ node_modules/
 # Supabase CLI working files
 supabase/.temp/
 supabase/.branches/
+
+# TASK-504 - audio the walk simulator downloads to prove offline lookup.
+mobile/scripts/.sim-bundle/
