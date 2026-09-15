@@ -44,6 +44,13 @@ export class AudioPlayer {
   }
   setActiveForLockScreen(_active: boolean, _meta: { title: string }): void {}
 
+  /** Last seek target. Resolves on a later microtask, like the native call. */
+  seekedTo: number | null = null;
+  async seekTo(seconds: number): Promise<void> {
+    await Promise.resolve();
+    this.seekedTo = seconds;
+  }
+
   /** Test hook: push a status update through the real listener path. */
   emitStatus(status: Partial<AudioStatus>): void {
     const full: AudioStatus = {

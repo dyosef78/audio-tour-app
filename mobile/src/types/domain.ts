@@ -108,6 +108,16 @@ export interface Waypoint {
   sortOrder: number;
   geofence: GeofenceZone | null;
   audio: AudioTrack | null;
+  /**
+   * Optional extended narration for an anchor, played only on request (TASK-602).
+   *
+   * ALWAYS ABSENT TODAY. Nothing in the schema distinguishes a deep dive from
+   * the main narration, and get_tour_bundle() returns one track per waypoint.
+   * Optional so the walk simulator's hand-built waypoints need not change.
+   * By convention its `id` is `<waypoint_id>:deep_dive`, which is what keeps a
+   * zone exit from stopping it (the exit only stops `<waypoint_id>:audio`).
+   */
+  deepDive?: AudioTrack | null;
 }
 
 /** A tour plus everything needed to run it with no network. */

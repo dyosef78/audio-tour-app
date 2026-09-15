@@ -179,6 +179,11 @@ class TourSessionController {
     if (event.type === 'enter') {
       useTourSession.getState().markEntered(waypoint.id);
 
+      // Re-entering the stop whose Deep Dive is playing must not restart the
+      // short narration over it: the listener is plainly still at that stop.
+      // markEntered() keeps deepDiveWaypointId for exactly this case.
+      if (useTourSession.getState().deepDiveWaypointId === waypoint.id) return;
+
       const track = waypoint.audio;
       // localUri is derived at read time by the bundle repository, never stored.
       const uri = track?.localUri;
@@ -190,6 +195,11 @@ class TourSessionController {
         // playbackStatusUpdate. Otherwise the transport button shows "paused"
         // for the gap between tapping and the first event - and stays wrong if
         // that event is delayed. The status feed corrects this either way.
+        //
+        // Guarded: play() reports an unsupported format or a failed create
+        // through onError and then RETURNS normally. Claiming "playing" after
+        // that overwrote the error state setPlaybackError had just reset.
+        if (this.audio.playingTrackId !== track.id) return;
         const s = useTourSession.getState();
         s.setPlayback({
           isPlaying: true,
@@ -259,10 +269,21 @@ class TourSessionController {
     });
   }
 
-  /** Stop narration as a zone exit would, with the same fade-out. */
+  /**
+   * Stop a stop's audio as a zone exit would, with the same fade-out.
+   *
+   * A Deep Dive deliberately survives a zone exit, so the synthetic exit alone
+   * would leave one playing behind a dismissed player. Stop means stop.
+   */
   async releaseWaypoint(waypointId: string): Promise<void> {
     const waypoint = useTourSession.getState().waypoints.find((w) => w.id === waypointId);
     if (!waypoint) return;
+
+    const store = useTourSession.getState();
+    if (store.deepDiveWaypointId === waypointId) {
+      store.endDeepDive();
+      await this.audio.stop('audio_stopped');
+    }
 
     await this.handleGeofence({
       type: 'exit',
@@ -287,6 +308,57 @@ class TourSessionController {
         durationSeconds: s.durationSeconds,
       });
     }
+  }
+
+  /** Seek the current track. The store is updated at once so the highlight moves on tap. */
+  async seekTo(seconds: number): Promise<void> {
+    const target = Math.max(0, seconds);
+    await this.audio.seekTo(target);
+    const s = useTourSession.getState();
+    s.setPlayback({ isPlaying: s.isPlaying, positionSeconds: target, durationSeconds: s.durationSeconds });
+  }
+
+  async rewind(seconds: number): Promise<void> {
+    await this.seekTo(useTourSession.getState().positionSeconds - seconds);
+  }
+
+  /**
+   * Play a stop's Deep Dive in place of its narration (TASK-602).
+   *
+   * Goes through the same AudioService.play() as narration, so the Deep Dive is
+   * a real audio_started/completed/skipped event stream. That is a KPI problem
+   * the handover flags: nothing in the event distinguishes the two kinds.
+   */
+  async playDeepDive(waypointId: string): Promise<void> {
+    const waypoint = useTourSession.getState().waypoints.find((w) => w.id === waypointId);
+    const track = waypoint?.deepDive;
+    const uri = track?.localUri;
+    if (!waypoint || !track || !uri) return;
+
+    // Before play(), not after: a synchronous failure inside play() reports
+    // through setPlaybackError, and startDeepDive would clear that error.
+    useTourSession.getState().startDeepDive(waypoint.id);
+
+    try {
+      await this.audio.play(track, uri, waypoint);
+      if (this.audio.playingTrackId !== track.id) return;
+      useTourSession.getState().setPlayback({
+        isPlaying: true,
+        positionSeconds: 0,
+        durationSeconds: track.durationSeconds ?? 0,
+      });
+    } catch (err) {
+      console.warn(`[TourSession] deep dive failed for ${waypoint.name}:`, err);
+      useTourSession
+        .getState()
+        .setPlaybackError(err instanceof Error ? err.message : 'Could not play the Deep Dive.');
+    }
+  }
+
+  /** Leave a Deep Dive and replay the stop's own narration. */
+  async playNarration(waypointId: string): Promise<void> {
+    useTourSession.getState().endDeepDive();
+    await this.triggerWaypoint(waypointId);
   }
 
   // ---------------------------------------------------------------------------

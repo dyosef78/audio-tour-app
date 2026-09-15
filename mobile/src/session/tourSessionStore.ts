@@ -47,6 +47,14 @@ export interface TourSessionState {
 
   /** Waypoint currently narrating, if any. Drives the player sheet. */
   activeWaypointId: string | null;
+  /**
+   * The waypoint whose Deep Dive is playing instead of its narration (TASK-602).
+   *
+   * A Deep Dive is chosen, not triggered, and runs for minutes, so it survives a
+   * zone exit - the listener has usually wandered on by the end. Entering a
+   * DIFFERENT waypoint still displaces it; see markEntered.
+   */
+  deepDiveWaypointId: string | null;
   /** Waypoints whose geofence has been entered at least once. */
   visitedWaypointIds: string[];
 
@@ -78,6 +86,8 @@ export interface TourSessionActions {
   setPlayback: (snapshot: { isPlaying: boolean; positionSeconds: number; durationSeconds: number }) => void;
   markEntered: (waypointId: string) => void;
   markExited: (waypointId: string) => void;
+  startDeepDive: (waypointId: string) => void;
+  endDeepDive: () => void;
   dismissCompletionPrompt: () => void;
 }
 
@@ -95,6 +105,7 @@ const initial: TourSessionState = {
   positionSeconds: 0,
   durationSeconds: 0,
   activeWaypointId: null,
+  deepDiveWaypointId: null,
   visitedWaypointIds: [],
   completionPrompted: false,
   backgroundPermission: false,
@@ -146,15 +157,23 @@ export const useTourSession = create<TourSessionState & TourSessionActions>((set
         completionPrompted: s.completionPrompted || allVisited,
         // A new stop clears the previous stop's failure.
         playbackError: null,
+        // Re-entering the same stop keeps its Deep Dive; a new stop's narration
+        // displaces it (PM to confirm - see the TASK-602 handover).
+        deepDiveWaypointId: s.deepDiveWaypointId === waypointId ? s.deepDiveWaypointId : null,
       };
     }),
 
   markExited: (waypointId) =>
-    set((s) =>
-      s.activeWaypointId === waypointId
-        ? { activeWaypointId: null, isPlaying: false, positionSeconds: 0, durationSeconds: 0 }
-        : {},
-    ),
+    set((s) => {
+      if (s.activeWaypointId !== waypointId) return {};
+      // Leaving the zone must not hide a Deep Dive the user is still listening to.
+      if (s.deepDiveWaypointId === waypointId) return {};
+      return { activeWaypointId: null, isPlaying: false, positionSeconds: 0, durationSeconds: 0 };
+    }),
+
+  startDeepDive: (waypointId) => set({ deepDiveWaypointId: waypointId, playbackError: null }),
+
+  endDeepDive: () => set({ deepDiveWaypointId: null }),
 
   dismissCompletionPrompt: () => set({ completionPrompted: false }),
 }));

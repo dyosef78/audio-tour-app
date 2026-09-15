@@ -367,6 +367,36 @@ export class AudioService {
     this.player?.play();
   }
 
+  /**
+   * Jump within the current track - transcript taps and the rewind button.
+   *
+   * Emits nothing: telemetry has no seek event, and a seek is neither a start
+   * nor a terminal outcome.
+   *
+   * The stall watchdog is the reason this is more than `player.seekTo()`. It
+   * only re-arms when currentTime EXCEEDS lastPosition, so a backward seek left
+   * it waiting for a position the track would not reach again for as long as
+   * the jump - and after 8 s it tore down perfectly healthy playback as
+   * "stalled". lastPosition is re-baselined twice: before, and again after the
+   * seek lands, because a status tick already in flight carries the OLD
+   * position and would otherwise raise the baseline straight back up.
+   */
+  async seekTo(seconds: number): Promise<void> {
+    const player = this.player;
+    if (player === null) return;
+
+    const target = Math.max(0, seconds);
+    this.lastPosition = target;
+    if (player.playing) this.armStallWatchdog();
+
+    await player.seekTo(target);
+
+    // Stopped or replaced while the seek was in flight.
+    if (this.player !== player) return;
+    this.lastPosition = target;
+    if (player.playing) this.armStallWatchdog();
+  }
+
   /** True while a player exists and is actually producing audio. */
   get isPlaying(): boolean {
     return this.player?.playing ?? false;

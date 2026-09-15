@@ -23,8 +23,17 @@ export function __setFailWrites(fail: boolean): void {
   __failWrites = fail;
 }
 
+/** Force reads to throw, to exercise restore-failure paths (TASK-601). */
+export let __failReads = false;
+export function __setFailReads(fail: boolean): void {
+  __failReads = fail;
+}
+
 const AsyncStorage = {
-  getItem: async (key: string): Promise<string | null> => store.get(key) ?? null,
+  getItem: async (key: string): Promise<string | null> => {
+    if (__failReads) throw new Error('simulated storage read failure');
+    return store.get(key) ?? null;
+  },
   setItem: async (key: string, value: string): Promise<void> => {
     if (__failWrites) throw new Error('simulated storage failure');
     store.set(key, value);
