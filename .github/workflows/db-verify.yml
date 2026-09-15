@@ -79,12 +79,47 @@ jobs:
 
       # Generated types are committed, and a schema change that does not
       # regenerate them breaks the next person's build rather than this one.
+      #
+      # COMPARES THE SCHEMA, NOT THE GENERATOR'S BOILERPLATE (TASK-603).
+      # The committed file comes from `npm run types:generate`, i.e. --linked,
+      # which Supabase's hosted generator produces; this job can only run
+      # --local. The two differ in ways that say nothing about the schema, and
+      # that alone kept this step red on main from aa20049 onward:
+      #   * --linked adds an __InternalSupabase { PostgrestVersion } header that
+      #     --local omits, and its value tracks whichever PostgREST built it;
+      #   * the generic helpers after the Database type (Tables<>, Enums<>, ...)
+      #     are formatted differently between generator versions - parentheses
+      #     and a trailing newline.
+      # So both files are cut down to the Database type, minus that header, and
+      # compared EXACTLY. Every schema, table, view, column, function argument
+      # and return type is still diffed. Only generator boilerplate is ignored.
       - name: Types are up to date
+        shell: bash
         run: |
+          set -euo pipefail
           supabase gen types typescript --local > /tmp/supabase.ts
-          if ! diff -q /tmp/supabase.ts backend/types/supabase.ts > /dev/null; then
+
+          schema_only() {
+            awk '/^export type Database = [{]/ { on = 1 } /^type DatabaseWithoutInternals/ { on = 0 } on' "$1" \
+              | sed -e '/^  \/\/ Allows to automatically instantiate createClient/d' \
+                    -e '/^  \/\/ instead of createClient</d' \
+                    -e '/^  __InternalSupabase: {$/,/^  }$/d'
+          }
+
+          schema_only /tmp/supabase.ts > /tmp/generated.schema
+          schema_only backend/types/supabase.ts > /tmp/committed.schema
+
+          # No vacuous pass: if the generator ever renames these markers, both
+          # extracts would come out empty and compare equal.
+          for f in /tmp/generated.schema /tmp/committed.schema; do
+            if ! grep -q '^  public: {$' "$f"; then
+              echo "Could not extract the Database type from $f - update schema_only() in db-verify.yml."
+              exit 1
+            fi
+          done
+
+          if ! diff -u /tmp/committed.schema /tmp/generated.schema; then
             echo "backend/types/supabase.ts is stale. Run: npm run types:generate"
-            diff /tmp/supabase.ts backend/types/supabase.ts || true
             exit 1
           fi
 
