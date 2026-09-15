@@ -4,9 +4,11 @@
  * Pure - no React Native, no storage - so the route generator in TASK-603 and
  * the Node harness can both import it.
  *
- * The ids are a STORAGE CONTRACT. They are persisted on the device and are
- * intended to match the interest tags the CMS will attach to waypoints, so
- * rename a label freely but never an id.
+ * The ids are a STORAGE CONTRACT. They are persisted on the device, and since
+ * TASK-603 they are also the database tag vocabulary - audience_tag_vocabulary()
+ * and interest_tag_vocabulary() in migration 20260915120000, enforced by CHECK
+ * constraints. Rename a label freely, never an id; `npm run test:cms` fails if
+ * the two lists drift.
  */
 
 export type GroupType = 'solo' | 'couple' | 'friends' | 'family_kids';
@@ -46,6 +48,27 @@ export const TIME_BUDGETS: readonly TimeBudgetOption[] = [
   { id: 'half_day', label: 'Half-day exploration', description: 'Up to four hours', icon: '🌤️', maxMinutes: 240 },
   { id: 'full_day', label: 'Full day', description: 'Take it all in', icon: '🗺️', maxMinutes: 480 },
 ];
+
+const GROUP_TYPE_IDS: ReadonlySet<string> = new Set(GROUP_TYPES.map((o) => o.id));
+const INTEREST_IDS: ReadonlySet<string> = new Set(INTERESTS.map((o) => o.id));
+
+/**
+ * Tags from a bundle, narrowed to the ids this build knows.
+ *
+ * The server vocabulary can widen before an app update ships; an unknown tag
+ * is dropped rather than carried as a value no label or filter can handle.
+ */
+export function parseGroupTypes(values: unknown): GroupType[] {
+  return Array.isArray(values)
+    ? values.filter((v): v is GroupType => typeof v === 'string' && GROUP_TYPE_IDS.has(v))
+    : [];
+}
+
+export function parseInterests(values: unknown): Interest[] {
+  return Array.isArray(values)
+    ? values.filter((v): v is Interest => typeof v === 'string' && INTEREST_IDS.has(v))
+    : [];
+}
 
 export function labelFor<Id extends string>(options: readonly ChoiceOption<Id>[], id: Id): string {
   return options.find((o) => o.id === id)?.label ?? id;

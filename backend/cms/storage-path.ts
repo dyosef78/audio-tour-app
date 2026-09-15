@@ -12,10 +12,33 @@
  *
  * Shape, unchanged from architecture_schema.md and both seed files:
  *
- *     tours/<tour_id>/wp01_jaffa_gate.m4a
+ *     tours/<tour_id>/wp01_jaffa_gate.m4a              narration
+ *     tours/<tour_id>/wp01_jaffa_gate.deep_dive.m4a    Deep Dive   (TASK-603)
+ *     tours/<tour_id>/wp01_jaffa_gate.vtt              transcript of the first
+ *     tours/<tour_id>/wp01_jaffa_gate.deep_dive.vtt    ... and of the second
+ *
+ * The kind segment is not cosmetic. Uploads use upsert, so without it a Deep
+ * Dive for a waypoint would be written OVER that waypoint's narration file -
+ * and the size check in cms_register_audio_track would then refuse the
+ * narration row that still describes it, with nothing pointing at the cause.
  */
 
+import { transcriptPathFor } from '../../mobile/src/transcript/sidecar.ts';
 import { CmsIngestError } from './errors.ts';
+
+/**
+ * Single definition shared with the device, not a mirror: a naming convention
+ * with two implementations is a naming convention with two behaviours.
+ */
+export { transcriptPathFor };
+
+/** Mirrors the audio_tracks_track_kind_check constraint. */
+export const TRACK_KINDS = ['narration', 'deep_dive'] as const;
+export type TrackKind = (typeof TRACK_KINDS)[number];
+
+export function isTrackKind(value: unknown): value is TrackKind {
+  return typeof value === 'string' && (TRACK_KINDS as readonly string[]).includes(value);
+}
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -27,6 +50,8 @@ export interface StoragePathInput {
   /** waypoints.sort_order - what makes the filename unique within a tour. */
   sortOrder: number;
   waypointName: string;
+  /** Defaults to 'narration', whose paths are unchanged from before TASK-603. */
+  trackKind?: TrackKind;
   /** Required when `contentAddressed` is set. */
   sha256?: string;
   /**
@@ -99,6 +124,16 @@ export function buildAudioStoragePath(input: StoragePathInput): string {
     );
   }
 
+  // Checked at runtime too: this is called from JavaScript controllers where
+  // the type is only a hope, and a misspelt kind would silently mean narration.
+  if (input.trackKind !== undefined && !isTrackKind(input.trackKind)) {
+    throw new CmsIngestError(
+      'invalid_request',
+      `trackKind must be one of ${TRACK_KINDS.join(', ')}, got ${String(input.trackKind)}`,
+    );
+  }
+  const kindSegment = input.trackKind === 'deep_dive' ? '.deep_dive' : '';
+
   // Zero-padded so a bucket listing sorts the way the tour plays. Beyond 99
   // stops it simply grows a digit, which sorts wrong at 100 but is honest -
   // and no walking tour has a hundred stops.
@@ -115,7 +150,9 @@ export function buildAudioStoragePath(input: StoragePathInput): string {
     suffix = `.${input.sha256.slice(0, 8)}`;
   }
 
-  const path = `tours/${input.tourId}/wp${index}_${slugifyWaypointName(input.waypointName)}${suffix}.m4a`;
+  const path =
+    `tours/${input.tourId}/wp${index}_${slugifyWaypointName(input.waypointName)}` +
+    `${kindSegment}${suffix}.m4a`;
 
   // Belt and braces. Every input above is already constrained, so reaching this
   // means one of those constraints was loosened and the traversal guard was the

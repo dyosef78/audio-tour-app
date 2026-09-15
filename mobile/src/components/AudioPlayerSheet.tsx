@@ -396,7 +396,7 @@ function ControlButton({
 
 /**
  * Always visible on an anchor stop, per the brief - disabled with a reason
- * when the stop has no Deep Dive, which today is every stop.
+ * when the downloaded bundle holds no Deep Dive for the stop.
  */
 function DeepDiveButton({ waypoint, active }: { waypoint: Waypoint; active: boolean }) {
   if (active) {

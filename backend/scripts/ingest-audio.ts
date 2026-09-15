@@ -11,6 +11,10 @@
  *                          --sort <n> --name "Jaffa Gate" [options]
  *
  * Options:
+ *   --kind <kind>        narration (default) or deep_dive (TASK-603)
+ *   --transcript <file>  a WebVTT transcript to upload beside the track. It is
+ *                        validated BEFORE the audio is encoded, so a bad file
+ *                        costs nothing; the duration check runs after.
  *   --dry-run            process and name the file; touch neither Storage nor
  *                        the database. Needs no credentials at all.
  *   --content-addressed  append the content hash to the filename (decision D5)
@@ -27,10 +31,21 @@
  * service_role path through this service. See backend/cms/client.ts.
  */
 
+import { readFile } from 'node:fs/promises';
+
 import { createClient } from '@supabase/supabase-js';
 
 import { MediaPipelineError } from '../media/index.ts';
-import { CmsIngestError, ingestWaypointAudio, type AudioIngestResult } from '../cms/index.ts';
+import {
+  CmsIngestError,
+  checkTranscript,
+  ingestTrackTranscript,
+  ingestWaypointAudio,
+  isTrackKind,
+  type AudioIngestResult,
+  type TrackKind,
+  type TranscriptIngestResult,
+} from '../cms/index.ts';
 
 interface Args {
   file: string;
@@ -38,6 +53,8 @@ interface Args {
   waypointId: string;
   sortOrder: number;
   waypointName: string;
+  trackKind: TrackKind;
+  transcript: string | null;
   dryRun: boolean;
   contentAddressed: boolean;
   json: boolean;
@@ -70,6 +87,8 @@ function parseArgs(argv: readonly string[]): Args {
       case '--tour':
       case '--waypoint':
       case '--sort':
+      case '--kind':
+      case '--transcript':
       case '--name': {
         const value = argv[++i];
         if (value === undefined) fail(`${arg} needs a value.`);
@@ -92,14 +111,21 @@ function parseArgs(argv: readonly string[]): Args {
       sort === undefined || name === undefined) {
     fail(
       'Usage: npm run cms:ingest -- <file> --tour <uuid> --waypoint <uuid> ' +
-        '--sort <n> --name "Waypoint name" [--dry-run] [--content-addressed] [--json]',
+        '--sort <n> --name "Waypoint name" [--kind deep_dive] [--transcript file.vtt] ' +
+        '[--dry-run] [--content-addressed] [--json]',
     );
   }
 
   const sortOrder = Number(sort);
   if (!Number.isInteger(sortOrder) || sortOrder < 0) fail('--sort must be a non-negative integer.');
 
-  return { file, tourId, waypointId, sortOrder, waypointName: name, dryRun, contentAddressed, json, deleteSource };
+  const kind = named.get('--kind') ?? 'narration';
+  if (!isTrackKind(kind)) fail('--kind must be narration or deep_dive.');
+
+  return {
+    file, tourId, waypointId, sortOrder, waypointName: name, trackKind: kind,
+    transcript: named.get('--transcript') ?? null, dryRun, contentAddressed, json, deleteSource,
+  };
 }
 
 /**
@@ -156,6 +182,7 @@ function report(result: AudioIngestResult, dryRun: boolean): void {
 
   console.log('\naudio_tracks row');
   console.log(`  track_id           ${result.trackId ?? '- (dry run)'}`);
+  console.log(`  track_kind         ${result.trackKind}`);
   console.log(`  storage_path       ${result.storagePath}`);
   console.log(`  size_bytes         ${result.sizeBytes}`);
   console.log(`  duration_seconds   ${result.durationSeconds}`);
@@ -169,22 +196,58 @@ function report(result: AudioIngestResult, dryRun: boolean): void {
   }
 }
 
+function reportTranscript(result: TranscriptIngestResult): void {
+  console.log(`\nTranscript${result.uploaded ? '' : ' (dry run - validated only)'}`);
+  console.log(`  audio-tracks/${result.storagePath}`);
+  console.log(`  ${result.cueCount} cues, ${result.sizeBytes} bytes`);
+  for (const warning of result.warnings) console.log(`  - ${warning}`);
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
 
+  // Fail on a broken transcript before spending an encode on the audio. The
+  // duration comparison needs the processed track, so it runs again after.
+  if (args.transcript !== null) {
+    try {
+      checkTranscript(await readFile(args.transcript), null);
+    } catch (error) {
+      if (error instanceof CmsIngestError) throw error;
+      fail(`Could not read ${args.transcript}.`);
+    }
+  }
+
+  const accessToken = args.dryRun ? null : await adminAccessToken();
+
   const result = await ingestWaypointAudio({
-    ...(args.dryRun ? {} : { accessToken: await adminAccessToken() }),
+    ...(accessToken === null ? {} : { accessToken }),
     tourId: args.tourId,
     waypointId: args.waypointId,
     sortOrder: args.sortOrder,
     waypointName: args.waypointName,
+    trackKind: args.trackKind,
     contentAddressed: args.contentAddressed,
     dryRun: args.dryRun,
     source: { path: args.file, filename: args.file, deleteAfter: args.deleteSource },
   });
 
-  if (args.json) console.log(JSON.stringify(result, null, 2));
-  else report(result, args.dryRun);
+  const transcript =
+    args.transcript === null
+      ? null
+      : await ingestTrackTranscript({
+          ...(accessToken === null ? {} : { accessToken }),
+          audioStoragePath: result.storagePath,
+          source: { path: args.transcript },
+          dryRun: args.dryRun,
+          audioDurationSeconds: result.durationSeconds,
+        });
+
+  if (args.json) {
+    console.log(JSON.stringify(transcript === null ? result : { ...result, transcript }, null, 2));
+  } else {
+    report(result, args.dryRun);
+    if (transcript !== null) reportTranscript(transcript);
+  }
 
   process.exit(0);
 }

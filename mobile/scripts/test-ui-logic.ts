@@ -12,7 +12,15 @@
 
 import { mock } from 'node:test';
 
-import { routeCriteria, tourFitsBudget } from '../src/personalization/options.ts';
+import {
+  parseGroupTypes,
+  parseInterests,
+  routeCriteria,
+  tourFitsBudget,
+} from '../src/personalization/options.ts';
+import { planBundleFiles } from '../src/services/bundle/plan.ts';
+import type { WireBundle } from '../src/services/bundle/types.ts';
+import { transcriptPathFor } from '../src/transcript/sidecar.ts';
 import { usePreferences, usePreferencesBoot } from '../src/personalization/preferencesStore.ts';
 import { AudioService, type PlaybackError } from '../src/services/audio/AudioService.ts';
 import { useTourSession } from '../src/session/tourSessionStore.ts';
@@ -272,6 +280,82 @@ if (player) {
 }
 
 mock.timers.reset();
+
+// -----------------------------------------------------------------------------
+// TASK-603: what a bundle download fetches
+// -----------------------------------------------------------------------------
+
+heading('planBundleFiles');
+
+const T = 'tours/t';
+const media = (path: string, size: number, transcript?: { storage_path: string; size_bytes: number } | null) => ({
+  storage_path: path,
+  size_bytes: size,
+  duration_seconds: 10,
+  format: 'AAC',
+  ...(transcript === undefined ? {} : { transcript }),
+});
+const wp = (id: string, sort: number, extra: Partial<WireBundle['waypoints'][number]>) => ({
+  waypoint_id: id,
+  name: `Stop ${id}`,
+  poi_type: 'anchor',
+  sort_order: sort,
+  coordinates: [34.79, 32.08] as [number, number],
+  geofence: null,
+  media: null,
+  ...extra,
+});
+
+const bundlePlan = planBundleFiles({
+  bundle_version_hash: 'h',
+  tour_metadata: { tour_id: 't', title: 'T', topology: 'in_city', transit_mode: 'walking', duration_minutes: 30 },
+  waypoints: [
+    wp('a', 1, {
+      media: media(`${T}/wp01_a.m4a`, 100, { storage_path: `${T}/wp01_a.vtt`, size_bytes: 20 }),
+      deep_dive: media(`${T}/wp01_a.deep_dive.m4a`, 900, { storage_path: `${T}/wp01_a.deep_dive.vtt`, size_bytes: 80 }),
+    }),
+    // Shares a's recording AND its transcript.
+    wp('b', 2, { media: media(`${T}/wp01_a.m4a`, 100, { storage_path: `${T}/wp01_a.vtt`, size_bytes: 20 }) }),
+    // A pre-TASK-603 manifest: no transcript, deep_dive or tag keys at all.
+    wp('c', 3, { media: media(`${T}/wp03_c.m4a`, 50) }),
+    // A transcript at the wrong name, and a deep dive transcript with no size.
+    wp('d', 4, {
+      media: media(`${T}/wp04_d.m4a`, 60, { storage_path: `${T}/elsewhere.vtt`, size_bytes: 10 }),
+      deep_dive: media(`${T}/wp04_d.deep_dive.m4a`, 70, { storage_path: `${T}/wp04_d.deep_dive.vtt`, size_bytes: 0 }),
+    }),
+    wp('e', 5, { media: null, deep_dive: null }),
+  ],
+});
+
+eq('narration, deep dives and valid transcripts, de-duplicated, in tour order', bundlePlan.files.map((f) => f.storagePath), [
+  `${T}/wp01_a.m4a`,
+  `${T}/wp01_a.vtt`,
+  `${T}/wp01_a.deep_dive.m4a`,
+  `${T}/wp01_a.deep_dive.vtt`,
+  `${T}/wp03_c.m4a`,
+  `${T}/wp04_d.m4a`,
+  `${T}/wp04_d.deep_dive.m4a`,
+]);
+eq('kinds recorded', bundlePlan.files.map((f) => f.kind), [
+  'narration', 'transcript', 'deep_dive', 'transcript', 'narration', 'narration', 'deep_dive',
+]);
+eq('transcript sizes carried for validation', bundlePlan.files.find((f) => f.kind === 'transcript')?.sizeBytes, 20);
+eq('two bad transcript entries skipped with warnings, not failures', bundlePlan.warnings.length, 2);
+assert(
+  'the mis-named transcript names the path it expected',
+  bundlePlan.warnings.some((w) => w.includes('expected tours/t/wp04_d.vtt')),
+  JSON.stringify(bundlePlan.warnings),
+);
+
+heading('Bundle tags and sidecar paths');
+
+eq('unknown and non-string interests dropped', parseInterests(['history', 'shopping', 3, null, 'nature']), ['history', 'nature']);
+eq('absent tags parse as untagged', parseGroupTypes(undefined), []);
+eq('audiences filtered to known ids', parseGroupTypes(['family_kids', 'couples']), ['family_kids']);
+eq('m4a sidecar', transcriptPathFor('tours/t/wp01_a.m4a'), 'tours/t/wp01_a.vtt');
+eq('deep dive sidecar', transcriptPathFor('tours/t/wp01_a.deep_dive.m4a'), 'tours/t/wp01_a.deep_dive.vtt');
+eq('MP3 fallback, any case', transcriptPathFor('tours/t/B.MP3'), 'tours/t/B.vtt');
+eq('no audio extension, no sidecar (never the file itself)', transcriptPathFor('tours/t/a.opus'), null);
 
 // -----------------------------------------------------------------------------
 

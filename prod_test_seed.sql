@@ -21,13 +21,18 @@ SET search_path = public, extensions;
 DELETE FROM public.tours WHERE id = 'eeeeeeee-0000-4000-8000-000000000001';
 
 -- --- Tour ---------------------------------------------------------------------
-INSERT INTO public.tours (id, title, topology, transit_mode, duration_minutes, status) VALUES
+-- audiences/interests need migrations 20260915120000+ (TASK-603). Run against a
+-- database without them and this INSERT fails on the unknown column - loudly,
+-- which is the right way round.
+INSERT INTO public.tours (id, title, topology, transit_mode, duration_minutes, status, audiences, interests) VALUES
     ('eeeeeeee-0000-4000-8000-000000000001',
      '[TEST] Jerusalem Gate Walk - delete after TASK-202',
      'in_city',
      'walking',
      15,
-     'published');
+     'published',
+     ARRAY['solo'],
+     ARRAY['history']);
 
 -- --- Waypoints ----------------------------------------------------------------
 -- Jaffa Gate and the Tower of David: 58.7 m apart, which matters.
@@ -70,6 +75,11 @@ INSERT INTO public.waypoints (id, tour_id, name, poi_type, geom, sort_order) VAL
      'anchor',
      ST_SetSRID(ST_MakePoint(35.2281, 31.7761), 4326),
      2);
+
+-- Waypoint tags (TASK-603); values from interest_tag_vocabulary().
+UPDATE public.waypoints
+   SET interests = ARRAY['architecture', 'history']
+ WHERE tour_id = 'eeeeeeee-0000-4000-8000-000000000001';
 
 -- --- Geofence zones -----------------------------------------------------------
 -- geom is NOT NULL geometry(Polygon, 4326), so a radius zone still needs a real

@@ -1,5 +1,6 @@
 import { bundleDir, mediaFile } from '../services/bundle/paths';
 import type { AudioTrack } from '../types/domain';
+import { transcriptPathFor } from './sidecar';
 import { parseVtt, type Cue } from './vtt';
 
 export type TranscriptLoad =
@@ -7,18 +8,13 @@ export type TranscriptLoad =
   | { status: 'missing' }
   | { status: 'invalid'; message: string };
 
-/**
- * Where a track's transcript would live: beside the audio, same name, `.vtt`.
- *
- * PROVISIONAL CONTRACT (TASK-602). No transcript exists anywhere in the system
- * yet - not in the schema, the bundle RPC, the bucket, or the downloader. This
- * sidecar convention is the smallest thing the UI can be built against, and it
- * stays inside the bundle directory so it inherits the derive-never-store rule
- * from paths.ts. The handover report proposes the backend side.
+/*
+ * Transcripts are found by convention - beside the audio, `.vtt` - through
+ * transcriptPathFor(), the same function the downloader checks the server's
+ * claim against (bundle/plan.ts). So a transcript is readable here exactly
+ * when it was downloaded, with no path stored anywhere, which keeps the
+ * derive-never-store rule from paths.ts.
  */
-export function sidecarPath(storagePath: string): string | null {
-  return /\.m4a$/i.test(storagePath) ? storagePath.replace(/\.m4a$/i, '.vtt') : null;
-}
 
 export class TranscriptRepository {
   /**
@@ -28,7 +24,7 @@ export class TranscriptRepository {
    * kilobytes, and it is read once when the player is expanded.
    */
   static load(tourId: string, track: AudioTrack): TranscriptLoad {
-    const path = sidecarPath(track.storagePath);
+    const path = transcriptPathFor(track.storagePath);
 
     let text: string | null = null;
     if (path !== null) {

@@ -96,7 +96,7 @@ export default function TourDetailScreen({ route, navigation }: TourDetailScreen
               ` · ${fmtMB(state.progress.bytesWritten)} of ${fmtMB(state.progress.totalBytes)}`}
           </Text>
           <Text style={styles.muted}>
-            {state.progress.filesCompleted} of {state.progress.filesTotal} tracks
+            {state.progress.filesCompleted} of {state.progress.filesTotal} files
           </Text>
         </>
       )}

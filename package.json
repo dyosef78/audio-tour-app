@@ -23,6 +23,7 @@
     "cms:ingest": "node --env-file-if-exists=.env backend/scripts/ingest-audio.ts",
     "sim:walk": "node --env-file-if-exists=.env --import ./mobile/scripts/register-stubs.mjs mobile/scripts/simulate-walk.ts",
     "test:telemetry": "node --env-file-if-exists=.env --import ./mobile/scripts/register-stubs.mjs mobile/scripts/test-telemetry.ts",
+    "test:cms": "node backend/scripts/test-cms.ts",
     "test:ui": "node --import ./mobile/scripts/register-stubs.mjs mobile/scripts/test-ui-logic.ts",
     "seed:telaviv": "node --env-file-if-exists=.env backend/scripts/seed-tel-aviv-qa.ts"
   },

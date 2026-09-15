@@ -20,7 +20,13 @@ export type CmsErrorCode =
   /** Storage refused the object. Usually RLS, occasionally the MIME allowlist. */
   | 'upload_failed'
   /** cms_register_audio_track raised. The object has been rolled back. */
-  | 'register_failed';
+  | 'register_failed'
+  /** A transcript failed validation with the device's own WebVTT parser. Nothing was uploaded. */
+  | 'invalid_transcript'
+  /** A transcript names an audio path no registered track uses. Nothing was uploaded. */
+  | 'track_not_found'
+  /** The lookup that proves the track exists could not run. Nothing was uploaded. */
+  | 'lookup_failed';
 
 export interface CmsIngestErrorOptions {
   detail?: string;

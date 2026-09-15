@@ -9,10 +9,16 @@ import type { BundleProgress } from './types';
  * A bounded-concurrency queue of `DownloadTask`s with pause/resume state
  * persisted across app launches.
  *
- * Progress is computed against a denominator taken from `audio_tracks.size_bytes`
- * rather than from `Content-Length`, because `onProgress` reports `totalBytes`
- * as -1 whenever the server omits that header. Using the database figure means
- * the bar is accurate from the first byte and never jumps.
+ * Progress is computed against a denominator taken from the bundle's declared
+ * sizes - `audio_tracks.size_bytes` for audio, Storage's object size for
+ * transcript sidecars - rather than from `Content-Length`, because `onProgress`
+ * reports `totalBytes` as -1 whenever the server omits that header. Using the
+ * declared figure means the bar is accurate from the first byte and never jumps.
+ *
+ * KIND-AGNOSTIC (TASK-603). Narration, Deep Dives and .vtt transcripts are all
+ * just items with a path, a URL and an exact size; which files a bundle needs
+ * is decided upstream in bundle/plan.ts. Every item gets the same size check,
+ * so a transcript truncated in transit fails the bundle like audio would.
  *
  * PLATFORM NOTE: `sessionType` defaults to 'background', which lets iOS continue
  * a transfer while the app is suspended. Android ignores the option entirely -
@@ -140,7 +146,7 @@ export class DownloadManager {
     if (this.completed.size < this.items.length) {
       await this.persistCaptured();
       throw new Error(
-        `Download incomplete: ${this.completed.size} of ${this.items.length} tracks finished. Resume to continue.`,
+        `Download incomplete: ${this.completed.size} of ${this.items.length} files finished. Resume to continue.`,
       );
     }
 

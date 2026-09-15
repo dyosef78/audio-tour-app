@@ -14,6 +14,8 @@
  * can map the generated Row types onto these.
  */
 
+import type { GroupType, Interest } from '../personalization/options';
+
 /** Longitude/latitude in WGS84 (SRID 4326), matching raw GPS fixes. */
 export interface LatLng {
   latitude: number;
@@ -109,15 +111,17 @@ export interface Waypoint {
   geofence: GeofenceZone | null;
   audio: AudioTrack | null;
   /**
-   * Optional extended narration for an anchor, played only on request (TASK-602).
+   * Optional extended narration, played only on request (TASK-602).
    *
-   * ALWAYS ABSENT TODAY. Nothing in the schema distinguishes a deep dive from
-   * the main narration, and get_tour_bundle() returns one track per waypoint.
-   * Optional so the walk simulator's hand-built waypoints need not change.
-   * By convention its `id` is `<waypoint_id>:deep_dive`, which is what keeps a
-   * zone exit from stopping it (the exit only stops `<waypoint_id>:audio`).
+   * From the bundle's `deep_dive` (audio_tracks.track_kind = 'deep_dive',
+   * TASK-603). Optional so the walk simulator's hand-built waypoints need not
+   * change. Its `id` is `<waypoint_id>:deep_dive`, which is what keeps a zone
+   * exit from stopping it (the exit only stops `<waypoint_id>:audio`).
    */
   deepDive?: AudioTrack | null;
+  /** Preference tags for route filtering (TASK-603). Empty = not restricted. */
+  audiences?: readonly GroupType[];
+  interests?: readonly Interest[];
 }
 
 /** A tour plus everything needed to run it with no network. */

@@ -5,6 +5,10 @@
  * Snake_case is deliberate - this is the server contract, not a domain type.
  * `TourBundleRepository` maps it into the camelCase domain types in
  * `types/domain.ts` at load time, so exactly one module knows both shapes.
+ *
+ * EVERY KEY ADDED AFTER A RELEASE IS OPTIONAL. Manifests are written to disk and
+ * read back by later builds, so a manifest from before TASK-507 or TASK-603
+ * must still parse.
  */
 
 /** [longitude, latitude] - GeoJSON axis order, as the manifest spec defines. */
@@ -13,6 +17,12 @@ export type LonLat = [number, number];
 export type WireGeofence =
   | { type: 'radius'; radius_meters: number | null; center: LonLat }
   | { type: 'polygon'; ring: LonLat[] };
+
+/** A WebVTT sidecar found beside the audio in storage (TASK-603). */
+export interface WireTranscript {
+  storage_path: string;
+  size_bytes: number;
+}
 
 export interface WireMedia {
   /**
@@ -24,11 +34,15 @@ export interface WireMedia {
    * TASK-507 therefore has no such key, and parsing must not reject it.
    */
   audio_track_id?: string | null;
+  /** 'narration' under `media`, 'deep_dive' under `deep_dive`. Absent before TASK-603. */
+  track_kind?: string;
   /** Relative to the `audio-tracks` bucket. Never an absolute URL. */
   storage_path: string;
   duration_seconds: number | null;
   size_bytes: number;
   format: string | null;
+  /** Null when no transcript is published beside this track. Absent before TASK-603. */
+  transcript?: WireTranscript | null;
 }
 
 export interface WireWaypoint {
@@ -38,7 +52,13 @@ export interface WireWaypoint {
   sort_order: number;
   coordinates: LonLat;
   geofence: WireGeofence | null;
+  /** The geofence narration. Never a Deep Dive since TASK-603. */
   media: WireMedia | null;
+  /** Optional extended track (TASK-603). */
+  deep_dive?: WireMedia | null;
+  /** Preference tags (TASK-603). Values may postdate this build - filter, do not trust. */
+  audiences?: string[];
+  interests?: string[];
 }
 
 export interface WireBundle {
@@ -50,6 +70,8 @@ export interface WireBundle {
     topology: string;
     transit_mode: string;
     duration_minutes: number;
+    audiences?: string[];
+    interests?: string[];
   };
   waypoints: WireWaypoint[];
 }

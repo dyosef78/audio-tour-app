@@ -1,8 +1,10 @@
 import { Directory } from 'expo-file-system';
 
+import { parseGroupTypes, parseInterests } from '../../personalization/options';
 import { signedAudioUrls } from '../supabase/client';
 import { fetchTourBundle } from '../supabase/bundle';
 import { DownloadManager, type DownloadItem } from './DownloadManager';
+import { planBundleFiles } from './plan';
 import {
   bundleDir,
   bundlesRoot,
@@ -11,7 +13,13 @@ import {
   partialDir,
   resolveLocalUri,
 } from './paths';
-import { isWireBundle, type BundleProgress, type WireBundle, type WireWaypoint } from './types';
+import {
+  isWireBundle,
+  type BundleProgress,
+  type WireBundle,
+  type WireMedia,
+  type WireWaypoint,
+} from './types';
 import type {
   AudioTrack,
   GeofenceZone,
@@ -73,41 +81,45 @@ export class TourBundleRepository {
       return local;
     }
 
-    const tracks = remote.waypoints
-      .map((w) => w.media)
-      .filter((m): m is NonNullable<WireWaypoint['media']> => m !== null);
+    // Narration, Deep Dives and transcript sidecars, de-duplicated by path
+    // (TASK-603). Every file lands at its bucket path inside the bundle, which
+    // is what lets TranscriptRepository find a transcript by convention.
+    const plan = planBundleFiles(remote);
+    for (const warning of plan.warnings) console.warn('[Bundle]', warning);
 
     // Signed in one batch, and deliberately BEFORE any directory is created:
     // an unpublished tour should fail here, having written nothing, rather than
     // leave an empty staging directory behind for the resume path to find.
     //
     // These tokens are minted fresh on every call, which is what makes a
-    // resumed download work after its previous URLs have expired.
-    const urls = await signedAudioUrls(tracks.map((m) => m.storage_path));
+    // resumed download work after its previous URLs have expired. Transcripts
+    // sign through the same policy as audio since migration 20260915120000.
+    const urls = await signedAudioUrls(plan.files.map((f) => f.storagePath));
 
     bundlesRoot().create({ intermediates: true, idempotent: true });
 
     const staging = partialDir(tourId);
     staging.create({ intermediates: true, idempotent: true });
 
-    const items: DownloadItem[] = tracks.map((m) => {
-      const url = urls.get(m.storage_path);
+    const items: DownloadItem[] = plan.files.map((f) => {
+      const url = urls.get(f.storagePath);
       if (url === undefined) {
         // The bundle metadata and the storage objects are gated on the same
         // tours.status, so the realistic cause is an unpublish between the RPC
         // above and this call. Fail loudly: committing a manifest whose media
         // is unreachable is precisely what the atomic-commit design prevents.
+        // A transcript is no exception - the bundle promised it.
         throw new Error(
-          `No audio URL was issued for ${m.storage_path}. ` +
+          `No download URL was issued for ${f.storagePath} (${f.kind}). ` +
             'The tour may have been unpublished since its metadata was fetched.',
         );
       }
 
       return {
-        storagePath: m.storage_path,
+        storagePath: f.storagePath,
         url,
-        destination: mediaFile(staging, m.storage_path),
-        sizeBytes: m.size_bytes,
+        destination: mediaFile(staging, f.storagePath),
+        sizeBytes: f.sizeBytes,
       };
     });
 
@@ -194,7 +206,11 @@ export class TourBundleRepository {
       coordinate: { latitude, longitude },
       sortOrder: w.sort_order,
       geofence: this.toGeofence(w),
-      audio: this.toAudio(tourId, w),
+      audio: this.toAudio(tourId, w.waypoint_id, w.media, 'audio'),
+      deepDive: this.toAudio(tourId, w.waypoint_id, w.deep_dive ?? null, 'deep_dive'),
+      // Absent in pre-TASK-603 manifests, which parse as untagged.
+      audiences: parseGroupTypes(w.audiences),
+      interests: parseInterests(w.interests),
     };
   }
 
@@ -224,13 +240,22 @@ export class TourBundleRepository {
     };
   }
 
-  private static toAudio(tourId: string, w: WireWaypoint): AudioTrack | null {
-    const m = w.media;
+  /**
+   * `slot` becomes the synthetic id suffix. The session controller relies on
+   * it: a zone exit stops only `<waypoint_id>:audio`, which is what lets a
+   * Deep Dive keep playing after the listener walks on.
+   */
+  private static toAudio(
+    tourId: string,
+    waypointId: string,
+    m: WireMedia | null,
+    slot: 'audio' | 'deep_dive',
+  ): AudioTrack | null {
     if (!m) return null;
 
     return {
-      id: `${w.waypoint_id}:audio`,
-      waypointId: w.waypoint_id,
+      id: `${waypointId}:${slot}`,
+      waypointId,
       storagePath: m.storage_path,
       // Absent from pre-TASK-507 manifests; null rather than undefined so the
       // telemetry payload shape is identical either way.

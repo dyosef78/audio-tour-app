@@ -45,13 +45,18 @@ SET search_path = public, extensions;
 DELETE FROM public.tours WHERE id = 'aaaaaaaa-0000-4000-8000-000000000001';
 
 -- --- Tour ---------------------------------------------------------------------
-INSERT INTO public.tours (id, title, topology, transit_mode, duration_minutes, status) VALUES
+-- audiences/interests (TASK-603) must come from audience_tag_vocabulary() and
+-- interest_tag_vocabulary(). A typo fails `db reset` on the CHECK constraint,
+-- which is exactly the drift this file has caught before.
+INSERT INTO public.tours (id, title, topology, transit_mode, duration_minutes, status, audiences, interests) VALUES
     ('aaaaaaaa-0000-4000-8000-000000000001',
      'Jerusalem Old City - Historic Morning Walk',
      'in_city',
      'walking',
      90,
-     'published');
+     'published',
+     ARRAY['couple', 'friends', 'solo'],
+     ARRAY['architecture', 'history']);
 
 -- --- Waypoints ----------------------------------------------------------------
 -- Mixed anchors and one transition. sort_order drives the Screen 3 timeline.
@@ -88,6 +93,20 @@ INSERT INTO public.waypoints (id, tour_id, name, poi_type, geom, sort_order) VAL
      'anchor',
      ST_SetSRID(ST_MakePoint(35.2344, 31.7767), 4326),
      4);
+
+-- --- Waypoint tags (TASK-603) -------------------------------------------------
+-- UPDATEs rather than extra VALUES columns, so the tuples above stay readable.
+-- The Cardo transition is left untagged on purpose: empty means "not
+-- restricted", and the bundle verifier should see both shapes.
+UPDATE public.waypoints
+   SET interests = ARRAY['architecture', 'history']
+ WHERE id IN ('bbbbbbbb-0000-4000-8000-000000000001',
+              'bbbbbbbb-0000-4000-8000-000000000002');
+
+UPDATE public.waypoints
+   SET interests = ARRAY['history'],
+       audiences = ARRAY['couple', 'family_kids', 'friends', 'solo']
+ WHERE id = 'bbbbbbbb-0000-4000-8000-000000000004';
 
 -- --- Geofence zones -----------------------------------------------------------
 -- geom is NOT NULL geometry(Polygon, 4326), so radius-type zones still need a
@@ -159,3 +178,17 @@ INSERT INTO public.audio_tracks (id, waypoint_id, storage_path, format, size_byt
      'bbbbbbbb-0000-4000-8000-000000000004',
      'tours/aaaaaaaa-0000-4000-8000-000000000001/wp04_western_wall.m4a',
      'AAC', 1200000, 150, -16);
+
+-- --- Deep Dive (TASK-603) -----------------------------------------------------
+-- A SECOND track on the Tower of David, which is what the new
+-- (waypoint_id, track_kind) unique index permits and the old one did not. It
+-- makes every `db reset` exercise the paths a Deep Dive changes: the bundle
+-- must still serve the NARRATION as `media` and this row as `deep_dive`.
+-- The `.deep_dive` path segment matches backend/cms/storage-path.ts.
+INSERT INTO public.audio_tracks
+    (id, waypoint_id, track_kind, storage_path, format, size_bytes, duration_seconds, lufs_normalization) VALUES
+    ('dddddddd-0000-4000-8000-000000000005',
+     'bbbbbbbb-0000-4000-8000-000000000002',
+     'deep_dive',
+     'tours/aaaaaaaa-0000-4000-8000-000000000001/wp02_tower_of_david.deep_dive.m4a',
+     'AAC', 2880000, 360, -16);

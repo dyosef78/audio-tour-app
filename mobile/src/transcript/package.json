@@ -1,0 +1,4 @@
+{
+  "//": "Marks these modules as ESM for Node and the backend's NodeNext tsc, which import sidecar.ts and vtt.ts directly (TASK-603) - the CMS validates transcripts with the device's own parser. Scoped to this directory so mobile/package.json, and with it the Expo app, is untouched. Metro ignores the field.",
+  "type": "module"
+}

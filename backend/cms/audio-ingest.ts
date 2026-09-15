@@ -39,7 +39,7 @@ import {
 } from '../media/index.ts';
 import { AUDIO_BUCKET, createAdminScopedClient } from './client.ts';
 import { CmsIngestError } from './errors.ts';
-import { buildAudioStoragePath } from './storage-path.ts';
+import { buildAudioStoragePath, isTrackKind, TRACK_KINDS, type TrackKind } from './storage-path.ts';
 import { removeQuietly, withWorkspace, type Workspace } from './workspace.ts';
 
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -82,6 +82,11 @@ export interface AudioIngestRequest {
   /** waypoints.sort_order, for the filename. */
   sortOrder: number;
   waypointName: string;
+  /**
+   * 'narration' (default) plays on geofence entry; 'deep_dive' is the optional
+   * extended track (TASK-603). Decides both the file name and the row replaced.
+   */
+  trackKind?: TrackKind;
   source: AudioIngestSource;
   preset?: AudioPreset;
   /** See StoragePathInput.contentAddressed. Off by default (decision D5). */
@@ -94,13 +99,14 @@ export interface AudioIngestRequest {
 export interface AudioIngestResult {
   /** audio_tracks.id, or null on a dry run. */
   trackId: string | null;
+  trackKind: TrackKind;
   storagePath: string;
   sizeBytes: number;
   durationSeconds: number;
   format: 'AAC';
   lufsNormalization: number;
   sha256: string;
-  /** True when this replaced an existing track for the waypoint. */
+  /** True when this replaced an existing track of the same kind for the waypoint. */
   replaced: boolean;
   loudness: {
     source: LoudnessReport;
@@ -117,6 +123,10 @@ interface RegistrationRow {
   storage_path: string;
   replaced: boolean;
   orphaned_object: string | null;
+  /** Sidecar of the replaced path, when the path changed (TASK-603). */
+  orphaned_transcript?: string | null;
+  /** A transcript sits beside audio that was just re-recorded in place. */
+  transcript_needs_review?: boolean;
 }
 
 function isRegistrationRow(value: unknown): value is RegistrationRow {
@@ -131,6 +141,12 @@ function assertValidRequest(request: AudioIngestRequest): void {
   }
   if (!UUID.test(request.waypointId)) {
     throw new CmsIngestError('invalid_request', `waypointId is not a uuid: ${request.waypointId}`);
+  }
+  if (request.trackKind !== undefined && !isTrackKind(request.trackKind)) {
+    throw new CmsIngestError(
+      'invalid_request',
+      `trackKind must be one of ${TRACK_KINDS.join(', ')}, got ${String(request.trackKind)}`,
+    );
   }
   if (request.source.path === undefined && request.source.bytes === undefined) {
     throw new CmsIngestError('invalid_request', 'source needs either a path or bytes.');
@@ -215,6 +231,7 @@ async function registerTrack(
   sizeBytes: number,
   durationSeconds: number,
   lufsNormalization: number,
+  trackKind: TrackKind,
 ): Promise<RegistrationRow> {
   const { data, error } = await supabase.rpc('cms_register_audio_track', {
     p_waypoint_id: waypointId,
@@ -223,6 +240,7 @@ async function registerTrack(
     p_duration_seconds: durationSeconds,
     // Measured by the verification pass, not assumed from the column default.
     p_lufs_normalization: lufsNormalization,
+    p_track_kind: trackKind,
   });
 
   if (error) {
@@ -279,6 +297,7 @@ export async function ingestWaypointAudio(
   assertValidRequest(request);
 
   const dryRun = request.dryRun === true;
+  const trackKind: TrackKind = request.trackKind ?? 'narration';
   const warnings: string[] = [];
 
   // Built before any work: a bad token or missing configuration should cost
@@ -304,6 +323,7 @@ export async function ingestWaypointAudio(
         tourId: request.tourId,
         sortOrder: request.sortOrder,
         waypointName: request.waypointName,
+        trackKind,
         sha256: processed.sha256,
         ...(request.contentAddressed !== undefined
           ? { contentAddressed: request.contentAddressed }
@@ -311,6 +331,7 @@ export async function ingestWaypointAudio(
       });
 
       const common = {
+        trackKind,
         storagePath,
         sizeBytes: processed.sizeBytes,
         durationSeconds: processed.durationSeconds,
@@ -346,6 +367,7 @@ export async function ingestWaypointAudio(
           processed.sizeBytes,
           processed.durationSeconds,
           processed.lufsNormalization,
+          trackKind,
         );
       } catch (error) {
         // The row will not exist, so the object must not either. This is the
@@ -363,6 +385,28 @@ export async function ingestWaypointAudio(
           registration.orphaned_object,
           warnings,
           'the replaced object',
+        );
+      }
+
+      // The replaced path's transcript went with it. Same reasoning: nothing
+      // will ever reference it again, and SQL can only point at it.
+      if (registration.orphaned_transcript) {
+        await removeObject(
+          supabase,
+          registration.orphaned_transcript,
+          warnings,
+          "the replaced track's transcript",
+        );
+      }
+
+      // Re-recorded IN PLACE (same path), so the old transcript now sits beside
+      // new audio and every device would highlight it on the old take's
+      // timings. Deleting it would silently remove an accessibility feature;
+      // keeping it silently would be wrong. So a person decides.
+      if (registration.transcript_needs_review === true) {
+        warnings.push(
+          `A transcript already exists beside ${storagePath} and was timed against the PREVIOUS ` +
+            'recording. Re-time and re-upload it, or delete it, before republishing.',
         );
       }
 

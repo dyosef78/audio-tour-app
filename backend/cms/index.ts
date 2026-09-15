@@ -44,11 +44,30 @@ export type { CmsErrorCode } from './errors.ts';
 
 export { AUDIO_BUCKET, createAdminScopedClient } from './client.ts';
 
-export { buildAudioStoragePath, isSafeStoragePath, slugifyWaypointName } from './storage-path.ts';
-export type { StoragePathInput } from './storage-path.ts';
+export {
+  TRACK_KINDS,
+  buildAudioStoragePath,
+  isSafeStoragePath,
+  isTrackKind,
+  slugifyWaypointName,
+  transcriptPathFor,
+} from './storage-path.ts';
+export type { StoragePathInput, TrackKind } from './storage-path.ts';
 
 export { removeQuietly, withWorkspace } from './workspace.ts';
 export type { Workspace, WorkspaceOptions } from './workspace.ts';
 
 export { ingestWaypointAudio } from './audio-ingest.ts';
 export type { AudioIngestRequest, AudioIngestResult, AudioIngestSource } from './audio-ingest.ts';
+
+export {
+  MAX_TRANSCRIPT_BYTES,
+  TRANSCRIPT_CONTENT_TYPE,
+  checkTranscript,
+  ingestTrackTranscript,
+} from './transcript-ingest.ts';
+export type {
+  TranscriptCheck,
+  TranscriptIngestRequest,
+  TranscriptIngestResult,
+} from './transcript-ingest.ts';

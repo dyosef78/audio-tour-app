@@ -72,6 +72,7 @@ export type Database = {
           lufs_normalization: number | null
           size_bytes: number
           storage_path: string
+          track_kind: string
           updated_at: string
           waypoint_id: string
         }
@@ -83,6 +84,7 @@ export type Database = {
           lufs_normalization?: number | null
           size_bytes: number
           storage_path: string
+          track_kind?: string
           updated_at?: string
           waypoint_id: string
         }
@@ -94,6 +96,7 @@ export type Database = {
           lufs_normalization?: number | null
           size_bytes?: number
           storage_path?: string
+          track_kind?: string
           updated_at?: string
           waypoint_id?: string
         }
@@ -220,9 +223,11 @@ export type Database = {
       }
       tours: {
         Row: {
+          audiences: string[]
           created_at: string
           duration_minutes: number
           id: string
+          interests: string[]
           start_point: unknown
           status: string
           title: string
@@ -231,9 +236,11 @@ export type Database = {
           updated_at: string
         }
         Insert: {
+          audiences?: string[]
           created_at?: string
           duration_minutes: number
           id?: string
+          interests?: string[]
           start_point?: unknown
           status?: string
           title: string
@@ -242,9 +249,11 @@ export type Database = {
           updated_at?: string
         }
         Update: {
+          audiences?: string[]
           created_at?: string
           duration_minutes?: number
           id?: string
+          interests?: string[]
           start_point?: unknown
           status?: string
           title?: string
@@ -339,9 +348,11 @@ export type Database = {
       }
       waypoints: {
         Row: {
+          audiences: string[]
           created_at: string
           geom: unknown
           id: string
+          interests: string[]
           name: string
           poi_type: string
           sort_order: number
@@ -349,9 +360,11 @@ export type Database = {
           updated_at: string
         }
         Insert: {
+          audiences?: string[]
           created_at?: string
           geom: unknown
           id?: string
+          interests?: string[]
           name: string
           poi_type: string
           sort_order: number
@@ -359,9 +372,11 @@ export type Database = {
           updated_at?: string
         }
         Update: {
+          audiences?: string[]
           created_at?: string
           geom?: unknown
           id?: string
+          interests?: string[]
           name?: string
           poi_type?: string
           sort_order?: number
@@ -438,19 +453,55 @@ export type Database = {
           },
         ]
       }
+      v_kpi_deep_dive_completion: {
+        Row: {
+          avg_progress_at_stop: number | null
+          completion_rate: number | null
+          devices_completed: number | null
+          devices_started: number | null
+          sort_order: number | null
+          tour_id: string | null
+          tour_title: string | null
+          waypoint_id: string | null
+          waypoint_name: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "telemetry_events_tour_id_fkey"
+            columns: ["tour_id"]
+            isOneToOne: false
+            referencedRelation: "tours"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "telemetry_events_waypoint_id_fkey"
+            columns: ["waypoint_id"]
+            isOneToOne: false
+            referencedRelation: "waypoints"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
     }
     Functions: {
       assert_cms_admin: { Args: never; Returns: undefined }
+      audience_tag_vocabulary: { Args: never; Returns: string[] }
       audio_object_is_published: {
         Args: { p_object_name: string }
         Returns: boolean
       }
+      cms_normalise_tags: {
+        Args: { p_label: string; p_tags: string[]; p_vocabulary: string[] }
+        Returns: string[]
+      }
       cms_publish_tour: {
         Args: { p_tour_id: string }
         Returns: {
+          audiences: string[]
           created_at: string
           duration_minutes: number
           id: string
+          interests: string[]
           start_point: unknown
           status: string
           title: string
@@ -471,6 +522,7 @@ export type Database = {
           p_lufs_normalization?: number
           p_size_bytes: number
           p_storage_path: string
+          p_track_kind?: string
           p_waypoint_id: string
         }
         Returns: Json
@@ -482,9 +534,11 @@ export type Database = {
       cms_set_tour_status: {
         Args: { p_status: string; p_tour_id: string }
         Returns: {
+          audiences: string[]
           created_at: string
           duration_minutes: number
           id: string
+          interests: string[]
           start_point: unknown
           status: string
           title: string
@@ -501,16 +555,20 @@ export type Database = {
       }
       cms_upsert_tour: {
         Args: {
+          p_audiences?: string[]
           p_duration_minutes: number
+          p_interests?: string[]
           p_title: string
           p_topology: string
           p_tour_id: string
           p_transit_mode: string
         }
         Returns: {
+          audiences: string[]
           created_at: string
           duration_minutes: number
           id: string
+          interests: string[]
           start_point: unknown
           status: string
           title: string
@@ -535,9 +593,11 @@ export type Database = {
         }[]
       }
       get_tour_bundle: { Args: { p_tour_id: string }; Returns: Json }
+      interest_tag_vocabulary: { Args: never; Returns: string[] }
       is_cms_admin: { Args: never; Returns: boolean }
       sync_pull_itineraries: { Args: { p_since?: string }; Returns: Json }
       tour_is_published: { Args: { p_tour_id: string }; Returns: boolean }
+      transcript_path_for: { Args: { p_storage_path: string }; Returns: string }
       waypoint_is_published: {
         Args: { p_waypoint_id: string }
         Returns: boolean

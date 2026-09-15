@@ -27,6 +27,8 @@
 
 import { createClient } from '@supabase/supabase-js';
 
+import { transcriptPathFor } from '../../mobile/src/transcript/sidecar.ts';
+
 const URL = process.env.SUPABASE_URL ?? 'http://127.0.0.1:54321';
 const ANON = process.env.SUPABASE_ANON_KEY;
 
@@ -50,6 +52,45 @@ function check(label: string, ok: boolean, detail?: string): void {
 
 function section(name: string): void {
   console.log(`\n${name}`);
+}
+
+function isStringArray(value: unknown): boolean {
+  return Array.isArray(value) && value.every((v) => typeof v === 'string');
+}
+
+/**
+ * Audio checks shared by narration and Deep Dives (TASK-603), plus the
+ * transcript contract: a transcript the bundle announces must sit exactly at
+ * the sidecar path, because that is the only place the device looks.
+ */
+function checkMedia(label: string, media: any, expectedKind: 'narration' | 'deep_dive'): void {
+  check(`${label} track_kind is ${expectedKind}`, media.track_kind === expectedKind, `track_kind = ${media.track_kind}`);
+  check(
+    `${label} storage_path is bucket-relative`,
+    typeof media.storage_path === 'string' &&
+      !/^https?:\/\//.test(media.storage_path) &&
+      !media.storage_path.startsWith('/'),
+    media.storage_path,
+  );
+  check(
+    `${label} extension matches codec`,
+    (media.format === 'AAC' && /\.m4a$/i.test(media.storage_path)) ||
+      (media.format === 'MP3' && /\.mp3$/i.test(media.storage_path)),
+    `${media.format} / ${media.storage_path}`,
+  );
+  check(`${label} has a positive size`, typeof media.size_bytes === 'number' && media.size_bytes > 0);
+
+  if (media.transcript != null) {
+    check(
+      `${label} transcript is the sidecar of its audio`,
+      media.transcript.storage_path === transcriptPathFor(media.storage_path),
+      `${media.transcript.storage_path} vs ${transcriptPathFor(media.storage_path)}`,
+    );
+    check(
+      `${label} transcript has a positive size`,
+      typeof media.transcript.size_bytes === 'number' && media.transcript.size_bytes > 0,
+    );
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -91,6 +132,8 @@ async function main(): Promise<void> {
     'the TASK-301 backfill or refresh trigger did not run',
   );
 
+  let deepDives = 0;
+
   // --- 2. The bundle is complete -------------------------------------------
   // This is the payload the mobile client actually consumes. Anything missing
   // here is a tour that downloads but does not work.
@@ -107,6 +150,12 @@ async function main(): Promise<void> {
 
     check('bundle has a version hash', typeof (bundle as any).bundle_version_hash === 'string');
     check('bundle has waypoints', waypoints.length > 0, 'tour is visible but empty');
+    check(
+      'tour_metadata carries tag arrays',
+      isStringArray((bundle as any).tour_metadata?.audiences) &&
+        isStringArray((bundle as any).tour_metadata?.interests),
+      'TASK-603 migrations not applied, or get_tour_bundle regressed',
+    );
 
     for (const w of waypoints) {
       const label = `wp${w.sort_order} "${w.name}"`;
@@ -144,27 +193,35 @@ async function main(): Promise<void> {
       // Media. Catches the TASK-303 class: a path that resolves to the wrong
       // place, or a codec/extension pair that fails silently on iOS.
       check(`${label} has media`, w.media != null, 'waypoint would play nothing');
-      if (w.media) {
+      // `media` is the GEOFENCE narration. If a Deep Dive ever appears here,
+      // entering the zone plays minutes of optional content instead.
+      if (w.media) checkMedia(label, w.media, 'narration');
+
+      if (w.deep_dive) {
+        deepDives++;
+        checkMedia(`${label} deep_dive`, w.deep_dive, 'deep_dive');
         check(
-          `${label} storage_path is bucket-relative`,
-          typeof w.media.storage_path === 'string' &&
-            !/^https?:\/\//.test(w.media.storage_path) &&
-            !w.media.storage_path.startsWith('/'),
-          w.media.storage_path,
+          `${label} deep_dive is not on a transition stop`,
+          w.poi_type !== 'transition',
+          'the app never offers one there',
         );
         check(
-          `${label} extension matches codec`,
-          (w.media.format === 'AAC' && /\.m4a$/i.test(w.media.storage_path)) ||
-            (w.media.format === 'MP3' && /\.mp3$/i.test(w.media.storage_path)),
-          `${w.media.format} / ${w.media.storage_path}`,
-        );
-        check(
-          `${label} has a positive size`,
-          typeof w.media.size_bytes === 'number' && w.media.size_bytes > 0,
+          `${label} deep_dive has its own file`,
+          w.deep_dive.storage_path !== w.media?.storage_path,
+          w.deep_dive.storage_path,
         );
       }
+
+      check(
+        `${label} tags are string arrays`,
+        isStringArray(w.audiences) && isStringArray(w.interests),
+      );
     }
   }
+
+  // Informational, not a failure: the local seed has one, a remote catalogue
+  // may legitimately have none.
+  console.log(`\n  INFO  ${deepDives} Deep Dive track(s) visible across the catalogue`);
 
   // --- 3. Writes are still refused -----------------------------------------
   // A migration that accidentally adds a permissive policy is otherwise
@@ -179,6 +236,25 @@ async function main(): Promise<void> {
     'anon cannot insert tours',
     writeError != null,
     'RLS is not denying writes - an insert succeeded',
+  );
+
+  // 42501 specifically, not just "an error". TASK-603 dropped and recreated
+  // this function with new parameters; a leftover overload would ALSO error
+  // (PGRST203, ambiguous candidates) and pass a looser check while every real
+  // CMS call was broken.
+  const { error: rpcError } = await supabase.rpc('cms_upsert_tour', {
+    p_tour_id: null,
+    p_title: 'ci probe',
+    p_topology: 'in_city',
+    p_transit_mode: 'walking',
+    p_duration_minutes: 5,
+    p_interests: ['history'],
+  });
+
+  check(
+    'anon calling cms_upsert_tour is refused as unauthorised (42501)',
+    rpcError?.code === '42501',
+    rpcError ? `${rpcError.code}: ${rpcError.message}` : 'the call SUCCEEDED as anon',
   );
 
   // --- Summary -------------------------------------------------------------
