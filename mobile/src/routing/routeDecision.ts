@@ -1,18 +1,20 @@
 import type { EncodedRoute, LatLng, TransitMode } from '../types/domain';
 
 /**
- * The route-selection rule, as one pure function (TASK-604).
+ * The route-selection rule, as one pure function (TASK-604, TASK-903).
  *
  * Three things can be drawn, best first:
  *
- *   dynamic   a route through ONLY the active stops, fetched while online.
- *             Considered only when stops were filtered out; otherwise the
- *             bundled route already is the right route.
- *   static    the route from the offline bundle, through every stop. When
- *             stops were filtered it still passes the skipped ones - the
- *             "physical backbone" - and only their pins disappear.
- *   straight  no route at all (every production tour today): stops joined by
- *             lines, drawn dashed so nobody mistakes them for a path.
+ *   dynamic   a route through the session's stops IN THE ORDER THEY NARRATE,
+ *             from route-stops or from the disk cache. Requested for every
+ *             session since TASK-903, filtered or not: it is the only route
+ *             that follows the Smart Sorter's order.
+ *   static    the route from the offline bundle, through every stop in
+ *             authored order. When stops were filtered it still passes the
+ *             skipped ones - the "physical backbone" - and only their pins
+ *             disappear.
+ *   straight  no route at all: stops joined by lines in narration order,
+ *             drawn dashed so nobody mistakes them for a path.
  *
  * Once a dynamic route is in hand it is never given up for connectivity
  * reasons: it is already on the device (memory and disk), and swapping back
@@ -41,11 +43,25 @@ export const MAX_FETCH_ATTEMPTS = 3;
 /** Wait before attempt 2, then 3. A reconnect skips the wait. */
 export const RETRY_DELAYS_MS: readonly number[] = [5_000, 20_000];
 
+/**
+ * The onboarding answers the Smart Sorter scores with (TASK-903): route-stops'
+ * `preferences`. Ids from personalization/options.ts, which are also the
+ * database tag vocabulary. Null when onboarding is not complete.
+ */
+export interface RoutePreferences {
+  groupType: string;
+  interests: readonly string[];
+}
+
 export interface DynamicRouteRequest {
   tourId: string;
-  /** In authored (sort) order. The server may answer with a different one. */
+  /** In authored (sort) order. The server answers with the order it routed. */
   waypointIds: string[];
   transitMode: TransitMode;
+  /** The device's wall clock with its UTC offset, stamped per attempt (TASK-901). */
+  localTime: string;
+  /** Snapshotted when the session started, like the stop selection. */
+  preferences: RoutePreferences | null;
 }
 
 /**
@@ -77,13 +93,18 @@ export type DynamicRouteResult =
   | { kind: 'failed'; reason: string };
 
 export interface RouteInputs {
-  filtered: boolean;
   staticRoute: LatLng[] | null;
   dynamicRoute: LatLng[] | null;
+  /** A route-stops answer has been drawn this session. A cached route does not count. */
+  liveRouteReceived: boolean;
   online: boolean;
   fetchState: FetchState;
   attempts: number;
-  /** The disk cache has been consulted. Fetching before that could pay for a route already stored. */
+  /**
+   * The disk cache has been consulted. Waiting for it (milliseconds) means a
+   * cached route is on screen while the request runs, and cannot land AFTER
+   * the live one and replace it.
+   */
   cacheChecked: boolean;
 }
 
@@ -93,15 +114,17 @@ export interface RouteDecision extends RouteDisplay {
 
 export function decideRoute(i: RouteInputs): RouteDecision {
   const display: RouteDisplay =
-    i.filtered && i.dynamicRoute !== null
+    i.dynamicRoute !== null
       ? { source: 'dynamic', points: i.dynamicRoute }
       : i.staticRoute !== null
         ? { source: 'static', points: i.staticRoute }
         : { source: 'straight', points: null };
 
+  // Every session asks once it can, even with a cached route drawn: the cache
+  // answers for the order predicted on the device, the server decides the
+  // order actually walked (TASK-903).
   const shouldFetch =
-    i.filtered &&
-    i.dynamicRoute === null &&
+    !i.liveRouteReceived &&
     i.cacheChecked &&
     i.online &&
     i.fetchState === 'idle' &&
@@ -113,16 +136,21 @@ export function decideRoute(i: RouteInputs): RouteDecision {
 /**
  * Where a dynamic route is cached. Null disables caching.
  *
+ * Keyed on the ORDERED stop ids (TASK-903, v2): the same stops walked in the
+ * morning order and in the sunset order are two routes, and neither may
+ * overwrite the other. An entry is only ever written under the order its
+ * polyline actually visits, so a hit is a route and a narration order that
+ * agree by construction.
+ *
  * The bundle hash is part of the key: if stops move, the tour's hash changes
- * and a route drawn for the old positions is never reused. Stop ids are sorted
- * because the set, not the argument order, decides the route - visiting order
- * always follows sort_order.
+ * and a route drawn for the old positions is never reused. v1 keys (the
+ * unordered set) are never read again; they carry no order.
  */
 export function routeCacheKey(
   tourId: string,
   bundleHash: string | null,
-  stopIds: readonly string[],
+  orderedStopIds: readonly string[],
 ): string | null {
   if (!bundleHash) return null;
-  return `route:dynamic:v1:${tourId}:${bundleHash}:${[...stopIds].sort().join(',')}`;
+  return `route:dynamic:v2:${tourId}:${bundleHash}:${orderedStopIds.join(',')}`;
 }

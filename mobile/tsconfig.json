@@ -1,7 +1,12 @@
 {
   "extends": "expo/tsconfig.base",
   "compilerOptions": {
-    "strict": true
+    "strict": true,
+    // ../shared is also run by Node and Deno, which need real ".ts" import
+    // specifiers (shared/src/smartSorter.ts imports "./distance.ts"). Metro
+    // resolves the exact filename first; this lets tsc agree. Legal because
+    // the Expo base sets noEmit.
+    "allowImportingTsExtensions": true
   },
   "exclude": [
     "scripts"

@@ -2,11 +2,12 @@ import { FunctionsHttpError } from '@supabase/supabase-js';
 
 import { isPermanentRouteStatus, type DynamicRouteRequest, type DynamicRouteResult } from '../../routing/routeDecision';
 import { parseEncodedRoute } from '../../routing/routeGeometry';
-import { deviceLocalTime, parseRouteOrder, routeRequestBody } from '../../routing/routeRequest';
+import { parseRouteOrder, routeRequestBody } from '../../routing/routeRequest';
 import { isSupabaseConfigured, supabase } from '../supabase/client';
 
 /**
- * Client for a route through a SUBSET of a tour's stops (TASK-604).
+ * Client for a route through a session's stops in the Smart Sorter's order
+ * (TASK-604; every session since TASK-903).
  *
  * The server side is supabase/functions/route-stops (TASK-702); its handler.ts
  * holds the full contract. Where it is not deployed, every call returns
@@ -16,10 +17,13 @@ import { isSupabaseConfigured, supabase } from '../supabase/client';
  * CONTRACT - Supabase Edge Function `route-stops`
  *
  *   POST  { "tour_id": uuid, "waypoint_ids": [uuid, ...], "transit_mode": "walking",
+ *           "preferences": { "group_type": "couple", "interests": ["history"] },
  *           "context": { "local_time": "2026-09-17T18:40:05+03:00" } }
  *         waypoint_ids are in authored order and must all belong to tour_id.
  *         context (TASK-901) opts in to the server's scored sort; local_time is
  *         the device's wall clock WITH its UTC offset, stamped per attempt.
+ *         preferences (TASK-903) are the onboarding answers, snapshotted when
+ *         the session started; omitted before onboarding is complete.
  *
  *   200   { "encoding": "polyline", "precision": 5 | 6,
  *           "polyline": "...", "length_meters": 1234,
@@ -54,9 +58,9 @@ export async function fetchDynamicRoute(
 
   try {
     const { data, error } = await supabase.functions.invoke(ROUTE_FUNCTION, {
-      // Stamped here, per attempt, not when the session started: a retry after
-      // a long dead zone must be scored at the time it is actually sent.
-      body: routeRequestBody(request, deviceLocalTime()),
+      // local_time is stamped per attempt by RouteManager; preferences come
+      // from the session snapshot. See routeRequestBody.
+      body: routeRequestBody(request),
       signal,
       timeout: ROUTE_REQUEST_TIMEOUT_MS,
     });

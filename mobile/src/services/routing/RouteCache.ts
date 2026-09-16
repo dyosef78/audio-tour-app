@@ -4,7 +4,7 @@ import type { RouteCacheStore } from '../../routing/RouteManager';
 import { parseEncodedRoute } from '../../routing/routeGeometry';
 
 /**
- * Disk cache for routes fetched through a subset of stops (TASK-604).
+ * Disk cache for live routes (TASK-604), one entry per visiting order (TASK-903).
  *
  * This is what makes the online path useful to an offline-first app: the
  * realistic moment of connectivity is BEFORE the walk (hotel WiFi, the
@@ -12,7 +12,11 @@ import { parseEncodedRoute } from '../../routing/routeGeometry';
  * goes, and the next session with the same stops reads it back with no network.
  *
  * Stored in the wire shape, so a read goes through the same parser as a
- * response. Keys are built by routeCacheKey() and include the bundle hash.
+ * response. Keys are built by routeCacheKey(): the bundle hash and the ORDERED
+ * stop ids, so a morning order and a sunset order for the same stops are two
+ * entries. The order is the key itself, never stored in the value. Nothing is
+ * evicted: entries are a few kB, and orders per tour are bounded by the time
+ * windows and preference combinations the sorter distinguishes.
  * Never throws: a cache is an optimisation, not a dependency.
  */
 export const RouteCache: RouteCacheStore = {

@@ -8,15 +8,16 @@ import {
   type DynamicRouteResult,
   type FetchState,
   type RouteDisplay,
+  type RoutePreferences,
 } from './routeDecision';
 import { decodeRoute } from './routeGeometry';
-import { adoptableStopOrder } from './routeRequest';
+import { adoptableStopOrder, predictStopOrder } from './routeRequest';
 
 /**
  * RouteManager - keeps the map's route right as connectivity comes and goes
  * (TASK-604, hybrid offline-first).
  *
- * Owns no hardware and imports nothing native: network, fetcher, cache,
+ * Owns no hardware and imports nothing native: network, fetcher, cache, clock,
  * timers and the store are injected, so every transition below is exercised by
  * `npm run test:ui` without a device. session/routing.ts wires the real ones.
  *
@@ -24,18 +25,27 @@ import { adoptableStopOrder } from './routeRequest';
  *
  *   start()   publishes the best route available RIGHT NOW (static or
  *             straight) synchronously, so the first map frame is never empty;
- *             then reads the disk cache; then fetches if everything allows.
+ *             then reads the disk cache; then fetches whenever online - every
+ *             session, filtered or not (TASK-903) - until one live route
+ *             arrives.
  *   network   offline -> online   retries a failed or dropped request at once
  *             online -> offline   aborts an in-flight request; the displayed
  *                                 route does not change
  *   stop()    aborts, unsubscribes, cancels timers, and discards any late
  *             result from the session that just ended.
  *
- * VISITING ORDER (TASK-902): a live route arrives with the order it visits the
- * stops. That order goes to `onStopOrder` only together with a route that
- * validated, so the geofences are never sequenced by a route that is not drawn.
- * A route read from the disk cache carries no order (TASK-903) and leaves
- * narration on the authored order.
+ * VISITING ORDER (TASK-902/903): whatever route is drawn, `onStopOrder`
+ * receives the order it visits the stops, so the geofences are sequenced by
+ * the line on the map and never by a route that is not drawn.
+ *
+ *   live     the response's `waypoint_ids`, once the route validates. Written
+ *            to the cache under THAT order.
+ *   cached   the device cannot know the server's order before asking, so it
+ *            predicts it with the same Smart Sorter (shared/src/smartSorter.ts)
+ *            and looks up that order's key. A hit is a route for exactly that
+ *            order. A miss - a new time window, preferences changed, a server
+ *            on a newer sorter - costs only the cached route: the static
+ *            route and the authored order stay until the live answer.
  */
 
 export interface RouteNetwork {
@@ -53,6 +63,8 @@ export interface RouteManagerDeps {
   fetchRoute(request: DynamicRouteRequest, signal: AbortSignal): Promise<DynamicRouteResult>;
   cache: RouteCacheStore;
   publish(route: RouteDisplay): void;
+  /** The device's wall clock with its UTC offset - deviceLocalTime() in the app. */
+  localTime(): string;
   /** Returns a cancel function. */
   schedule(fn: () => void, delayMs: number): () => void;
   log?(message: string): void;
@@ -63,13 +75,14 @@ export interface RouteSessionContext {
   transitMode: TransitMode;
   /** The ACTIVE stops, in sort order. */
   stops: Waypoint[];
-  filtered: boolean;
+  /** Onboarding answers, snapshotted with the stop selection. Null = not onboarded. */
+  preferences: RoutePreferences | null;
   /** The bundle's route, already validated against `stops`. */
   staticRoute: LatLng[] | null;
   bundleHash: string | null;
   /**
-   * The order the drawn live route visits `stops`, already checked to be
-   * exactly a reordering of them. Called at most once per live route.
+   * The order the drawn dynamic route visits `stops`, already checked to be
+   * exactly a reordering of them. Called once per dynamic route drawn.
    */
   onStopOrder?(waypointIds: string[]): void;
 }
@@ -82,6 +95,9 @@ export class RouteManager {
   private generation = 0;
 
   private dynamicRoute: LatLng[] | null = null;
+  /** Bumped per dynamic route, so a live route replacing a cached one is published. */
+  private dynamicRevision = 0;
+  private liveRouteReceived = false;
   private fetchState: FetchState = 'idle';
   private attempts = 0;
   private cacheChecked = false;
@@ -100,14 +116,17 @@ export class RouteManager {
     const generation = this.generation;
     this.ctx = ctx;
 
-    const key = this.cacheKey();
+    const predicted = ctx.bundleHash
+      ? predictStopOrder(ctx.stops, ctx.preferences, this.deps.localTime())
+      : null;
+    const key = predicted ? routeCacheKey(ctx.tourId, ctx.bundleHash, predicted) : null;
     // Nothing to look up: allow a fetch decision immediately.
-    this.cacheChecked = !ctx.filtered || key === null;
+    this.cacheChecked = key === null;
 
     this.apply();
     this.unsubscribe = this.deps.network.subscribe((online) => this.onNetwork(online));
 
-    if (this.cacheChecked || key === null) return;
+    if (key === null || predicted === null) return;
 
     let cached: EncodedRoute | null = null;
     try {
@@ -122,8 +141,9 @@ export class RouteManager {
       // is checked before it is drawn" free of exceptions.
       const checked = decodeRoute(cached, ctx.stops, ctx.transitMode);
       if (checked.ok) {
-        this.dynamicRoute = checked.points;
-        this.log('using a cached route for the selected stops');
+        this.showDynamic(checked.points);
+        ctx.onStopOrder?.(predicted);
+        this.log('using a cached route for the predicted visiting order');
       }
     }
     this.cacheChecked = true;
@@ -141,6 +161,7 @@ export class RouteManager {
     this.cancelRetry = null;
     this.ctx = null;
     this.dynamicRoute = null;
+    this.liveRouteReceived = false;
     this.fetchState = 'idle';
     this.attempts = 0;
     this.cacheChecked = false;
@@ -170,23 +191,29 @@ export class RouteManager {
     this.apply();
   }
 
+  private showDynamic(points: LatLng[]): void {
+    this.dynamicRoute = points;
+    this.dynamicRevision++;
+  }
+
   private apply(): void {
     const ctx = this.ctx;
     if (!ctx) return;
 
     const decision = decideRoute({
-      filtered: ctx.filtered,
       staticRoute: ctx.staticRoute,
       dynamicRoute: this.dynamicRoute,
+      liveRouteReceived: this.liveRouteReceived,
       online: this.deps.network.isOnline(),
       fetchState: this.fetchState,
       attempts: this.attempts,
       cacheChecked: this.cacheChecked,
     });
 
-    // One session has at most one route per source, so source + length
-    // identifies what is on screen and spares the store redundant writes.
-    const signature = `${decision.source}:${decision.points?.length ?? 0}`;
+    // Static and straight are fixed for a session; a dynamic route can be
+    // replaced (cached, then live), so its revision is part of what is on screen.
+    const signature =
+      decision.source === 'dynamic' ? `dynamic:${this.dynamicRevision}` : decision.source;
     if (signature !== this.lastPublished) {
       this.lastPublished = signature;
       this.deps.publish({ source: decision.source, points: decision.points });
@@ -206,7 +233,14 @@ export class RouteManager {
     let result: DynamicRouteResult;
     try {
       result = await this.deps.fetchRoute(
-        { tourId: ctx.tourId, waypointIds: ctx.stops.map((s) => s.id), transitMode: ctx.transitMode },
+        {
+          tourId: ctx.tourId,
+          waypointIds: ctx.stops.map((s) => s.id),
+          transitMode: ctx.transitMode,
+          // Per attempt: a retry after a dead zone is scored at the time it is sent.
+          localTime: this.deps.localTime(),
+          preferences: ctx.preferences,
+        },
         controller.signal,
       );
     } catch (err) {
@@ -228,19 +262,26 @@ export class RouteManager {
 
     if (result.kind === 'ok') {
       const checked = decodeRoute(result.route, ctx.stops, ctx.transitMode);
-      if (checked.ok) {
-        this.dynamicRoute = checked.points;
+      const order = this.routedOrder(ctx, result.waypointIds);
+      if (checked.ok && order) {
+        this.showDynamic(checked.points);
+        this.liveRouteReceived = true;
         this.fetchState = 'idle';
-        const key = this.cacheKey();
+        const key = routeCacheKey(ctx.tourId, ctx.bundleHash, order);
         if (key) void this.deps.cache.set(key, result.route).catch(() => undefined);
-        this.log('using a live route for the selected stops');
-        this.adoptOrder(ctx, result.waypointIds);
+        ctx.onStopOrder?.(order);
+        this.log('using a live route');
         this.apply();
         return;
       }
-      // The server answered, but with a route that does not reach the stops.
-      // Asking again would get the same route, so stop asking this session.
-      result = { kind: 'unavailable', reason: `rejected the returned route: ${checked.reason}` };
+      // The server answered, but with a route that does not reach the stops or
+      // an order that is not theirs. Asking again would get the same answer.
+      result = {
+        kind: 'unavailable',
+        reason: checked.ok
+          ? `rejected the returned order: it does not name exactly the ${ctx.stops.length} stops`
+          : `rejected the returned route: ${checked.reason}`,
+      };
     }
 
     if (result.kind === 'unavailable') {
@@ -257,21 +298,16 @@ export class RouteManager {
   }
 
   /**
-   * An order that is not exactly the session's stops is dropped, not the
-   * route: the line on the map is still right, and narration falls back to the
-   * authored order rather than arming stops the session does not run.
+   * The order a live route visits the stops, in the session's own ids.
+   *
+   * No `waypoint_ids` means a server from before Epic 8, which routes in the
+   * order it was given: the authored order we sent. An order that is not
+   * exactly the session's stops is null - the route cannot be matched to the
+   * narration, so it is not drawn or cached.
    */
-  private adoptOrder(ctx: RouteSessionContext, order: string[] | null): void {
-    if (order === null) {
-      this.log('live route carried no visiting order; narration keeps the authored order');
-      return;
-    }
-    const adopted = adoptableStopOrder(order, ctx.stops);
-    if (adopted === null) {
-      this.log(`ignored a visiting order that does not match the ${ctx.stops.length} selected stops`);
-      return;
-    }
-    ctx.onStopOrder?.(adopted);
+  private routedOrder(ctx: RouteSessionContext, order: string[] | null): string[] | null {
+    if (order === null) return ctx.stops.map((s) => s.id);
+    return adoptableStopOrder(order, ctx.stops);
   }
 
   private scheduleRetry(attempt: number): void {
@@ -290,12 +326,6 @@ export class RouteManager {
       // Offline now? Then nothing happens here, and the reconnect fetches.
       this.apply();
     }, delay);
-  }
-
-  private cacheKey(): string | null {
-    const ctx = this.ctx;
-    if (!ctx || !ctx.filtered) return null;
-    return routeCacheKey(ctx.tourId, ctx.bundleHash, ctx.stops.map((s) => s.id));
   }
 
   private log(message: string): void {

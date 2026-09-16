@@ -43,6 +43,7 @@ import {
   deviceLocalTime,
   formatLocalTime,
   parseRouteOrder,
+  predictStopOrder,
   routeRequestBody,
 } from '../src/routing/routeRequest.ts';
 import { LocationService, type GeofenceEvent } from '../src/services/location/LocationService.ts';
@@ -466,7 +467,7 @@ assert(
 );
 const mislabelled = decodeRoute({ ...DIRECT_ROUTE, precision: 6 }, [JAFFA, WALL], 'walking');
 assert('a precision-5 route labelled 6 is rejected', !mislabelled.ok, JSON.stringify(mislabelled));
-eq('cache key ignores stop order', routeCacheKey('t', 'h', ['b', 'a']), routeCacheKey('t', 'h', ['a', 'b']));
+assert('cache key depends on the visiting order (TASK-903)', routeCacheKey('t', 'h', ['b', 'a']) !== routeCacheKey('t', 'h', ['a', 'b']));
 assert('cache key changes with the bundle version', routeCacheKey('t', 'h1', ['a']) !== routeCacheKey('t', 'h2', ['a']));
 eq('no bundle hash, no caching', routeCacheKey('t', null, ['a']), null);
 eq(
@@ -484,8 +485,12 @@ type PendingRequest = {
   resolve: (result: DynamicRouteResult) => void;
 };
 
-function routeHarness(opts: { online: boolean; cache?: Map<string, EncodedRoute> }) {
+const MORNING_TIME = '2026-09-17T08:00:00+03:00';
+const GOLDEN_TIME = '2026-09-17T17:40:00+03:00'; // sunset in Jerusalem that day is ~18:44
+
+function routeHarness(opts: { online: boolean; cache?: Map<string, EncodedRoute>; localTime?: string }) {
   let online = opts.online;
+  const localTime = opts.localTime ?? MORNING_TIME;
   const listeners = new Set<(online: boolean) => void>();
   const calls: PendingRequest[] = [];
   const published: RouteDisplay[] = [];
@@ -516,6 +521,7 @@ function routeHarness(opts: { online: boolean; cache?: Map<string, EncodedRoute>
       },
     },
     publish: (route) => published.push(route),
+    localTime: () => localTime,
     schedule: (fn, delay) => {
       const timer = { fn, delay, done: false };
       timers.push(timer);
@@ -554,7 +560,7 @@ const sessionFor = (over: Partial<RouteSessionContext> = {}): RouteSessionContex
   tourId: 'jlm',
   transitMode: 'walking',
   stops: [JAFFA, WALL],
-  filtered: true,
+  preferences: null,
   staticRoute: staticPoints,
   bundleHash: 'hash-1',
   ...over,
@@ -575,6 +581,7 @@ const liveRoute = (route: EncodedRoute = DIRECT_ROUTE, waypointIds: string[] | n
 
   await h.setOnline(true);
   eq('back online: one request, for the selected stops only', h.calls.map((c) => c.req.waypointIds), [['jaffa', 'wall']]);
+  eq('stamped with the clock at send time', h.calls[0]!.req.localTime, MORNING_TIME);
   eq('while it is in flight the bundled route stays up', h.source(), 'static');
 
   h.calls[0]!.resolve(liveRoute());
@@ -687,12 +694,16 @@ const liveRoute = (route: EncodedRoute = DIRECT_ROUTE, waypointIds: string[] | n
   h.manager.stop();
 }
 
-// 7-9. No filtering, no route at all, and a late answer after the tour ended.
+// 7-9. Every stop kept, no route at all, and a late answer after the tour ended.
 {
   const h = routeHarness({ online: true });
-  await h.manager.start(sessionFor({ filtered: false, stops: ALL_STOPS }));
+  await h.manager.start(sessionFor({ stops: ALL_STOPS }));
   await flush();
-  eq('nothing filtered: the bundled route is already right, no request even online', [h.source(), h.calls.length], ['static', 0]);
+  eq(
+    'nothing filtered: the Smart Sorter is still asked, for every stop (TASK-903)',
+    [h.source(), h.calls.map((c) => c.req.waypointIds.length)],
+    ['static', [4]],
+  );
   h.manager.stop();
 }
 {
@@ -726,14 +737,8 @@ const liveRoute = (route: EncodedRoute = DIRECT_ROUTE, waypointIds: string[] | n
   h.calls[0]!.resolve(liveRoute(DIRECT_ROUTE, ['WALL', 'jaffa']));
   await flush();
   eq("a live route hands its order to the session, in the session's own ids", orders, [['wall', 'jaffa']]);
+  eq('and is cached under that order', [...h.cache.keys()], ['route:dynamic:v2:jlm:hash-1:wall,jaffa']);
   h.manager.stop();
-
-  const later = routeHarness({ online: false, cache: h.cache });
-  const cachedOrders: string[][] = [];
-  await later.manager.start(sessionFor({ onStopOrder: (ids) => cachedOrders.push(ids) }));
-  await flush();
-  eq('a cached route carries no order: authored order stays (TASK-903)', [later.source(), cachedOrders.length], ['dynamic', 0]);
-  later.manager.stop();
 }
 {
   const orders: string[][] = [];
@@ -752,8 +757,180 @@ const liveRoute = (route: EncodedRoute = DIRECT_ROUTE, waypointIds: string[] | n
   await flush();
   h.calls[0]!.resolve(liveRoute(DIRECT_ROUTE, ['wall', 'david']));
   await flush();
-  eq('an order naming other stops is dropped, the route is still drawn', [orders.length, h.source()], [0, 'dynamic']);
+  eq(
+    'an order naming other stops: route neither drawn, cached nor sequenced (TASK-903)',
+    [orders.length, h.source(), h.cache.size, h.pendingTimers().length],
+    [0, 'static', 0, 0],
+  );
   h.manager.stop();
+}
+
+// -----------------------------------------------------------------------------
+// TASK-903: fetch policy, preferences, order-dependent cache
+// -----------------------------------------------------------------------------
+
+heading('TASK-903: preferences and the predicted order');
+
+// Stops on a line running north from Jaffa Gate. Checked against the real
+// sorter: the morning order is a-b-v-c, golden hour pulls the viewpoint to
+// second (a-v-b-c), and a history lover goes a-c-b-v.
+const northOfJaffa = (metres: number) => ({ latitude: 31.7766 + metres / 111_320, longitude: 35.2279 });
+const sortStop = (
+  id: string,
+  sort: number,
+  metres: number,
+  poiType: Waypoint['poiType'],
+  interests: NonNullable<Waypoint['interests']>,
+): Waypoint => ({
+  ...stopAt(id, sort, northOfJaffa(metres).latitude, northOfJaffa(metres).longitude, { interests }),
+  poiType,
+});
+const SA = sortStop('a', 1, 0, 'anchor', ['history']);
+const SB = sortStop('b', 2, 150, 'anchor', ['culinary']);
+const SV = sortStop('v', 3, 300, 'viewpoint', []);
+const SC = sortStop('c', 4, -150, 'anchor', ['history']);
+const SORT_STOPS = [SA, SB, SV, SC];
+const HISTORY_PREFS = { groupType: 'couple', interests: ['history'] };
+// Through every stop. Validation checks reach, not order, so one line serves every order.
+const THROUGH_ALL: EncodedRoute = {
+  precision: 6,
+  polyline: encodePolyline([SC, SA, SB, SV].map(asPoint), 6),
+  lengthMeters: 450,
+};
+
+eq('morning order', predictStopOrder(SORT_STOPS, null, MORNING_TIME), ['a', 'b', 'v', 'c']);
+eq('golden hour pulls the viewpoint forward', predictStopOrder(SORT_STOPS, null, GOLDEN_TIME), ['a', 'v', 'b', 'c']);
+eq('preferences change the order', predictStopOrder(SORT_STOPS, HISTORY_PREFS, MORNING_TIME), ['a', 'c', 'b', 'v']);
+eq(
+  "predicted in the session's own ids, whatever their case",
+  predictStopOrder([{ ...SA, id: 'A' }, SB], null, MORNING_TIME),
+  ['A', 'b'],
+);
+eq('a clock the sorter refuses predicts nothing', predictStopOrder(SORT_STOPS, null, '2026-09-17T08:00:00'), null);
+
+eq(
+  'preferences are sent alongside context',
+  routeRequestBody({ tourId: 't', waypointIds: ['a'], transitMode: 'walking', localTime: MORNING_TIME, preferences: HISTORY_PREFS }),
+  {
+    tour_id: 't',
+    waypoint_ids: ['a'],
+    transit_mode: 'walking',
+    preferences: { group_type: 'couple', interests: ['history'] },
+    context: { local_time: MORNING_TIME },
+  },
+);
+
+heading('TASK-903: RouteManager with an order-dependent cache');
+
+{
+  const sortSession = (over: Partial<RouteSessionContext> = {}): RouteSessionContext =>
+    sessionFor({ stops: SORT_STOPS, staticRoute: null, ...over });
+
+  // Morning, online: the server answers with the morning order.
+  const morning = routeHarness({ online: true, localTime: MORNING_TIME });
+  await morning.manager.start(sortSession());
+  await flush();
+  eq('online with an empty cache: asks at once', morning.calls.length, 1);
+  morning.calls[0]!.resolve(liveRoute(THROUGH_ALL, ['a', 'b', 'v', 'c']));
+  await flush();
+  morning.manager.stop();
+
+  // Evening, same stops, online: a different order, a SECOND entry.
+  const evening = routeHarness({ online: true, cache: morning.cache, localTime: GOLDEN_TIME });
+  await evening.manager.start(sortSession());
+  await flush();
+  evening.calls[0]!.resolve(liveRoute(THROUGH_ALL, ['a', 'v', 'b', 'c']));
+  await flush();
+  eq(
+    'the evening route does not overwrite the morning one',
+    [...evening.cache.keys()].sort(),
+    ['route:dynamic:v2:jlm:hash-1:a,b,v,c', 'route:dynamic:v2:jlm:hash-1:a,v,b,c'],
+  );
+  evening.manager.stop();
+
+  // Offline: each time window reads back its own route, and narrates in its order.
+  for (const [label, time, expected] of [
+    ['golden hour', GOLDEN_TIME, ['a', 'v', 'b', 'c']],
+    ['morning', MORNING_TIME, ['a', 'b', 'v', 'c']],
+  ] as const) {
+    const orders: string[][] = [];
+    const offline = routeHarness({ online: false, cache: evening.cache, localTime: time });
+    await offline.manager.start(sortSession({ onStopOrder: (ids) => orders.push(ids) }));
+    await flush();
+    eq(
+      `offline in the ${label}: that window's cached route, and narration in its order`,
+      [offline.source(), orders, offline.calls.length],
+      ['dynamic', [expected], 0],
+    );
+    offline.manager.stop();
+  }
+
+  // Offline with preferences the cache has never seen: a miss, not a wrong route.
+  const unseenOrders: string[][] = [];
+  const unseen = routeHarness({ online: false, cache: evening.cache, localTime: MORNING_TIME });
+  await unseen.manager.start(sortSession({ preferences: HISTORY_PREFS, onStopOrder: (ids) => unseenOrders.push(ids) }));
+  await flush();
+  eq(
+    'offline, no route cached for this order: straight lines, authored order kept',
+    [unseen.source(), unseenOrders.length],
+    ['straight', 0],
+  );
+  unseen.manager.stop();
+
+  // Online, preferences sent; the answer is cached under the preference order.
+  const refresh = routeHarness({ online: true, cache: evening.cache, localTime: MORNING_TIME });
+  await refresh.manager.start(sortSession({ preferences: HISTORY_PREFS }));
+  await flush();
+  eq('the session snapshot of preferences is sent', refresh.calls[0]?.req.preferences, HISTORY_PREFS);
+  refresh.calls[0]!.resolve(liveRoute(THROUGH_ALL, ['a', 'c', 'b', 'v']));
+  await flush();
+  refresh.manager.stop();
+
+  // Online with that route cached: drawn at once, and the server still asked.
+  const hitOrders: string[][] = [];
+  const hit = routeHarness({ online: true, cache: refresh.cache, localTime: MORNING_TIME });
+  await hit.manager.start(sortSession({ preferences: HISTORY_PREFS, onStopOrder: (ids) => hitOrders.push(ids) }));
+  await flush();
+  eq(
+    'online with a cached route: it is drawn AND the server is still asked',
+    [hit.source(), hitOrders, hit.calls.length],
+    ['dynamic', [['a', 'c', 'b', 'v']], 1],
+  );
+  const publishedBeforeLive = hit.published.length;
+  // The server disagrees with the prediction (say, a newer sorter): it wins.
+  hit.calls[0]!.resolve(liveRoute(THROUGH_ALL, ['a', 'b', 'c', 'v']));
+  await flush();
+  eq(
+    'the live route replaces the cached one on screen and re-sequences narration',
+    [hit.published.length - publishedBeforeLive, hit.source(), hitOrders.at(-1)],
+    [1, 'dynamic', ['a', 'b', 'c', 'v']],
+  );
+  await hit.setOnline(false);
+  await hit.setOnline(true);
+  eq('one live route per session: no further requests', hit.calls.length, 1);
+  hit.manager.stop();
+
+  // A server from before Epic 8 sends no order: it routed the order it was given.
+  const legacyOrders: string[][] = [];
+  const legacy = routeHarness({ online: true, localTime: MORNING_TIME });
+  await legacy.manager.start(sortSession({ onStopOrder: (ids) => legacyOrders.push(ids) }));
+  await flush();
+  legacy.calls[0]!.resolve(liveRoute(THROUGH_ALL, null));
+  await flush();
+  eq(
+    'no waypoint_ids: the authored order it was sent, cached under that order',
+    [legacyOrders, [...legacy.cache.keys()]],
+    [[['a', 'b', 'v', 'c']], ['route:dynamic:v2:jlm:hash-1:a,b,v,c']],
+  );
+  legacy.manager.stop();
+
+  const noHash = routeHarness({ online: true });
+  await noHash.manager.start(sortSession({ bundleHash: null }));
+  await flush();
+  noHash.calls[0]!.resolve(liveRoute(THROUGH_ALL, ['a', 'b', 'v', 'c']));
+  await flush();
+  eq('no bundle hash: fetched and drawn, never cached', [noHash.source(), noHash.cache.size], ['dynamic', 0]);
+  noHash.manager.stop();
 }
 
 // -----------------------------------------------------------------------------
@@ -792,7 +969,13 @@ eq(
 
 eq(
   'the request body carries context.local_time',
-  routeRequestBody({ tourId: 't', waypointIds: ['a', 'b'], transitMode: 'walking' }, '2026-09-17T18:40:05+03:00'),
+  routeRequestBody({
+    tourId: 't',
+    waypointIds: ['a', 'b'],
+    transitMode: 'walking',
+    localTime: '2026-09-17T18:40:05+03:00',
+    preferences: null,
+  }),
   { tour_id: 't', waypoint_ids: ['a', 'b'], transit_mode: 'walking', context: { local_time: '2026-09-17T18:40:05+03:00' } },
 );
 

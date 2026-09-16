@@ -133,7 +133,8 @@ class TourSessionController {
     // already under way. Skipped stops leave the geofence engine as well as the
     // map: a hidden pin whose narration still fired as you walked past it along
     // the route would be the worst of both.
-    const selection = selectStops(waypoints, routeCriteria(usePreferences.getState()));
+    const criteria = routeCriteria(usePreferences.getState());
+    const selection = selectStops(waypoints, criteria);
 
     const service = new LocationService(transitMode);
     service.loadTour(selection.active, transitMode);
@@ -190,12 +191,14 @@ class TourSessionController {
 
     // Publishes the best route available offline synchronously, in the same
     // tick as sessionStarted, so the first map frame already has it; then
-    // upgrades to a live route for the selected stops if and when it can.
+    // upgrades to a live route - the Smart Sorter's order - if and when it can.
+    // The same preference snapshot that selected the stops scores their order
+    // (TASK-903): editing preferences mid-walk reshuffles nothing.
     void routeManager.start({
       tourId,
       transitMode,
       stops: selection.active,
-      filtered: selection.filtered,
+      preferences: criteria ? { groupType: criteria.groupType, interests: criteria.interests } : null,
       staticRoute: this.loadStaticRoute(tourId, selection.active, transitMode),
       bundleHash: TourBundleRepository.readManifest(tourId)?.bundle_version_hash ?? null,
       onStopOrder: (waypointIds) => this.adoptStopOrder(service, waypointIds),

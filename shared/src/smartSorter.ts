@@ -55,13 +55,13 @@
  *      expensive. Anything time-varying arrives through `context`, never from a
  *      clock in here: the Edge Function runs in UTC and does not know the
  *      visitor's time zone, so "the morning" is the device's to say.
- *   2. THE APP ADOPTS THE ORDER (TASK-901/902). App builds that send `context`
- *      also read `waypoint_ids` and arm the geofences in that order
+ *   2. THE APP ADOPTS THE ORDER (TASK-901/902/903). App builds that send
+ *      `context` also read `waypoint_ids` and arm the geofences in that order
  *      (mobile/src/services/location/stopSequence.ts). Builds before them send
  *      no context and get order_index, so their narration order still matches.
- *      Open: the device keys its route cache on the unordered set and caches no
- *      order (TASK-903), so a cached route may disagree with the authored
- *      narration order it falls back to.
+ *      Offline, the app runs THIS function to predict the order and find the
+ *      cached route for it (mobile/src/routing/routeRequest.ts
+ *      predictStopOrder). Keep it free of npm imports: Metro bundles it.
  *   3. SYNCHRONOUS AND CHEAP. The whole Edge Function answers inside the
  *      phone's 10 s budget.
  *

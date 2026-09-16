@@ -2,6 +2,7 @@ import { RouteManager } from '../routing/RouteManager';
 import { networkMonitor } from '../services/network/NetworkMonitor';
 import { RouteCache } from '../services/routing/RouteCache';
 import { fetchDynamicRoute } from '../services/routing/DynamicRouteClient';
+import { deviceLocalTime } from '../routing/routeRequest';
 import { useTourSession } from './tourSessionStore';
 
 /**
@@ -14,6 +15,7 @@ export const routeManager = new RouteManager({
   fetchRoute: fetchDynamicRoute,
   cache: RouteCache,
   publish: (route) => useTourSession.getState().setRoute(route),
+  localTime: () => deviceLocalTime(),
   schedule: (fn, delayMs) => {
     const timer = setTimeout(fn, delayMs);
     return () => clearTimeout(timer);

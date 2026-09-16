@@ -1,3 +1,4 @@
+import { smartSort, type SortablePoi } from '../../../shared/src/smartSorter';
 import type { Waypoint } from '../types/domain';
 import type { DynamicRouteRequest } from './routeDecision';
 
@@ -45,14 +46,58 @@ export function deviceLocalTime(now: Date = new Date()): string {
 }
 
 /** The JSON body POSTed to route-stops. */
-export function routeRequestBody(request: DynamicRouteRequest, localTime: string): Record<string, unknown> {
+export function routeRequestBody(request: DynamicRouteRequest): Record<string, unknown> {
   return {
     tour_id: request.tourId,
     waypoint_ids: request.waypointIds,
     transit_mode: request.transitMode,
+    // Omitted, not sent empty, before onboarding: the server then scores on
+    // time alone, and predictStopOrder does exactly the same.
+    ...(request.preferences
+      ? { preferences: { group_type: request.preferences.groupType, interests: [...request.preferences.interests] } }
+      : {}),
     // Its presence opts the request in to the scored sort (smartSorter.ts).
-    context: { local_time: localTime },
+    context: { local_time: request.localTime },
   };
+}
+
+/**
+ * The order route-stops WOULD answer for this request, computed on the device
+ * with the server's own sorter (TASK-903). Used only to find a cached route
+ * while offline; the server's answer always wins once it arrives.
+ *
+ * Mirrors handler.ts: stops mapped as parseBundle maps the bundle (ids lower-
+ * cased - the sorter breaks ties on them), given in request order, with
+ * `preferences` exactly as parseRequest would read the body above. A
+ * divergence (a server on a newer SORTER_VERSION, a tag this build drops)
+ * yields a different order, which only misses the cache: an entry is stored
+ * under the order the server actually routed, so a hit can never pair a route
+ * with the wrong narration order. Null when the sorter refuses the input.
+ */
+export function predictStopOrder(
+  stops: readonly Waypoint[],
+  preferences: DynamicRouteRequest['preferences'],
+  localTime: string,
+): string[] | null {
+  const pois: SortablePoi[] = stops.map((s) => ({
+    id: s.id.toLowerCase(),
+    lon: s.coordinate.longitude,
+    lat: s.coordinate.latitude,
+    orderIndex: s.sortOrder,
+    poiType: s.poiType,
+    audiences: s.audiences ?? [],
+    interests: s.interests ?? [],
+  }));
+  try {
+    const { ordered } = smartSort(
+      pois,
+      preferences ? { groupType: preferences.groupType, interests: preferences.interests } : {},
+      { localTime },
+    );
+    return adoptableStopOrder(ordered.map((p) => p.id), stops);
+  } catch {
+    return null;
+  }
 }
 
 /** `waypoint_ids` from a route-stops response, or null when absent or malformed. */
