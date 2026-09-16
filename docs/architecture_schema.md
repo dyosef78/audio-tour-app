@@ -1,4 +1,7 @@
 # System Architecture & Database Schema
+
+> **Superseded in part.** [`ARCHITECTURE.md`](ARCHITECTURE.md) is the single source of truth. Where the two disagree (for example audio ducking, the public CDN, the zone-exit fade), it wins; see its §7.
+
 **Version:** 2.1.0 (Audio standard fixed to AAC-LC)
 **Status:** Approved for Mobile Development
 
