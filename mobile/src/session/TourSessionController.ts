@@ -10,13 +10,15 @@ import {
   type GeofenceEvent,
 } from '../services/location/LocationService';
 import { telemetry } from '../services/telemetry/TelemetryService';
+import { networkMonitor } from '../services/network/NetworkMonitor';
+import { signedAudioUrls } from '../services/supabase/client';
 import { routeCriteria } from '../personalization/options';
 import { usePreferences } from '../personalization/preferencesStore';
 import { decodeRoute } from '../routing/routeGeometry';
 import { selectStops } from '../routing/stopSelection';
 import { routeManager } from './routing';
 import { useTourSession } from './tourSessionStore';
-import type { LatLng, TransitMode, Waypoint } from '../types/domain';
+import type { AudioTrack, LatLng, TransitMode, Waypoint } from '../types/domain';
 
 /**
  * TourSessionController - the single owner of the running tour.
@@ -77,6 +79,11 @@ class TourSessionController {
     // queue that only drained during a session would strand exactly the events
     // a dead-zone tour produced. start() flushes immediately and then listens
     // for foreground transitions.
+    //
+    // Attached to the network BEFORE start() (TASK-605): a queue must drain the
+    // moment signal returns mid-walk, not when a backoff that has grown to 15
+    // minutes happens to expire.
+    telemetry.attachNetwork(networkMonitor);
     void telemetry.start(APP_VERSION);
   }
 
@@ -226,9 +233,12 @@ class TourSessionController {
       if (useTourSession.getState().deepDiveWaypointId === waypoint.id) return;
 
       const track = waypoint.audio;
-      // localUri is derived at read time by the bundle repository, never stored.
-      const uri = track?.localUri;
-      if (!track || !uri) return;
+      if (!track) return;
+      const uri = await this.playableUri(track);
+      if (!uri) return;
+      // Streaming takes a round trip to sign; if the listener left the stop
+      // meanwhile, starting its narration now would play it in the wrong place.
+      if (useTourSession.getState().activeWaypointId !== waypoint.id) return;
 
       try {
         await this.audio.play(track, uri, waypoint);
@@ -276,6 +286,35 @@ class TourSessionController {
       // Zone exit fades out rather than cutting (PRD Screen 4).
       await this.audio.fadeOutAndStop();
     }
+  }
+
+  /**
+   * What to hand the player (TASK-605, Hybrid Offline-First).
+   *
+   * The bundled file, whenever it is on disk - which is the normal case and
+   * costs nothing. If it is NOT (storage cleared by the OS or the user, or the
+   * download removed while a tour was open) and the device is online, a signed
+   * stream of the same object instead: before this, that stop simply played
+   * silence with full signal available.
+   *
+   * Offline with no file, the local path is returned unchanged so AudioService
+   * fails loudly exactly as it did before, rather than silently.
+   */
+  private async playableUri(track: AudioTrack): Promise<string | null> {
+    const local = track.localUri ?? null;
+    if (local !== null && TourBundleRepository.localFileExists(local)) return local;
+    if (!networkMonitor.isOnline()) return local;
+
+    try {
+      const remote = (await signedAudioUrls([track.storagePath])).get(track.storagePath);
+      if (remote) {
+        console.warn(`[TourSession] ${track.storagePath} is not on disk; streaming it instead`);
+        return remote;
+      }
+    } catch (err) {
+      console.warn(`[TourSession] could not sign a stream for ${track.storagePath}:`, err);
+    }
+    return local;
   }
 
   // ---------------------------------------------------------------------------
@@ -373,8 +412,9 @@ class TourSessionController {
   async playDeepDive(waypointId: string): Promise<void> {
     const waypoint = useTourSession.getState().waypoints.find((w) => w.id === waypointId);
     const track = waypoint?.deepDive;
-    const uri = track?.localUri;
-    if (!waypoint || !track || !uri) return;
+    if (!waypoint || !track) return;
+    const uri = await this.playableUri(track);
+    if (!uri) return;
 
     // Before play(), not after: a synchronous failure inside play() reports
     // through setPlaybackError, and startDeepDive would clear that error.

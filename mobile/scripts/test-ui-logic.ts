@@ -19,6 +19,7 @@ import {
   tourFitsBudget,
 } from '../src/personalization/options.ts';
 import { planBundleFiles } from '../src/services/bundle/plan.ts';
+import { tourFromManifest } from '../src/services/bundle/catalogue.ts';
 import type { WireBundle } from '../src/services/bundle/types.ts';
 import { transcriptPathFor } from '../src/transcript/sidecar.ts';
 import { usePreferences, usePreferencesBoot } from '../src/personalization/preferencesStore.ts';
@@ -694,6 +695,31 @@ const liveRoute = (route: EncodedRoute = DIRECT_ROUTE): DynamicRouteResult => ({
     [publishedBefore, 0, true],
   );
 }
+
+// -----------------------------------------------------------------------------
+// TASK-605: offline catalogue
+// -----------------------------------------------------------------------------
+
+heading('tourFromManifest (offline Discovery)');
+
+eq(
+  'a downloaded manifest becomes a catalogue entry',
+  tourFromManifest({
+    bundle_version_hash: 'h',
+    tour_metadata: { tour_id: 't1', title: 'Jerusalem', topology: 'in_city', transit_mode: 'walking', duration_minutes: 90 },
+    waypoints: [],
+  }),
+  { id: 't1', title: 'Jerusalem', topology: 'in_city', transitMode: 'walking', durationMinutes: 90 },
+);
+eq(
+  'an empty title still gets a readable label',
+  tourFromManifest({
+    bundle_version_hash: 'h',
+    tour_metadata: { tour_id: 't2', title: '', topology: 'in_city', transit_mode: 'walking', duration_minutes: 15 },
+    waypoints: [],
+  }).title,
+  'Untitled tour',
+);
 
 // -----------------------------------------------------------------------------
 

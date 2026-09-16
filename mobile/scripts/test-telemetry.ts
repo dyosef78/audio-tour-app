@@ -596,6 +596,47 @@ async function testResilience(): Promise<void> {
  * Opt-in because it needs credentials and a network, and the suite must stay
  * runnable on a fresh clone with neither.
  */
+// -----------------------------------------------------------------------------
+// 10b. Connectivity restored (TASK-605, Hybrid Offline-First)
+// -----------------------------------------------------------------------------
+
+async function testReconnect(): Promise<void> {
+  heading('10b. Reconnect drains the queue immediately');
+  resetStorage();
+  const transport = new ScriptedTransport();
+  transport.program(() => ({ kind: 'accepted' }));
+  const service = new TelemetryService(transport);
+
+  let online = false;
+  const listeners = new Set<(online: boolean) => void>();
+  const detach = service.attachNetwork({
+    isOnline: () => online,
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+  });
+
+  await service.record('audio_started', { tourId: 't1' });
+  await service.flush();
+  eq('known offline: not even an attempt is made', transport.sent.length, 0);
+  eq('known offline: the event is kept', await service.pendingCount(), 1);
+
+  // Signal returns with the app open - no foregrounding, no timer.
+  online = true;
+  for (const listener of [...listeners]) listener(true);
+  await service.flush(); // queued behind the flush the reconnect started
+
+  eq('reconnect delivers at once, without waiting out the backoff', await service.pendingCount(), 0);
+  eq('in a single request', transport.sent.length, 1);
+
+  detach();
+  eq('detach removes the network listener', listeners.size, 0);
+  service.stop();
+}
+
 async function testLiveContract(): Promise<void> {
   heading('11. Live contract check');
 
@@ -689,6 +730,7 @@ async function main(): Promise<void> {
   await testRetryKeepsId();
   await testAudioLifecycle();
   await testResilience();
+  await testReconnect();
   if (process.argv.includes('--live')) await testLiveContract();
 
   heading('Result');

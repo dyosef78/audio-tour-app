@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
@@ -18,6 +18,8 @@ import {
   tourFitsBudget,
 } from '../personalization/options';
 import { usePreferences } from '../personalization/preferencesStore';
+import { TourBundleRepository } from '../services/bundle/TourBundleRepository';
+import { networkMonitor } from '../services/network/NetworkMonitor';
 import { isSupabaseConfigured } from '../services/supabase/client';
 import { fetchTours } from '../services/supabase/tours';
 import type { DiscoveryScreenProps } from '../navigation/types';
@@ -38,7 +40,7 @@ const TRANSIT_LABEL: Record<string, string> = {
 
 type LoadState =
   | { status: 'loading' }
-  | { status: 'ready'; tours: Tour[] }
+  | { status: 'ready'; tours: Tour[]; source: 'live' | 'offline' }
   | { status: 'error'; message: string };
 
 /**
@@ -47,18 +49,25 @@ type LoadState =
  * Fetches the catalogue with the anon key, so it doubles as a live check that
  * the public-read RLS policy works from a real client.
  *
- * Four distinct states are rendered rather than collapsed into one spinner:
- * unconfigured, loading, error, and empty are different problems with different
- * fixes, and telling them apart is most of the debugging value.
+ * HYBRID OFFLINE-FIRST (TASK-605). With no connection this screen used to show
+ * "Could not load tours" - and nothing else, so a tour downloaded precisely for
+ * a dead zone could not be opened in one. Now:
+ *   * the live catalogue when it loads;
+ *   * otherwise the tours already downloaded, from their manifests, under a
+ *     banner saying so;
+ *   * an error only when there is neither;
+ *   * and the moment connectivity returns, an offline list or an error reloads
+ *     by itself.
  *
  * Personalisation (TASK-601): the time budget is the only preference the
  * catalogue can act on today, so tours that fit it sort first and are badged.
- * Nothing is hidden - with a catalogue this small, filtering would mostly
- * produce an empty screen.
  */
 export default function DiscoveryScreen({ navigation }: DiscoveryScreenProps) {
   const [state, setState] = useState<LoadState>({ status: 'loading' });
   const [refreshing, setRefreshing] = useState(false);
+
+  const stateRef = useRef(state);
+  stateRef.current = state;
 
   const groupType = usePreferences((s) => s.groupType);
   const interests = usePreferences((s) => s.interests);
@@ -83,27 +92,45 @@ export default function DiscoveryScreen({ navigation }: DiscoveryScreenProps) {
   }, [navigation, editPreferences]);
 
   const load = useCallback(async () => {
+    // The tours on this device, or the error if there are none.
+    const offlineOr = (message: string): void => {
+      const downloaded = TourBundleRepository.listDownloadedTours();
+      setState(
+        downloaded.length > 0
+          ? { status: 'ready', tours: downloaded, source: 'offline' }
+          : { status: 'error', message },
+      );
+    };
+
     if (!isSupabaseConfigured) {
-      setState({
-        status: 'error',
-        message:
-          'Supabase is not configured.\n\nCopy mobile/.env.example to mobile/.env, add your anon key, then restart the dev server.',
-      });
+      offlineOr(
+        'Supabase is not configured.\n\nCopy mobile/.env.example to mobile/.env, add your anon key, then restart the dev server.',
+      );
       return;
     }
     try {
-      setState({ status: 'ready', tours: await fetchTours() });
+      setState({ status: 'ready', tours: await fetchTours(), source: 'live' });
     } catch (err) {
-      setState({
-        status: 'error',
-        message: err instanceof Error ? err.message : 'Could not load tours.',
-      });
+      offlineOr(err instanceof Error ? err.message : 'Could not load tours.');
     }
   }, []);
 
   useEffect(() => {
     void load();
   }, [load]);
+
+  // Reload when the connection returns - but only if what is on screen is the
+  // offline fallback or an error. A live list does not need a second fetch
+  // just because the monitor reported its first reading.
+  useEffect(
+    () =>
+      networkMonitor.subscribe((online) => {
+        const current = stateRef.current;
+        const stale = current.status === 'error' || (current.status === 'ready' && current.source === 'offline');
+        if (online && stale) void load();
+      }),
+    [load],
+  );
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
@@ -147,22 +174,33 @@ export default function DiscoveryScreen({ navigation }: DiscoveryScreenProps) {
       contentContainerStyle={tours.length === 0 ? styles.flexFill : styles.list}
       refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => void onRefresh()} />}
       ListHeaderComponent={
-        criteria && timeBudget ? (
-          <Pressable
-            style={({ pressed }) => [styles.prefs, pressed && styles.cardPressed]}
-            onPress={editPreferences}
-            accessibilityRole="button"
-            accessibilityHint="Edit your preferences"
-          >
-            <Text style={styles.prefsEyebrow}>PLANNED FOR YOU</Text>
-            <Text style={styles.prefsTitle}>
-              {labelFor(GROUP_TYPES, criteria.groupType)} · {labelFor(TIME_BUDGETS, timeBudget)}
-            </Text>
-            <Text style={styles.prefsSub} numberOfLines={2}>
-              {criteria.interests.map((i) => labelFor(INTERESTS, i)).join(', ')}
-            </Text>
-          </Pressable>
-        ) : null
+        <>
+          {state.source === 'offline' && (
+            <View style={styles.offline} accessibilityRole="alert">
+              <Text style={styles.offlineTitle}>You are offline</Text>
+              <Text style={styles.offlineText}>
+                Showing the tours downloaded to this device. The full catalogue comes back as soon
+                as you reconnect.
+              </Text>
+            </View>
+          )}
+          {criteria && timeBudget ? (
+            <Pressable
+              style={({ pressed }) => [styles.prefs, pressed && styles.cardPressed]}
+              onPress={editPreferences}
+              accessibilityRole="button"
+              accessibilityHint="Edit your preferences"
+            >
+              <Text style={styles.prefsEyebrow}>PLANNED FOR YOU</Text>
+              <Text style={styles.prefsTitle}>
+                {labelFor(GROUP_TYPES, criteria.groupType)} · {labelFor(TIME_BUDGETS, timeBudget)}
+              </Text>
+              <Text style={styles.prefsSub} numberOfLines={2}>
+                {criteria.interests.map((i) => labelFor(INTERESTS, i)).join(', ')}
+              </Text>
+            </Pressable>
+          ) : null}
+        </>
       }
       ListEmptyComponent={
         <View style={styles.centered}>
@@ -207,6 +245,9 @@ const styles = StyleSheet.create({
   retry: { marginTop: 8, paddingVertical: 10, paddingHorizontal: 22, borderRadius: 8, backgroundColor: '#1C1C1E' },
   retryText: { color: '#FFFFFF', fontWeight: '600' },
   headerLink: { color: '#0C6C6A', fontSize: 15, fontWeight: '600' },
+  offline: { padding: 14, borderRadius: 12, backgroundColor: '#FBF0E0', gap: 2, marginBottom: 12 },
+  offlineTitle: { fontSize: 14, fontWeight: '700', color: '#8A5A00' },
+  offlineText: { fontSize: 13, lineHeight: 18, color: '#6B4A12' },
   prefs: { padding: 16, borderRadius: 14, backgroundColor: '#E3F1F0', gap: 3 },
   prefsEyebrow: { fontSize: 11, fontWeight: '700', letterSpacing: 0.8, color: '#0C6C6A' },
   prefsTitle: { fontSize: 16, fontWeight: '700', color: '#1C1C1E' },

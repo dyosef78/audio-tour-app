@@ -1,9 +1,10 @@
-import { Directory } from 'expo-file-system';
+import { Directory, File } from 'expo-file-system';
 
 import { parseGroupTypes, parseInterests } from '../../personalization/options';
 import { signedAudioUrls } from '../supabase/client';
 import { fetchTourBundle } from '../supabase/bundle';
 import { DownloadManager, type DownloadItem } from './DownloadManager';
+import { tourFromManifest } from './catalogue';
 import { planBundleFiles } from './plan';
 import { parseEncodedRoute } from '../../routing/routeGeometry';
 import {
@@ -26,6 +27,7 @@ import type {
   EncodedRoute,
   GeofenceZone,
   PoiType,
+  Tour,
   TransitMode,
   Waypoint,
 } from '../../types/domain';
@@ -169,6 +171,45 @@ export class TourBundleRepository {
       .map((dir) => dir.name)
       .filter((name) => !name.endsWith('.partial'))
       .filter((tourId) => this.isDownloaded(tourId));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Hybrid Offline-First (TASK-605)
+  // ---------------------------------------------------------------------------
+
+  /** The tours on this device, as catalogue entries - Discovery's offline list. */
+  static listDownloadedTours(): Tour[] {
+    return this.listDownloaded()
+      .map((tourId) => this.readManifest(tourId))
+      .filter((manifest): manifest is WireBundle => manifest !== null)
+      .map(tourFromManifest)
+      .sort((a, b) => a.title.localeCompare(b.title));
+  }
+
+  /**
+   * Is the downloaded bundle still the server's version? Needs the network;
+   * throws when it cannot reach it, which callers treat as "unknown".
+   *
+   * One small RPC and no media. It compares bundle_version_hash, so it sees
+   * every change that alters what is downloaded - audio, transcripts, Deep
+   * Dives, routes. It does NOT see tag-only edits, which are deliberately
+   * outside the hash; refreshing those in place needs an atomic manifest write
+   * that expo-file-system does not offer (see the TASK-605 report).
+   */
+  static async checkForUpdate(tourId: string): Promise<'current' | 'update_available'> {
+    const remote = await fetchTourBundle(tourId);
+    return this.readManifest(tourId)?.bundle_version_hash === remote.bundle_version_hash
+      ? 'current'
+      : 'update_available';
+  }
+
+  /** Whether a derived local media URI still has a file behind it. */
+  static localFileExists(uri: string): boolean {
+    try {
+      return new File(uri).exists;
+    } catch {
+      return false;
+    }
   }
 
   // ---------------------------------------------------------------------------

@@ -16,19 +16,17 @@ import type {
  * Owns three things the queue deliberately does not: the device identity, the
  * construction of a well-formed event, and when to try sending.
  *
- * NETWORK AWARENESS, HONESTLY DESCRIBED
- * This app has no NetInfo and no expo-network dependency, so nothing here can
- * observe the radio directly. Sync is therefore TRIGGER-DRIVEN plus backoff:
- * it flushes when something has probably changed (app foregrounded, a tour
- * started or ended, an explicit nudge) and, on failure, waits longer each time
- * up to a ceiling. The practical difference from a NetInfo build is latency, not
- * correctness - events are delivered a little later than the instant the radio
- * returns.
+ * NETWORK AWARENESS (TASK-605, Hybrid Offline-First)
+ * Sync is trigger-driven plus backoff - app launch, foregrounding, and a timer
+ * that waits longer after each failure, up to 15 minutes - AND, since expo-network
+ * arrived with TASK-604, connectivity-driven: attachNetwork() makes a reconnect
+ * reset the backoff and drain at once, and makes the loop skip attempts while
+ * the device is known to be offline.
  *
- * `setConnectivityProbe()` is the seam for closing that gap. Hand it
- * NetInfo.fetch().then(s => s.isInternetReachable ?? false) and the loop stops
- * making pointless attempts while offline; add a NetInfo listener calling
- * flush() and delivery becomes immediate. Neither requires touching the queue.
+ * Before that, a queue that had backed off during a dead-zone walk could sit
+ * for up to 15 minutes after signal returned with the app open - the queue
+ * ignoring a working connection, which the directive forbids. The queue itself
+ * is unchanged; only when to try is.
  */
 
 const DEVICE_ID_KEY = 'telemetry:device_id:v1';
@@ -85,6 +83,7 @@ export class TelemetryService implements AudioTelemetrySink {
   /** Serialises flushes so two triggers cannot drain concurrently. */
   private flushing: Promise<FlushResult | null> = Promise.resolve(null);
   private connectivityProbe: (() => Promise<boolean>) | null = null;
+  private networkUnsubscribe: (() => void) | null = null;
 
   private appVersion: string | null = null;
 
@@ -120,7 +119,40 @@ export class TelemetryService implements AudioTelemetrySink {
   stop(): void {
     this.appStateSub?.remove();
     this.appStateSub = null;
+    this.networkUnsubscribe?.();
+    this.networkUnsubscribe = null;
     this.clearTimer();
+  }
+
+  /**
+   * Follow a connectivity source: skip attempts while offline, and drain the
+   * moment the connection returns. Structural type, so the Node harness can
+   * drive it without expo-network. Returns a detach function.
+   */
+  attachNetwork(network: {
+    isOnline(): boolean;
+    subscribe(listener: (online: boolean) => void): () => void;
+  }): () => void {
+    this.networkUnsubscribe?.();
+    this.setConnectivityProbe(async () => network.isOnline());
+    const unsubscribe = network.subscribe((online) => {
+      if (online) void this.onConnectivityRestored();
+    });
+    this.networkUnsubscribe = unsubscribe;
+    return () => {
+      unsubscribe();
+      if (this.networkUnsubscribe === unsubscribe) this.networkUnsubscribe = null;
+      this.setConnectivityProbe(null);
+    };
+  }
+
+  /**
+   * The connection is back: forget the backoff and deliver now. The backoff
+   * existed to avoid hammering a dead network, which this event says is over.
+   */
+  onConnectivityRestored(): Promise<FlushResult | null> {
+    this.backoffMs = BACKOFF_MIN_MS;
+    return this.flush();
   }
 
   /**
