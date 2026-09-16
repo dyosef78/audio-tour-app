@@ -1,0 +1,6 @@
+{
+  "name": "@audio-tour/shared",
+  "private": true,
+  "//": "Code that runs in all three runtimes: Metro (the app), Node type-stripping (backend scripts, root tsc) and Deno (supabase/functions, through supabase/functions/import_map.json). Rules: relative imports only, with the real .ts extension; no node:, npm: or jsr: imports; no process.env or Deno.env. `type: module` makes Node and the root tsc treat these files as ESM.",
+  "type": "module"
+}

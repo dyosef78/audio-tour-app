@@ -1,5 +1,5 @@
-import { decodePolyline, distanceToRouteMeters, PolylineError, type RoutePoint } from '../geo/polyline';
-import { routeToleranceMeters } from '../geo/routeTolerance';
+import { decodePolyline, distanceToRouteMeters, PolylineError, type RoutePoint } from '../../../shared/src/polyline';
+import { routeToleranceMeters } from '../../../shared/src/routeTolerance';
 import type { EncodedRoute, LatLng, TransitMode, Waypoint } from '../types/domain';
 
 /**

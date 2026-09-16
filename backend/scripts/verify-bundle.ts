@@ -28,10 +28,10 @@
 import { createClient } from '@supabase/supabase-js';
 
 import { transcriptPathFor } from '../../mobile/src/transcript/sidecar.ts';
-// The device's own codec and tolerance (mobile/src/geo), so CI checks the
+// The device's own codec and tolerance (shared/src), so CI checks the
 // bundle route exactly the way the app will read it.
-import { decodePolyline, distanceToRouteMeters, type RoutePoint } from '../../mobile/src/geo/polyline.ts';
-import { routeToleranceMeters } from '../../mobile/src/geo/routeTolerance.ts';
+import { decodePolyline, distanceToRouteMeters, type RoutePoint } from '../../shared/src/polyline.ts';
+import { routeToleranceMeters } from '../../shared/src/routeTolerance.ts';
 
 const URL = process.env.SUPABASE_URL ?? 'http://127.0.0.1:54321';
 const ANON = process.env.SUPABASE_ANON_KEY;

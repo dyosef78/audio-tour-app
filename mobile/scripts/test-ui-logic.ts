@@ -27,9 +27,10 @@ import { AudioService, type PlaybackError } from '../src/services/audio/AudioSer
 import { useTourSession } from '../src/session/tourSessionStore.ts';
 import { cueIndexAt, isRtlText, parseVtt, VttParseError } from '../src/transcript/vtt.ts';
 import type { AudioTrack, EncodedRoute, LatLng, Waypoint } from '../src/types/domain.ts';
-import { encodePolyline } from '../src/geo/polyline.ts';
+import { encodePolyline } from '../../shared/src/polyline.ts';
 import { RouteManager, type RouteSessionContext } from '../src/routing/RouteManager.ts';
 import {
+  isPermanentRouteStatus,
   routeCacheKey,
   type DynamicRouteRequest,
   type DynamicRouteResult,
@@ -458,6 +459,12 @@ assert('a precision-5 route labelled 6 is rejected', !mislabelled.ok, JSON.strin
 eq('cache key ignores stop order', routeCacheKey('t', 'h', ['b', 'a']), routeCacheKey('t', 'h', ['a', 'b']));
 assert('cache key changes with the bundle version', routeCacheKey('t', 'h1', ['a']) !== routeCacheKey('t', 'h2', ['a']));
 eq('no bundle hash, no caching', routeCacheKey('t', null, ['a']), null);
+eq(
+  'route-stops statuses that stop retrying',
+  [400, 401, 403, 404, 408, 422, 429, 500, 501, 502, 504].filter((s) => isPermanentRouteStatus(s)),
+  [400, 403, 404, 422, 501],
+);
+eq('no status (network error) is retried', isPermanentRouteStatus(undefined), false);
 
 heading('RouteManager: live, bundled and straight routes across connectivity changes');
 

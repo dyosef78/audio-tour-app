@@ -19,9 +19,11 @@
  * defaults it.
  *
  * ONE implementation, shared: the app decodes and validates every route with it
- * (routing/routeGeometry.ts), and backend/scripts/verify-bundle.ts decodes the
- * bundle route CI serves with it. Moved here from backend/cms in TASK-604 Part 2.
- * Import-free, so both Metro and Node type-stripping load it (see package.json).
+ * (mobile/src/routing/routeGeometry.ts), backend/scripts/verify-bundle.ts decodes
+ * the bundle route CI serves with it, and the route-stops Edge Function encodes
+ * with it (via shared/src/routing). Moved from backend/cms to mobile/src/geo in
+ * TASK-604, then to shared/ in TASK-702 so Deno can import it too.
+ * Import-free, so Metro, Node type-stripping and Deno all load it unchanged.
  */
 
 export type PolylinePrecision = 5 | 6;

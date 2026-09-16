@@ -27,7 +27,7 @@ import {
   distanceToRouteMeters,
   encodePolyline,
   type RoutePoint,
-} from '../../mobile/src/geo/polyline.ts';
+} from '../../shared/src/polyline.ts';
 
 let failures = 0;
 let checks = 0;

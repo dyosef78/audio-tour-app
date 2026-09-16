@@ -6,7 +6,7 @@
  * route before drawing one - bundled or fetched live - so a route the CMS would
  * refuse is never shown on a map either.
  *
- * Import-free: shared with backend/scripts/verify-bundle.ts.
+ * Import-free: shared with backend/scripts/verify-bundle.ts and the Edge Functions.
  */
 export function routeToleranceMeters(transitMode: string | null | undefined): number {
   return transitMode === 'driving' ? 500 : transitMode === 'biking' ? 250 : 150;

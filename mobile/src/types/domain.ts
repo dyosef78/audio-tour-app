@@ -14,7 +14,7 @@
  * can map the generated Row types onto these.
  */
 
-import type { PolylinePrecision } from '../geo/polyline';
+import type { PolylinePrecision } from '../../../shared/src/polyline';
 import type { GroupType, Interest } from '../personalization/options';
 
 /** Longitude/latitude in WGS84 (SRID 4326), matching raw GPS fixes. */

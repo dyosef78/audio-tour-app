@@ -1,4 +1,0 @@
-{
-  "//": "Marks these modules as ESM for Node and the backend's NodeNext tsc, which import polyline.ts and routeTolerance.ts directly (TASK-604) - the CMS verifier decodes routes with the same codec the device renders with. Keep modules in this directory import-free. Metro ignores the field.",
-  "type": "module"
-}

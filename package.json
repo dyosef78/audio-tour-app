@@ -24,6 +24,10 @@
     "sim:walk": "node --env-file-if-exists=.env --import ./mobile/scripts/register-stubs.mjs mobile/scripts/simulate-walk.ts",
     "test:telemetry": "node --env-file-if-exists=.env --import ./mobile/scripts/register-stubs.mjs mobile/scripts/test-telemetry.ts",
     "test:cms": "node backend/scripts/test-cms.ts",
+    "test:routing": "node backend/scripts/test-routing.ts",
+    "test:edge": "deno test --import-map=supabase/functions/import_map.json supabase/functions/",
+    "check:edge": "deno check --import-map=supabase/functions/import_map.json supabase/functions/route-stops/index.ts",
+    "routing:ping": "node --env-file-if-exists=.env --env-file-if-exists=mobile/.env backend/scripts/ping-routing.ts",
     "test:ui": "node --import ./mobile/scripts/register-stubs.mjs mobile/scripts/test-ui-logic.ts",
     "seed:telaviv": "node --env-file-if-exists=.env backend/scripts/seed-tel-aviv-qa.ts"
   },

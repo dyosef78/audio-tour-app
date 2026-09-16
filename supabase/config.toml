@@ -447,6 +447,16 @@ deno_version = 2
 # [edge_runtime.secrets]
 # secret_key = "env(SECRET_VALUE)"
 
+# TASK-702 - route through a subset of a tour's stops (Valhalla).
+# verify_jwt stays on: the app sends the anon key or the tourist's session, and
+# the function forwards it to get_tour_bundle so RLS decides what is routable.
+# import_map resolves `@shared/` to ../../shared/src (relative to the map file).
+# Needs `supabase secrets set STADIA_API_KEY=...`; without it every call is 501.
+[functions.route-stops]
+enabled = true
+verify_jwt = true
+import_map = "./functions/import_map.json"
+
 [analytics]
 enabled = true
 port = 54327

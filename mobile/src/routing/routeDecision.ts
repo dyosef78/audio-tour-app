@@ -48,6 +48,21 @@ export interface DynamicRouteRequest {
   transitMode: TransitMode;
 }
 
+/**
+ * Whether an HTTP status from route-stops means "stop asking this session".
+ *
+ * 404/501 mean the function or its routing is absent. Other 4xx mean THIS
+ * request can never succeed - a stop the server does not know (400), a stop
+ * set Valhalla cannot route (422) - so retrying only spends routing calls.
+ * Still retried: 401 (the session token may have been refreshed), 408 and 429
+ * (transient by definition), and every 5xx.
+ */
+export function isPermanentRouteStatus(status: number | undefined): boolean {
+  if (status === undefined) return false;
+  if (status === 501) return true;
+  return status >= 400 && status < 500 && status !== 401 && status !== 408 && status !== 429;
+}
+
 export type DynamicRouteResult =
   | { kind: 'ok'; route: EncodedRoute }
   | { kind: 'unavailable'; reason: string }
