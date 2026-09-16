@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 
+import type { RouteDisplay } from '../routing/routeDecision';
 import type { LatLng, TransitMode, Waypoint } from '../types/domain';
 
 /**
@@ -24,7 +25,12 @@ export interface TourSessionState {
   tourId: string | null;
   tourTitle: string | null;
   transitMode: TransitMode | null;
+  /** The stops this session RUNS - after onboarding filtering (TASK-604). */
   waypoints: Waypoint[];
+  /** Stops removed by the preferences: no pin, no geofence. */
+  skippedWaypointIds: string[];
+  /** What the map draws, maintained by RouteManager as connectivity changes. */
+  route: RouteDisplay;
 
   /** Live position, for the map dot. Highest-frequency field in the store. */
   currentFix: LatLng | null;
@@ -75,7 +81,9 @@ export interface TourSessionActions {
     waypoints: Waypoint[];
     transitMode: TransitMode;
     backgroundPermission: boolean;
+    skippedWaypointIds?: string[];
   }) => void;
+  setRoute: (route: RouteDisplay) => void;
   sessionFailed: (message: string) => void;
   reset: () => void;
 
@@ -97,6 +105,8 @@ const initial: TourSessionState = {
   tourTitle: null,
   transitMode: null,
   waypoints: [],
+  skippedWaypointIds: [],
+  route: { source: 'straight', points: null },
   currentFix: null,
   accuracyMeters: null,
   samplingTier: 'coarse',
@@ -118,8 +128,10 @@ export const useTourSession = create<TourSessionState & TourSessionActions>((set
   beginStart: (tourId, tourTitle) =>
     set({ ...initial, status: 'starting', tourId, tourTitle }),
 
-  sessionStarted: ({ waypoints, transitMode, backgroundPermission }) =>
-    set({ status: 'active', waypoints, transitMode, backgroundPermission, error: null }),
+  sessionStarted: ({ waypoints, transitMode, backgroundPermission, skippedWaypointIds = [] }) =>
+    set({ status: 'active', waypoints, transitMode, backgroundPermission, skippedWaypointIds, error: null }),
+
+  setRoute: (route) => set({ route }),
 
   sessionFailed: (message) => set({ status: 'error', error: message }),
 

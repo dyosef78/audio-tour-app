@@ -14,6 +14,7 @@
  * can map the generated Row types onto these.
  */
 
+import type { PolylinePrecision } from '../geo/polyline';
 import type { GroupType, Interest } from '../personalization/options';
 
 /** Longitude/latitude in WGS84 (SRID 4326), matching raw GPS fixes. */
@@ -122,6 +123,19 @@ export interface Waypoint {
   /** Preference tags for route filtering (TASK-603). Empty = not restricted. */
   audiences?: readonly GroupType[];
   interests?: readonly Interest[];
+}
+
+/**
+ * A route as shipped: an encoded polyline WITH its precision (TASK-604).
+ *
+ * Never drawn as-is. routing/routeGeometry.ts decodes it and proves it reaches
+ * the stops first, whether it came from the bundle, the disk cache or the
+ * network.
+ */
+export interface EncodedRoute {
+  precision: PolylinePrecision;
+  polyline: string;
+  lengthMeters: number | null;
 }
 
 /** A tour plus everything needed to run it with no network. */

@@ -61,6 +61,18 @@ export interface WireWaypoint {
   interests?: string[];
 }
 
+/**
+ * The tour route (TASK-604): top-level `route` in get_tour_bundle. The server
+ * always sends precision 6 and says so; parseEncodedRoute() still refuses one
+ * whose precision is missing rather than assuming.
+ */
+export interface WireRoute {
+  encoding: string;
+  precision: number;
+  polyline: string;
+  length_meters?: number;
+}
+
 export interface WireBundle {
   /** Content-derived hash; changes whenever any tour content changes. */
   bundle_version_hash: string;
@@ -74,6 +86,8 @@ export interface WireBundle {
     interests?: string[];
   };
   waypoints: WireWaypoint[];
+  /** Null when the tour has no route; absent from bundles made before TASK-604. */
+  route?: WireRoute | null;
 }
 
 /** Aggregate progress for the Screen 2 bar. */

@@ -10,8 +10,13 @@ import {
   type GeofenceEvent,
 } from '../services/location/LocationService';
 import { telemetry } from '../services/telemetry/TelemetryService';
+import { routeCriteria } from '../personalization/options';
+import { usePreferences } from '../personalization/preferencesStore';
+import { decodeRoute } from '../routing/routeGeometry';
+import { selectStops } from '../routing/stopSelection';
+import { routeManager } from './routing';
 import { useTourSession } from './tourSessionStore';
-import type { LatLng } from '../types/domain';
+import type { LatLng, TransitMode, Waypoint } from '../types/domain';
 
 /**
  * TourSessionController - the single owner of the running tour.
@@ -116,8 +121,15 @@ class TourSessionController {
       return;
     }
 
+    // TASK-604: onboarding preferences decide which stops this session RUNS.
+    // Snapshotted here - editing preferences mid-walk does not reshuffle a tour
+    // already under way. Skipped stops leave the geofence engine as well as the
+    // map: a hidden pin whose narration still fired as you walked past it along
+    // the route would be the worst of both.
+    const selection = selectStops(waypoints, routeCriteria(usePreferences.getState()));
+
     const service = new LocationService(transitMode);
-    service.loadTour(waypoints, transitMode);
+    service.loadTour(selection.active, transitMode);
     service.setCallbacks({
       onLocation: (fix, accuracy) => useTourSession.getState().setFix(fix, accuracy),
       onSamplingChange: (tier) => useTourSession.getState().setSamplingTier(tier),
@@ -163,10 +175,39 @@ class TourSessionController {
     });
 
     useTourSession.getState().sessionStarted({
-      waypoints,
+      waypoints: selection.active,
       transitMode,
       backgroundPermission: permissions.background,
+      skippedWaypointIds: selection.skippedIds,
     });
+
+    // Publishes the best route available offline synchronously, in the same
+    // tick as sessionStarted, so the first map frame already has it; then
+    // upgrades to a live route for the selected stops if and when it can.
+    void routeManager.start({
+      tourId,
+      transitMode,
+      stops: selection.active,
+      filtered: selection.filtered,
+      staticRoute: this.loadStaticRoute(tourId, selection.active, transitMode),
+      bundleHash: TourBundleRepository.readManifest(tourId)?.bundle_version_hash ?? null,
+    });
+  }
+
+  /**
+   * The bundle's route, validated against the stops this session runs.
+   *
+   * A route that fails validation is logged and dropped: dashed straight lines
+   * are honest about being approximate; a confident line that misses the stops
+   * is not.
+   */
+  private loadStaticRoute(tourId: string, stops: Waypoint[], transitMode: TransitMode): LatLng[] | null {
+    const encoded = TourBundleRepository.loadRoute(tourId);
+    if (!encoded) return null;
+    const checked = decodeRoute(encoded, stops, transitMode);
+    if (checked.ok) return checked.points;
+    console.warn(`[TourSession] bundled route ignored: ${checked.reason}`);
+    return null;
   }
 
   // ---------------------------------------------------------------------------
@@ -434,6 +475,9 @@ class TourSessionController {
     this.audio.setTelemetry(null);
     this.audio.setOnStatus(null);
     this.audio.setOnError(null);
+
+    // Aborts any route request and ignores its late answer.
+    routeManager.stop();
 
     useTourSession.getState().reset();
   }

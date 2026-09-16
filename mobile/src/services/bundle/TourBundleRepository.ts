@@ -5,6 +5,7 @@ import { signedAudioUrls } from '../supabase/client';
 import { fetchTourBundle } from '../supabase/bundle';
 import { DownloadManager, type DownloadItem } from './DownloadManager';
 import { planBundleFiles } from './plan';
+import { parseEncodedRoute } from '../../routing/routeGeometry';
 import {
   bundleDir,
   bundlesRoot,
@@ -22,6 +23,7 @@ import {
 } from './types';
 import type {
   AudioTrack,
+  EncodedRoute,
   GeofenceZone,
   PoiType,
   TransitMode,
@@ -193,6 +195,16 @@ export class TourBundleRepository {
   static loadTransitMode(tourId: string): TransitMode | null {
     const manifest = this.readManifest(tourId);
     return manifest ? (manifest.tour_metadata.transit_mode as TransitMode) : null;
+  }
+
+  /**
+   * The bundled route (TASK-604), shape-checked but not yet decoded - that
+   * needs the session's active stops. Null for tours without a route and for
+   * every bundle downloaded before the route migration.
+   */
+  static loadRoute(tourId: string): EncodedRoute | null {
+    const manifest = this.readManifest(tourId);
+    return manifest ? parseEncodedRoute(manifest.route) : null;
   }
 
   private static toWaypoint(tourId: string, w: WireWaypoint): Waypoint {

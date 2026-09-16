@@ -28,6 +28,10 @@
 import { createClient } from '@supabase/supabase-js';
 
 import { transcriptPathFor } from '../../mobile/src/transcript/sidecar.ts';
+// The device's own codec and tolerance (mobile/src/geo), so CI checks the
+// bundle route exactly the way the app will read it.
+import { decodePolyline, distanceToRouteMeters, type RoutePoint } from '../../mobile/src/geo/polyline.ts';
+import { routeToleranceMeters } from '../../mobile/src/geo/routeTolerance.ts';
 
 const URL = process.env.SUPABASE_URL ?? 'http://127.0.0.1:54321';
 const ANON = process.env.SUPABASE_ANON_KEY;
@@ -133,6 +137,7 @@ async function main(): Promise<void> {
   );
 
   let deepDives = 0;
+  let routes = 0;
 
   // --- 2. The bundle is complete -------------------------------------------
   // This is the payload the mobile client actually consumes. Anything missing
@@ -217,11 +222,52 @@ async function main(): Promise<void> {
         isStringArray(w.audiences) && isStringArray(w.interests),
       );
     }
+
+    // --- Route (TASK-604) ---------------------------------------------------
+    // Decoded HERE, in the device's language, from what the bundle ships -
+    // not trusted from the database. A route that decodes to the wrong place
+    // (the classic polyline5/polyline6 mix-up) fails the per-stop distance.
+    check("bundle carries a 'route' key", 'route' in (bundle as any), 'TASK-604 migration not applied');
+    const route = (bundle as any).route;
+    if (route != null) {
+      routes++;
+      check(
+        'route is declared as a precision-6 encoded polyline',
+        route.encoding === 'polyline' && route.precision === 6 && typeof route.polyline === 'string',
+        JSON.stringify({ encoding: route.encoding, precision: route.precision }),
+      );
+
+      let points: RoutePoint[] = [];
+      try {
+        points = decodePolyline(route.polyline, 6);
+      } catch (err) {
+        check('route polyline decodes', false, String(err));
+      }
+
+      check('route has at least 2 points', points.length >= 2, `${points.length} point(s)`);
+      check(
+        'route coordinates are in range',
+        points.every((p) => Math.abs(p.lat) <= 90 && Math.abs(p.lng) <= 180),
+      );
+      check('route has a positive length', typeof route.length_meters === 'number' && route.length_meters > 0);
+
+      const tolerance = routeToleranceMeters((bundle as any).tour_metadata?.transit_mode);
+      for (const w of waypoints) {
+        const [lon, lat] = w.coordinates ?? [];
+        const gap = distanceToRouteMeters({ lat, lng: lon }, points);
+        check(
+          `wp${w.sort_order} "${w.name}" is within ${tolerance} m of the route`,
+          gap <= tolerance,
+          `${Math.round(gap)} m`,
+        );
+      }
+    }
   }
 
   // Informational, not a failure: the local seed has one, a remote catalogue
   // may legitimately have none.
   console.log(`\n  INFO  ${deepDives} Deep Dive track(s) visible across the catalogue`);
+  console.log(`  INFO  ${routes} tour(s) ship a route; the rest draw straight lines`);
 
   // --- 3. Writes are still refused -----------------------------------------
   // A migration that accidentally adds a permissive policy is otherwise

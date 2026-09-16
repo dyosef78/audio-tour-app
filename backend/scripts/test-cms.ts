@@ -21,6 +21,13 @@ import { readFileSync } from 'node:fs';
 import { CmsIngestError } from '../cms/errors.ts';
 import { buildAudioStoragePath, transcriptPathFor } from '../cms/storage-path.ts';
 import { MAX_TRANSCRIPT_BYTES, checkTranscript } from '../cms/transcript-ingest.ts';
+import {
+  PolylineError,
+  decodePolyline,
+  distanceToRouteMeters,
+  encodePolyline,
+  type RoutePoint,
+} from '../../mobile/src/geo/polyline.ts';
 
 let failures = 0;
 let checks = 0;
@@ -56,6 +63,7 @@ const read = (name: string): string => readFileSync(new URL(name, MIGRATIONS), '
 const schemaSql = read('20260915120000_track_kind_tags_transcripts.sql');
 const functionsSql = read('20260915120100_bundle_and_cms_track_kind_tags.sql');
 const previousBundleSql = read('20260828150000_bundle_audio_track_id.sql');
+const routeSql = read('20260916090000_tour_route_polyline.sql');
 
 // -----------------------------------------------------------------------------
 
@@ -165,6 +173,26 @@ assert(
 const outer = "md5( concat_ws(':', tr.id::text, tr.title, tr.topology, tr.transit_mode, tr.duration_minutes::text, coalesce(a.signature, '')) )";
 assert('the tour-level hash expression is unchanged', oldSql.includes(outer) && newSql.includes(outer));
 
+// TASK-604 rewrites get_tour_bundle again. What is in PRODUCTION is the
+// TASK-603 version, so that is the baseline every later rewrite must preserve.
+const normalisedRoute = normalise(routeSql);
+const signatureBlock = (sql: string): string => {
+  const start = sql.indexOf('string_agg( concat_ws');
+  const end = sql.indexOf('AS signature', start);
+  return start >= 0 && end > start ? sql.slice(start, end) : '';
+};
+assert(
+  'TASK-604: per-waypoint signature is byte-identical to the one in production (TASK-603)',
+  signatureBlock(newSql).length > 100 && signatureBlock(normalisedRoute) === signatureBlock(newSql),
+  'the waypoint signature changed - every bundle hash in production would move',
+);
+const outerPrefix = outer.slice(0, outer.indexOf("coalesce(a.signature, '')") + "coalesce(a.signature, '')".length);
+assert(
+  'TASK-604: tour-level expression only APPENDS a route term that is NULL without a route',
+  normalisedRoute.includes(`${outerPrefix}, CASE WHEN tr.route IS NOT NULL THEN`),
+  'a route term that is not NULL-when-absent would change every existing hash',
+);
+
 // -----------------------------------------------------------------------------
 
 heading('checkTranscript');
@@ -211,6 +239,94 @@ const skipped = checkTranscript(utf8(`${VALID}\n00:20.000 --> 00:10.000\nbad\n`)
 assert('unusable cue blocks warn', skipped.warnings.some((w) => w.includes('unusable')), JSON.stringify(skipped.warnings));
 
 // -----------------------------------------------------------------------------
+
+heading('Encoded polyline codec (TASK-604)');
+
+// Google's published reference example, precision 5.
+const GOOGLE_POINTS: RoutePoint[] = [
+  { lat: 38.5, lng: -120.2 },
+  { lat: 40.7, lng: -120.95 },
+  { lat: 43.252, lng: -126.453 },
+];
+const GOOGLE_ENCODED = '_p~iF~ps|U_ulLnnqC_mqNvxq`@';
+
+eq("encodes Google's reference example", encodePolyline(GOOGLE_POINTS, 5), GOOGLE_ENCODED);
+eq('decodes it back exactly', decodePolyline(GOOGLE_ENCODED, 5), GOOGLE_POINTS);
+eq('precision 6 round-trips', decodePolyline(encodePolyline(GOOGLE_POINTS, 6), 6), GOOGLE_POINTS);
+eq(
+  'negative and near-zero coordinates round-trip',
+  decodePolyline(encodePolyline([{ lat: -0.00001, lng: 0 }, { lat: -33.8688, lng: 151.2093 }], 6), 6),
+  [{ lat: -0.00001, lng: 0 }, { lat: -33.8688, lng: 151.2093 }],
+);
+
+// Why cms_set_tour_route makes precision REQUIRED and checks two different ways.
+const TEL_AVIV: RoutePoint[] = [{ lat: 32.0833, lng: 34.7891 }, { lat: 32.0779, lng: 34.7874 }];
+const sixReadAsFive = decodePolyline(encodePolyline(TEL_AVIV, 6), 5);
+assert(
+  'polyline6 read at precision 5 leaves the coordinate range (the range check catches it)',
+  sixReadAsFive.some((p) => Math.abs(p.lat) > 90 || Math.abs(p.lng) > 180),
+  JSON.stringify(sixReadAsFive),
+);
+const fiveReadAsSix = decodePolyline(encodePolyline(TEL_AVIV, 5), 6);
+// Lands near 3.2N 3.5E - valid coordinates, in the sea off West Africa. The
+// assertion uses cms_set_tour_route's own 5 km gross-mismatch threshold rather
+// than a continental distance, which the local projection is not built for.
+assert(
+  'polyline5 read at precision 6 stays IN range, far beyond the 5 km stop check (only that check catches it)',
+  fiveReadAsSix.every((p) => Math.abs(p.lat) <= 90 && Math.abs(p.lng) <= 180) &&
+    distanceToRouteMeters(TEL_AVIV[0] as RoutePoint, fiveReadAsSix) > 5_000,
+  JSON.stringify(fiveReadAsSix),
+);
+
+for (const [label, input] of [
+  ['a truncated value', '_p~iF~ps|U_'],
+  ['a character outside the alphabet', '_p~iF ps|U'],
+] as const) {
+  let threw = false;
+  try {
+    decodePolyline(input, 5);
+  } catch (err) {
+    threw = err instanceof PolylineError;
+  }
+  assert(`rejects ${label}`, threw);
+}
+
+const EAST_WEST: RoutePoint[] = [{ lat: 32.08, lng: 34.78 }, { lat: 32.08, lng: 34.79 }];
+assert('a point on the route is 0 m away', distanceToRouteMeters({ lat: 32.08, lng: 34.785 }, EAST_WEST) < 0.01);
+const hundredNorth = distanceToRouteMeters({ lat: 32.08 + 100 / 111_195, lng: 34.785 }, EAST_WEST);
+assert('a point 100 m north measures ~100 m', Math.abs(hundredNorth - 100) < 1, `${hundredNorth.toFixed(2)} m`);
+
+heading('Seed routes pass through their stops (TASK-604)');
+
+for (const [file, tourId, waypointPrefix] of [
+  ['../../supabase/seed.sql', 'aaaaaaaa-0000-4000-8000-000000000001', 'bbbbbbbb-'],
+  ['../../prod_test_seed.sql', 'eeeeeeee-0000-4000-8000-000000000001', 'eeeeeeee-0001-'],
+] as const) {
+  const sql = readFileSync(new URL(file, import.meta.url), 'utf8');
+  const name = file.split('/').pop() as string;
+
+  const encoded = /ST_LineFromEncodedPolyline\('([^']+)',\s*(\d)\)/.exec(sql);
+  assert(`${name}: route found`, encoded !== null);
+  if (!encoded) continue;
+  assert(`${name}: route is precision 6, like the bundle`, encoded[2] === '6');
+
+  const stops = [
+    ...sql.matchAll(
+      new RegExp(
+        `\\('(${waypointPrefix}[0-9a-f-]+)',\\s*'${tourId}',\\s*'([^']+)',\\s*'[a-z_]+',\\s*` +
+          `ST_SetSRID\\(ST_MakePoint\\(([-\\d.]+),\\s*([-\\d.]+)\\)`,
+        'g',
+      ),
+    ),
+  ].map((m) => ({ name: m[2] as string, lng: Number(m[3]), lat: Number(m[4]) }));
+
+  assert(`${name}: stops found`, stops.length >= 2, `${stops.length}`);
+  const points = decodePolyline(encoded[1] as string, 6);
+  for (const stop of stops) {
+    const gap = distanceToRouteMeters(stop, points);
+    assert(`${name}: route passes through "${stop.name}"`, gap < 1, `${gap.toFixed(2)} m`);
+  }
+}
 
 console.log(`\n${checks - failures}/${checks} checks passed`);
 if (failures > 0) process.exit(1);

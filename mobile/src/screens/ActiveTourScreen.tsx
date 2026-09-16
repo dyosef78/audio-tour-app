@@ -5,6 +5,13 @@ import TourMap from '../components/TourMap';
 import { tourSession } from '../session/TourSessionController';
 import { useTourSession } from '../session/tourSessionStore';
 import type { ActiveTourScreenProps } from '../navigation/types';
+import type { RouteSource } from '../routing/routeDecision';
+
+const ROUTE_LABEL: Record<RouteSource, string> = {
+  dynamic: 'Route updated for your stops',
+  static: 'Offline route',
+  straight: 'No route yet - stops joined directly',
+};
 
 /**
  * Screen 3 - Active Map & Geofencing Engine (PRD v2.0.0).
@@ -39,6 +46,9 @@ export default function ActiveTourScreen({ route, navigation }: ActiveTourScreen
   const visited = useTourSession((s) => s.visitedWaypointIds);
   const bgGranted = useTourSession((s) => s.backgroundPermission);
   const completed = useTourSession((s) => s.completionPrompted);
+  // `mapRoute`, not `route`: that name is the navigation prop above.
+  const mapRoute = useTourSession((s) => s.route);
+  const skippedCount = useTourSession((s) => s.skippedWaypointIds.length);
 
   // Requests a start; a no-op if this tour is already running. Safe under
   // StrictMode's mount/unmount/remount precisely because it is idempotent.
@@ -102,6 +112,8 @@ export default function ActiveTourScreen({ route, navigation }: ActiveTourScreen
     <View style={styles.container}>
       <TourMap
         waypoints={waypoints}
+        route={mapRoute.points}
+        routeSource={mapRoute.source}
         currentFix={fix}
         activeWaypointId={activeId}
         visitedWaypointIds={visited}
@@ -118,6 +130,14 @@ export default function ActiveTourScreen({ route, navigation }: ActiveTourScreen
             {visited.length}/{waypoints.length} stops
             {accuracy !== null ? ` · ±${Math.round(accuracy)} m` : ''}
             {` · ${tier === 'fine' ? 'high accuracy' : 'power saving'}`}
+          </Text>
+          {/* Says which of the three routes is on screen, so a field tester can
+              tell "live route" from "offline route" without reading logs. */}
+          <Text style={styles.cardMeta}>
+            {ROUTE_LABEL[mapRoute.source]}
+            {skippedCount > 0
+              ? ` · ${skippedCount} stop${skippedCount === 1 ? '' : 's'} hidden by your preferences`
+              : ''}
           </Text>
         </View>
 

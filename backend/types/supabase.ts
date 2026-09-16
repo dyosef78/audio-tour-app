@@ -228,6 +228,7 @@ export type Database = {
           duration_minutes: number
           id: string
           interests: string[]
+          route: unknown
           start_point: unknown
           status: string
           title: string
@@ -241,6 +242,7 @@ export type Database = {
           duration_minutes: number
           id?: string
           interests?: string[]
+          route?: unknown
           start_point?: unknown
           status?: string
           title: string
@@ -254,6 +256,7 @@ export type Database = {
           duration_minutes?: number
           id?: string
           interests?: string[]
+          route?: unknown
           start_point?: unknown
           status?: string
           title?: string
@@ -502,6 +505,7 @@ export type Database = {
           duration_minutes: number
           id: string
           interests: string[]
+          route: unknown
           start_point: unknown
           status: string
           title: string
@@ -531,6 +535,10 @@ export type Database = {
         Args: { p_tour_id: string; p_waypoints: Json }
         Returns: Json
       }
+      cms_set_tour_route: {
+        Args: { p_polyline: string; p_precision: number; p_tour_id: string }
+        Returns: Json
+      }
       cms_set_tour_status: {
         Args: { p_status: string; p_tour_id: string }
         Returns: {
@@ -539,6 +547,7 @@ export type Database = {
           duration_minutes: number
           id: string
           interests: string[]
+          route: unknown
           start_point: unknown
           status: string
           title: string
@@ -569,6 +578,7 @@ export type Database = {
           duration_minutes: number
           id: string
           interests: string[]
+          route: unknown
           start_point: unknown
           status: string
           title: string
@@ -595,6 +605,10 @@ export type Database = {
       get_tour_bundle: { Args: { p_tour_id: string }; Returns: Json }
       interest_tag_vocabulary: { Args: never; Returns: string[] }
       is_cms_admin: { Args: never; Returns: boolean }
+      route_tolerance_meters: {
+        Args: { p_transit_mode: string }
+        Returns: number
+      }
       sync_pull_itineraries: { Args: { p_since?: string }; Returns: Json }
       tour_is_published: { Args: { p_tour_id: string }; Returns: boolean }
       transcript_path_for: { Args: { p_storage_path: string }; Returns: string }

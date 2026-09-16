@@ -25,7 +25,18 @@ import { usePreferences, usePreferencesBoot } from '../src/personalization/prefe
 import { AudioService, type PlaybackError } from '../src/services/audio/AudioService.ts';
 import { useTourSession } from '../src/session/tourSessionStore.ts';
 import { cueIndexAt, isRtlText, parseVtt, VttParseError } from '../src/transcript/vtt.ts';
-import type { AudioTrack, Waypoint } from '../src/types/domain.ts';
+import type { AudioTrack, EncodedRoute, LatLng, Waypoint } from '../src/types/domain.ts';
+import { encodePolyline } from '../src/geo/polyline.ts';
+import { RouteManager, type RouteSessionContext } from '../src/routing/RouteManager.ts';
+import {
+  routeCacheKey,
+  type DynamicRouteRequest,
+  type DynamicRouteResult,
+  type RouteDisplay,
+} from '../src/routing/routeDecision.ts';
+import { decodeRoute, parseEncodedRoute } from '../src/routing/routeGeometry.ts';
+import { selectStops } from '../src/routing/stopSelection.ts';
+import { connectivityOf } from '../src/services/network/connectivity.ts';
 import AsyncStorage, { __dump, __setFailReads } from './stubs/async-storage.ts';
 import { players } from './stubs/expo-audio.ts';
 
@@ -356,6 +367,333 @@ eq('m4a sidecar', transcriptPathFor('tours/t/wp01_a.m4a'), 'tours/t/wp01_a.vtt')
 eq('deep dive sidecar', transcriptPathFor('tours/t/wp01_a.deep_dive.m4a'), 'tours/t/wp01_a.deep_dive.vtt');
 eq('MP3 fallback, any case', transcriptPathFor('tours/t/B.MP3'), 'tours/t/B.vtt');
 eq('no audio extension, no sidecar (never the file itself)', transcriptPathFor('tours/t/a.opus'), null);
+
+// -----------------------------------------------------------------------------
+// TASK-604: which stops run, which route is drawn, and what the network does
+// -----------------------------------------------------------------------------
+
+heading('selectStops');
+
+const stopAt = (
+  id: string,
+  sort: number,
+  lat: number,
+  lng: number,
+  tags: Partial<Pick<Waypoint, 'audiences' | 'interests'>> = {},
+): Waypoint => ({
+  id,
+  tourId: 'jlm',
+  name: `Stop ${id}`,
+  poiType: 'anchor',
+  coordinate: { latitude: lat, longitude: lng },
+  sortOrder: sort,
+  geofence: null,
+  audio: null,
+  ...tags,
+});
+
+// The Jerusalem seed's four stops.
+const JAFFA = stopAt('jaffa', 1, 31.7766, 35.2279, { interests: ['history', 'architecture'] });
+const DAVID = stopAt('david', 2, 31.7761, 35.2281, { interests: ['architecture'] });
+const CARDO = stopAt('cardo', 3, 31.7757, 35.2312, { interests: ['culinary'] });
+const WALL = stopAt('wall', 4, 31.7767, 35.2344); // untagged: never filtered out
+const ALL_STOPS = [JAFFA, DAVID, CARDO, WALL];
+const HISTORY_COUPLE = { groupType: 'couple' as const, interests: ['history' as const], maxMinutes: 60 };
+
+const selection = selectStops(ALL_STOPS, HISTORY_COUPLE);
+eq('keeps matching and untagged stops, in order', selection.active.map((s) => s.id), ['jaffa', 'wall']);
+eq('reports the skipped stops', selection.skippedIds, ['david', 'cardo']);
+eq('marks the session as filtered', selection.filtered, true);
+eq('no preferences: nothing filtered', selectStops(ALL_STOPS, null).filtered, false);
+eq(
+  'every stop matches: not "filtered", so no live route is ever requested',
+  selectStops(ALL_STOPS, { ...HISTORY_COUPLE, interests: ['history', 'architecture', 'culinary'] }).filtered,
+  false,
+);
+const oneLeft = selectStops([JAFFA, DAVID, CARDO], { ...HISTORY_COUPLE, interests: ['culinary'] });
+eq('fewer than 2 stops would remain: the whole tour runs instead', [oneLeft.active.length, oneLeft.filtered], [3, false]);
+eq(
+  'audience tags filter too',
+  selectStops(
+    [stopAt('bar', 1, 0, 0, { audiences: ['couple'] }), stopAt('park', 2, 0, 0), stopAt('zoo', 3, 0, 0, { audiences: ['family_kids'] })],
+    { groupType: 'family_kids', interests: ['nature'], maxMinutes: 60 },
+  ).skippedIds,
+  ['bar'],
+);
+
+heading('connectivityOf');
+
+eq('reachable', connectivityOf({ isConnected: true, isInternetReachable: true }), 'online');
+eq('connected but no internet (captive portal, Android)', connectivityOf({ isConnected: true, isInternetReachable: false }), 'offline');
+eq('connected, reachability unknown: worth trying', connectivityOf({ isConnected: true }), 'online');
+eq('no connection', connectivityOf({ isConnected: false }), 'offline');
+eq('nothing known yet', connectivityOf({}), 'unknown');
+
+heading('parseEncodedRoute / decodeRoute');
+
+const asPoint = (s: Waypoint) => ({ lat: s.coordinate.latitude, lng: s.coordinate.longitude });
+const STATIC_ROUTE: EncodedRoute = { precision: 6, polyline: encodePolyline(ALL_STOPS.map(asPoint), 6), lengthMeters: 700 };
+const DIRECT_ROUTE: EncodedRoute = { precision: 5, polyline: encodePolyline([JAFFA, WALL].map(asPoint), 5), lengthMeters: 620 };
+const FAR = stopAt('far', 5, 31.78, 35.231); // ~380 m north of the Jaffa-Wall line
+
+eq(
+  'wire route parsed',
+  parseEncodedRoute({ encoding: 'polyline', precision: 6, polyline: 'abc', length_meters: 12 }),
+  { precision: 6, polyline: 'abc', lengthMeters: 12 },
+);
+eq('missing precision rejected, never defaulted to 5', parseEncodedRoute({ encoding: 'polyline', polyline: 'abc' }), null);
+eq('unknown encoding rejected', parseEncodedRoute({ encoding: 'geojson', precision: 6, polyline: 'abc' }), null);
+eq('bundles from before TASK-604 carry no route', parseEncodedRoute(undefined), null);
+assert('the bundled route passes every stop', decodeRoute(STATIC_ROUTE, ALL_STOPS, 'walking').ok);
+assert('a direct route validates for the two stops it joins', decodeRoute(DIRECT_ROUTE, [JAFFA, WALL], 'walking').ok);
+const missesStop = decodeRoute(DIRECT_ROUTE, [JAFFA, FAR, WALL], 'walking');
+assert(
+  'a route is rejected for a stop it does not reach',
+  !missesStop.ok && missesStop.reason.includes('Stop far'),
+  JSON.stringify(missesStop),
+);
+const mislabelled = decodeRoute({ ...DIRECT_ROUTE, precision: 6 }, [JAFFA, WALL], 'walking');
+assert('a precision-5 route labelled 6 is rejected', !mislabelled.ok, JSON.stringify(mislabelled));
+eq('cache key ignores stop order', routeCacheKey('t', 'h', ['b', 'a']), routeCacheKey('t', 'h', ['a', 'b']));
+assert('cache key changes with the bundle version', routeCacheKey('t', 'h1', ['a']) !== routeCacheKey('t', 'h2', ['a']));
+eq('no bundle hash, no caching', routeCacheKey('t', null, ['a']), null);
+
+heading('RouteManager: live, bundled and straight routes across connectivity changes');
+
+type PendingRequest = {
+  req: DynamicRouteRequest;
+  signal: AbortSignal;
+  resolve: (result: DynamicRouteResult) => void;
+};
+
+function routeHarness(opts: { online: boolean; cache?: Map<string, EncodedRoute> }) {
+  let online = opts.online;
+  const listeners = new Set<(online: boolean) => void>();
+  const calls: PendingRequest[] = [];
+  const published: RouteDisplay[] = [];
+  const timers: { fn: () => void; delay: number; done: boolean }[] = [];
+  const cache = opts.cache ?? new Map<string, EncodedRoute>();
+
+  const manager = new RouteManager({
+    network: {
+      isOnline: () => online,
+      subscribe: (listener) => {
+        listeners.add(listener);
+        return () => {
+          listeners.delete(listener);
+        };
+      },
+    },
+    // A request that never settles by itself, like a real one on a bad link.
+    // Aborting resolves it the way supabase-js does: as a failure.
+    fetchRoute: (req, signal) =>
+      new Promise((resolve) => {
+        calls.push({ req, signal, resolve });
+        signal.addEventListener('abort', () => resolve({ kind: 'failed', reason: 'aborted' }));
+      }),
+    cache: {
+      get: async (key) => cache.get(key) ?? null,
+      set: async (key, route) => {
+        cache.set(key, route);
+      },
+    },
+    publish: (route) => published.push(route),
+    schedule: (fn, delay) => {
+      const timer = { fn, delay, done: false };
+      timers.push(timer);
+      return () => {
+        timer.done = true;
+      };
+    },
+  });
+
+  return {
+    manager,
+    calls,
+    published,
+    cache,
+    listeners,
+    pendingTimers: () => timers.filter((t) => !t.done).map((t) => t.delay),
+    source: () => published.at(-1)?.source,
+    setOnline: async (next: boolean) => {
+      online = next;
+      for (const listener of [...listeners]) listener(next);
+      await flush();
+    },
+    fireTimer: async () => {
+      const timer = timers.filter((t) => !t.done).pop();
+      if (timer) {
+        timer.done = true;
+        timer.fn();
+      }
+      await flush();
+    },
+  };
+}
+
+const staticPoints = (decodeRoute(STATIC_ROUTE, ALL_STOPS, 'walking') as { ok: true; points: LatLng[] }).points;
+const sessionFor = (over: Partial<RouteSessionContext> = {}): RouteSessionContext => ({
+  tourId: 'jlm',
+  transitMode: 'walking',
+  stops: [JAFFA, WALL],
+  filtered: true,
+  staticRoute: staticPoints,
+  bundleHash: 'hash-1',
+  ...over,
+});
+const liveRoute = (route: EncodedRoute = DIRECT_ROUTE): DynamicRouteResult => ({ kind: 'ok', route });
+
+// 1. Offline -> online -> offline, then a later session with no signal at all.
+{
+  const h = routeHarness({ online: false });
+  await h.manager.start(sessionFor());
+  await flush();
+  eq('offline start: bundled route drawn at once', h.source(), 'static');
+  eq('offline start: nothing requested', h.calls.length, 0);
+
+  await h.setOnline(true);
+  eq('back online: one request, for the selected stops only', h.calls.map((c) => c.req.waypointIds), [['jaffa', 'wall']]);
+  eq('while it is in flight the bundled route stays up', h.source(), 'static');
+
+  h.calls[0]!.resolve(liveRoute());
+  await flush();
+  eq('valid response: live route drawn', h.source(), 'dynamic');
+  eq('and written to the disk cache', h.cache.size, 1);
+
+  await h.setOnline(false);
+  eq('offline again: the live route is kept, not downgraded', h.source(), 'dynamic');
+  eq('and nothing more is requested', h.calls.length, 1);
+
+  h.manager.stop();
+  eq('stop() unsubscribes from the network', h.listeners.size, 0);
+
+  const later = routeHarness({ online: false, cache: h.cache });
+  await later.manager.start(sessionFor());
+  await flush();
+  eq('next session, same stops, no signal: cached live route and zero requests', [later.source(), later.calls.length], ['dynamic', 0]);
+  later.manager.stop();
+}
+
+// 2. A failed request: backoff, a timer firing while offline, a reconnect.
+{
+  const h = routeHarness({ online: true });
+  await h.manager.start(sessionFor());
+  await flush();
+  eq('online start: requests straight away', h.calls.length, 1);
+
+  h.calls[0]!.resolve({ kind: 'failed', reason: 'HTTP 502' });
+  await flush();
+  eq('failure: bundled route kept', h.source(), 'static');
+  eq('a retry is scheduled in 5 s', h.pendingTimers(), [5000]);
+
+  await h.setOnline(false);
+  await h.fireTimer();
+  eq('the retry timer firing while offline sends nothing', h.calls.length, 1);
+
+  await h.setOnline(true);
+  eq('the reconnect retries at once', h.calls.length, 2);
+  h.calls[1]!.resolve(liveRoute());
+  await flush();
+  eq('second attempt succeeds: live route', h.source(), 'dynamic');
+  h.manager.stop();
+}
+
+// 3. Connections dropping mid-request do not use up the attempts.
+{
+  const h = routeHarness({ online: true });
+  await h.manager.start(sessionFor());
+  await flush();
+  for (let i = 0; i < 4; i++) {
+    await h.setOnline(false);
+    await h.setOnline(true);
+  }
+  eq('four drops mid-request, more than the 3-attempt limit: a fifth request still goes out', h.calls.length, 5);
+  eq('each dropped request was actually aborted', h.calls.slice(0, 4).every((c) => c.signal.aborted), true);
+  h.calls[4]!.resolve(liveRoute());
+  await flush();
+  eq('and it delivers the live route', h.source(), 'dynamic');
+  h.manager.stop();
+}
+
+// 4. Endpoint not deployed - today's reality.
+{
+  const h = routeHarness({ online: true });
+  await h.manager.start(sessionFor());
+  await flush();
+  h.calls[0]!.resolve({ kind: 'unavailable', reason: 'route-stops answered HTTP 404' });
+  await flush();
+  await h.setOnline(false);
+  await h.setOnline(true);
+  eq(
+    'endpoint missing (404): bundled route, no retries, no timers',
+    [h.source(), h.calls.length, h.pendingTimers().length],
+    ['static', 1, 0],
+  );
+  h.manager.stop();
+}
+
+// 5. The server answers with a route that does not fit the stops.
+{
+  const h = routeHarness({ online: true });
+  await h.manager.start(sessionFor());
+  await flush();
+  h.calls[0]!.resolve(liveRoute({ ...DIRECT_ROUTE, precision: 6 }));
+  await flush();
+  await h.setOnline(false);
+  await h.setOnline(true);
+  eq(
+    'a bad route is never drawn, cached, or asked for again',
+    [h.source(), h.cache.size, h.calls.length],
+    ['static', 0, 1],
+  );
+  h.manager.stop();
+}
+
+// 6. Three genuine failures exhaust the session.
+{
+  const h = routeHarness({ online: true });
+  await h.manager.start(sessionFor());
+  await flush();
+  for (let i = 0; i < 3; i++) {
+    h.calls[i]!.resolve({ kind: 'failed', reason: 'timeout' });
+    await flush();
+    await h.fireTimer();
+  }
+  await h.setOnline(false);
+  await h.setOnline(true);
+  eq('after 3 real failures it stops asking; bundled route stays', [h.calls.length, h.source()], [3, 'static']);
+  h.manager.stop();
+}
+
+// 7-9. No filtering, no route at all, and a late answer after the tour ended.
+{
+  const h = routeHarness({ online: true });
+  await h.manager.start(sessionFor({ filtered: false, stops: ALL_STOPS }));
+  await flush();
+  eq('nothing filtered: the bundled route is already right, no request even online', [h.source(), h.calls.length], ['static', 0]);
+  h.manager.stop();
+}
+{
+  const h = routeHarness({ online: false });
+  await h.manager.start(sessionFor({ staticRoute: null }));
+  await flush();
+  eq('no bundled route and no signal: straight (dashed) lines', h.source(), 'straight');
+  h.manager.stop();
+}
+{
+  const h = routeHarness({ online: true });
+  await h.manager.start(sessionFor());
+  await flush();
+  const publishedBefore = h.published.length;
+  h.manager.stop();
+  h.calls[0]!.resolve(liveRoute());
+  await flush();
+  eq(
+    'an answer arriving after the tour ended is aborted and ignored',
+    [h.published.length, h.cache.size, h.calls[0]!.signal.aborted],
+    [publishedBefore, 0, true],
+  );
+}
 
 // -----------------------------------------------------------------------------
 

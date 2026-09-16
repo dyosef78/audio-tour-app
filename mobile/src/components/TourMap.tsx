@@ -1,12 +1,11 @@
 import { Platform, StyleSheet, View } from 'react-native';
 import MapView, { Circle, Marker, Polygon, Polyline, PROVIDER_GOOGLE, type Region } from 'react-native-maps';
 
+import type { RouteSource } from '../routing/routeDecision';
 import type { LatLng, Waypoint } from '../types/domain';
 
 /**
  * The tour map (PRD v2.0.0 Screen 3).
- *
- * Two deliberate decisions, both approved in the TASK-102 proposal:
  *
  * 1. `showsUserLocation` is OFF. Enabling it makes the native map subscribe to
  *    the platform's own location service - a second GPS consumer alongside
@@ -15,13 +14,21 @@ import type { LatLng, Waypoint } from '../types/domain';
  *    below is rendered from the store instead, so what you see is provably what
  *    the engine is acting on.
  *
- * 2. The polyline joins waypoints with straight segments. There is no routing
- *    engine yet (PRD Flow Step 3), so this cuts through buildings. Approved as
- *    MVP, but it is a placeholder, not a route.
+ * 2. The line follows the ROUTE (TASK-604) - a live one through the selected
+ *    stops, or the one from the offline bundle - already decoded and checked
+ *    against the stops by RouteManager. Only when a tour has no route does it
+ *    fall back to joining the stops directly, and then it is DASHED, so the
+ *    placeholder cannot be mistaken for a path through the buildings.
+ *
+ * `waypoints` are the stops this session runs. Stops the preferences skipped
+ * never reach this component, so their pins are simply absent while the
+ * bundled route still runs past them.
  */
 
 interface Props {
   waypoints: Waypoint[];
+  route: LatLng[] | null;
+  routeSource: RouteSource;
   currentFix: LatLng | null;
   activeWaypointId: string | null;
   visitedWaypointIds: string[];
@@ -36,12 +43,20 @@ interface Props {
   showZones: boolean;
 }
 
-/** Bounding region over the tour, with padding so pins are not on the edge. */
-function regionFor(waypoints: Waypoint[]): Region | undefined {
-  if (waypoints.length === 0) return undefined;
+const ROUTE_STYLE: Record<RouteSource, { color: string; width: number; dash?: number[] }> = {
+  // Teal marks a route drawn for YOUR stops; ink, the tour's standard route.
+  dynamic: { color: 'rgba(12,108,106,0.92)', width: 5 },
+  static: { color: 'rgba(28,28,30,0.8)', width: 5 },
+  straight: { color: 'rgba(28,28,30,0.55)', width: 3, dash: [10, 8] },
+};
 
-  const lats = waypoints.map((w) => w.coordinate.latitude);
-  const lons = waypoints.map((w) => w.coordinate.longitude);
+/** Bounding region over the stops AND the route, with padding. */
+function regionFor(waypoints: Waypoint[], route: LatLng[] | null): Region | undefined {
+  const points = [...waypoints.map((w) => w.coordinate), ...(route ?? [])];
+  if (points.length === 0) return undefined;
+
+  const lats = points.map((p) => p.latitude);
+  const lons = points.map((p) => p.longitude);
   const minLat = Math.min(...lats);
   const maxLat = Math.max(...lats);
   const minLon = Math.min(...lons);
@@ -49,27 +64,31 @@ function regionFor(waypoints: Waypoint[]): Region | undefined {
 
   // Floor the span so a single waypoint, or two very close ones, does not zoom
   // to a meaningless level. 0.004 deg is roughly 400 m of latitude.
-  const latitudeDelta = Math.max((maxLat - minLat) * 1.6, 0.004);
-  const longitudeDelta = Math.max((maxLon - minLon) * 1.6, 0.004);
-
   return {
     latitude: (minLat + maxLat) / 2,
     longitude: (minLon + maxLon) / 2,
-    latitudeDelta,
-    longitudeDelta,
+    latitudeDelta: Math.max((maxLat - minLat) * 1.6, 0.004),
+    longitudeDelta: Math.max((maxLon - minLon) * 1.6, 0.004),
   };
 }
 
 export default function TourMap({
   waypoints,
+  route,
+  routeSource,
   currentFix,
   activeWaypointId,
   visitedWaypointIds,
   showZones,
   onWaypointPress,
 }: Props) {
-  const region = regionFor(waypoints);
-  const route = waypoints.map((w) => w.coordinate);
+  // Only initial: once the map is up the user owns the camera, and a live route
+  // arriving later must not yank the view away from where they are looking.
+  const region = regionFor(waypoints, route);
+
+  const followsRoute = route !== null && route.length > 1;
+  const line = followsRoute ? route : waypoints.map((w) => w.coordinate);
+  const style = ROUTE_STYLE[followsRoute ? routeSource : 'straight'];
 
   return (
     <MapView
@@ -81,8 +100,18 @@ export default function TourMap({
       showsMyLocationButton={false}
       toolbarEnabled={false}
     >
-      {route.length > 1 && (
-        <Polyline coordinates={route} strokeWidth={4} strokeColor="rgba(28,28,30,0.75)" />
+      {line.length > 1 && (
+        <Polyline
+          // Keyed by source so a route swap replaces the native overlay rather
+          // than mutating a dashed line into a solid one in place.
+          key={`route:${followsRoute ? routeSource : 'straight'}`}
+          coordinates={line}
+          strokeWidth={style.width}
+          strokeColor={style.color}
+          lineDashPattern={style.dash}
+          lineCap="round"
+          lineJoin="round"
+        />
       )}
 
       {showZones &&

@@ -81,6 +81,12 @@ UPDATE public.waypoints
    SET interests = ARRAY['architecture', 'history']
  WHERE tour_id = 'eeeeeeee-0000-4000-8000-000000000001';
 
+-- Route (TASK-604): Jaffa Gate -> Tower of David, precision-6 polyline. Needs
+-- migration 20260916090000 on the target database.
+UPDATE public.tours
+   SET route = ST_LineFromEncodedPolyline('otnr{@wncebAf^oK', 6)
+ WHERE id = 'eeeeeeee-0000-4000-8000-000000000001';
+
 -- --- Geofence zones -----------------------------------------------------------
 -- geom is NOT NULL geometry(Polygon, 4326), so a radius zone still needs a real
 -- polygon. The ::geography cast is load-bearing - buffering the raw geometry

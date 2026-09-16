@@ -108,6 +108,16 @@ UPDATE public.waypoints
        audiences = ARRAY['couple', 'family_kids', 'friends', 'solo']
  WHERE id = 'bbbbbbbb-0000-4000-8000-000000000004';
 
+-- --- Route (TASK-604) ---------------------------------------------------------
+-- A precision-6 encoded polyline through all four stops in sort_order, along
+-- David Street and the Cardo. Decoding it through PostGIS on every `db reset`
+-- is what exercises ST_LineFromEncodedPolyline in CI, and verify-bundle.ts
+-- checks each stop against the route the bundle ships back.
+-- Illustrative street geometry, not survey-grade - like the coordinates above.
+UPDATE public.tours
+   SET route = ST_LineFromEncodedPolyline('otnr{@wncebAnKgEvQgEnKgw@nKwcA?wcAoK_jA_X_jA_X_q@', 6)
+ WHERE id = 'aaaaaaaa-0000-4000-8000-000000000001';
+
 -- --- Geofence zones -----------------------------------------------------------
 -- geom is NOT NULL geometry(Polygon, 4326), so radius-type zones still need a
 -- materialised polygon. The ::geography cast is load-bearing: buffering the raw
