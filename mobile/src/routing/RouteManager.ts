@@ -10,6 +10,7 @@ import {
   type RouteDisplay,
 } from './routeDecision';
 import { decodeRoute } from './routeGeometry';
+import { adoptableStopOrder } from './routeRequest';
 
 /**
  * RouteManager - keeps the map's route right as connectivity comes and goes
@@ -29,6 +30,12 @@ import { decodeRoute } from './routeGeometry';
  *                                 route does not change
  *   stop()    aborts, unsubscribes, cancels timers, and discards any late
  *             result from the session that just ended.
+ *
+ * VISITING ORDER (TASK-902): a live route arrives with the order it visits the
+ * stops. That order goes to `onStopOrder` only together with a route that
+ * validated, so the geofences are never sequenced by a route that is not drawn.
+ * A route read from the disk cache carries no order (TASK-903) and leaves
+ * narration on the authored order.
  */
 
 export interface RouteNetwork {
@@ -60,6 +67,11 @@ export interface RouteSessionContext {
   /** The bundle's route, already validated against `stops`. */
   staticRoute: LatLng[] | null;
   bundleHash: string | null;
+  /**
+   * The order the drawn live route visits `stops`, already checked to be
+   * exactly a reordering of them. Called at most once per live route.
+   */
+  onStopOrder?(waypointIds: string[]): void;
 }
 
 export class RouteManager {
@@ -222,6 +234,7 @@ export class RouteManager {
         const key = this.cacheKey();
         if (key) void this.deps.cache.set(key, result.route).catch(() => undefined);
         this.log('using a live route for the selected stops');
+        this.adoptOrder(ctx, result.waypointIds);
         this.apply();
         return;
       }
@@ -241,6 +254,24 @@ export class RouteManager {
     this.log(`route request failed: ${result.reason}`);
     this.scheduleRetry(attempt);
     this.apply();
+  }
+
+  /**
+   * An order that is not exactly the session's stops is dropped, not the
+   * route: the line on the map is still right, and narration falls back to the
+   * authored order rather than arming stops the session does not run.
+   */
+  private adoptOrder(ctx: RouteSessionContext, order: string[] | null): void {
+    if (order === null) {
+      this.log('live route carried no visiting order; narration keeps the authored order');
+      return;
+    }
+    const adopted = adoptableStopOrder(order, ctx.stops);
+    if (adopted === null) {
+      this.log(`ignored a visiting order that does not match the ${ctx.stops.length} selected stops`);
+      return;
+    }
+    ctx.onStopOrder?.(adopted);
   }
 
   private scheduleRetry(attempt: number): void {

@@ -2,6 +2,7 @@ import { FunctionsHttpError } from '@supabase/supabase-js';
 
 import { isPermanentRouteStatus, type DynamicRouteRequest, type DynamicRouteResult } from '../../routing/routeDecision';
 import { parseEncodedRoute } from '../../routing/routeGeometry';
+import { deviceLocalTime, parseRouteOrder, routeRequestBody } from '../../routing/routeRequest';
 import { isSupabaseConfigured, supabase } from '../supabase/client';
 
 /**
@@ -14,12 +15,19 @@ import { isSupabaseConfigured, supabase } from '../supabase/client';
  *
  * CONTRACT - Supabase Edge Function `route-stops`
  *
- *   POST  { "tour_id": uuid, "waypoint_ids": [uuid, ...], "transit_mode": "walking" }
- *         waypoint_ids are in visiting order and must all belong to tour_id.
+ *   POST  { "tour_id": uuid, "waypoint_ids": [uuid, ...], "transit_mode": "walking",
+ *           "context": { "local_time": "2026-09-17T18:40:05+03:00" } }
+ *         waypoint_ids are in authored order and must all belong to tour_id.
+ *         context (TASK-901) opts in to the server's scored sort; local_time is
+ *         the device's wall clock WITH its UTC offset, stamped per attempt.
  *
  *   200   { "encoding": "polyline", "precision": 5 | 6,
- *           "polyline": "...", "length_meters": 1234 }
+ *           "polyline": "...", "length_meters": 1234,
+ *           "waypoint_ids": [uuid, ...] }
  *         precision is REQUIRED; the client refuses a response without it.
+ *         waypoint_ids is the order the polyline visits the stops. RouteManager
+ *         hands it to the geofence engine once the route itself validates
+ *         (TASK-902); without it narration keeps the authored order.
  *   404   function not deployed / tour not visible  -> unavailable, not retried
  *   501   routing not configured                    -> unavailable, not retried
  *   400, 422, other 4xx  request can never succeed   -> unavailable, not retried
@@ -46,11 +54,9 @@ export async function fetchDynamicRoute(
 
   try {
     const { data, error } = await supabase.functions.invoke(ROUTE_FUNCTION, {
-      body: {
-        tour_id: request.tourId,
-        waypoint_ids: request.waypointIds,
-        transit_mode: request.transitMode,
-      },
+      // Stamped here, per attempt, not when the session started: a retry after
+      // a long dead zone must be scored at the time it is actually sent.
+      body: routeRequestBody(request, deviceLocalTime()),
       signal,
       timeout: ROUTE_REQUEST_TIMEOUT_MS,
     });
@@ -68,7 +74,7 @@ export async function fetchDynamicRoute(
 
     const route = parseEncodedRoute(data);
     return route
-      ? { kind: 'ok', route }
+      ? { kind: 'ok', route, waypointIds: parseRouteOrder(data) }
       : { kind: 'failed', reason: 'response was not an encoded route with a declared precision' };
   } catch (err) {
     return { kind: 'failed', reason: err instanceof Error ? err.message : String(err) };

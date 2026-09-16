@@ -43,7 +43,7 @@ export const RETRY_DELAYS_MS: readonly number[] = [5_000, 20_000];
 
 export interface DynamicRouteRequest {
   tourId: string;
-  /** In visiting (sort) order. */
+  /** In authored (sort) order. The server may answer with a different one. */
   waypointIds: string[];
   transitMode: TransitMode;
 }
@@ -64,7 +64,15 @@ export function isPermanentRouteStatus(status: number | undefined): boolean {
 }
 
 export type DynamicRouteResult =
-  | { kind: 'ok'; route: EncodedRoute }
+  | {
+      kind: 'ok';
+      route: EncodedRoute;
+      /**
+       * The order the route visits the stops (TASK-902): the server's
+       * `waypoint_ids`, unvalidated. Null when the response had none.
+       */
+      waypointIds: string[] | null;
+    }
   | { kind: 'unavailable'; reason: string }
   | { kind: 'failed'; reason: string };
 

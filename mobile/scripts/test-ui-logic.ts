@@ -38,6 +38,16 @@ import {
 } from '../src/routing/routeDecision.ts';
 import { decodeRoute, parseEncodedRoute } from '../src/routing/routeGeometry.ts';
 import { selectStops } from '../src/routing/stopSelection.ts';
+import {
+  adoptableStopOrder,
+  deviceLocalTime,
+  formatLocalTime,
+  parseRouteOrder,
+  routeRequestBody,
+} from '../src/routing/routeRequest.ts';
+import { LocationService, type GeofenceEvent } from '../src/services/location/LocationService.ts';
+import { StopSequence } from '../src/services/location/stopSequence.ts';
+import { parseLocalTime } from '../../shared/src/smartSorter.ts';
 import { connectivityOf } from '../src/services/network/connectivity.ts';
 import AsyncStorage, { __dump, __setFailReads } from './stubs/async-storage.ts';
 import { players } from './stubs/expo-audio.ts';
@@ -549,7 +559,11 @@ const sessionFor = (over: Partial<RouteSessionContext> = {}): RouteSessionContex
   bundleHash: 'hash-1',
   ...over,
 });
-const liveRoute = (route: EncodedRoute = DIRECT_ROUTE): DynamicRouteResult => ({ kind: 'ok', route });
+const liveRoute = (route: EncodedRoute = DIRECT_ROUTE, waypointIds: string[] | null = null): DynamicRouteResult => ({
+  kind: 'ok',
+  route,
+  waypointIds,
+});
 
 // 1. Offline -> online -> offline, then a later session with no signal at all.
 {
@@ -701,6 +715,231 @@ const liveRoute = (route: EncodedRoute = DIRECT_ROUTE): DynamicRouteResult => ({
     [h.published.length, h.cache.size, h.calls[0]!.signal.aborted],
     [publishedBefore, 0, true],
   );
+}
+
+// 10-12. TASK-902: the visiting order travels with the route that validated.
+{
+  const orders: string[][] = [];
+  const h = routeHarness({ online: true });
+  await h.manager.start(sessionFor({ onStopOrder: (ids) => orders.push(ids) }));
+  await flush();
+  h.calls[0]!.resolve(liveRoute(DIRECT_ROUTE, ['WALL', 'jaffa']));
+  await flush();
+  eq("a live route hands its order to the session, in the session's own ids", orders, [['wall', 'jaffa']]);
+  h.manager.stop();
+
+  const later = routeHarness({ online: false, cache: h.cache });
+  const cachedOrders: string[][] = [];
+  await later.manager.start(sessionFor({ onStopOrder: (ids) => cachedOrders.push(ids) }));
+  await flush();
+  eq('a cached route carries no order: authored order stays (TASK-903)', [later.source(), cachedOrders.length], ['dynamic', 0]);
+  later.manager.stop();
+}
+{
+  const orders: string[][] = [];
+  const h = routeHarness({ online: true });
+  await h.manager.start(sessionFor({ onStopOrder: (ids) => orders.push(ids) }));
+  await flush();
+  h.calls[0]!.resolve(liveRoute({ ...DIRECT_ROUTE, precision: 6 }, ['wall', 'jaffa']));
+  await flush();
+  eq('a route that fails validation never sequences the geofences', orders.length, 0);
+  h.manager.stop();
+}
+{
+  const orders: string[][] = [];
+  const h = routeHarness({ online: true });
+  await h.manager.start(sessionFor({ onStopOrder: (ids) => orders.push(ids) }));
+  await flush();
+  h.calls[0]!.resolve(liveRoute(DIRECT_ROUTE, ['wall', 'david']));
+  await flush();
+  eq('an order naming other stops is dropped, the route is still drawn', [orders.length, h.source()], [0, 'dynamic']);
+  h.manager.stop();
+}
+
+// -----------------------------------------------------------------------------
+// TASK-901: context.local_time
+// -----------------------------------------------------------------------------
+
+heading('TASK-901: local time with its UTC offset');
+
+const INSTANT = Date.UTC(2026, 8, 17, 15, 40, 5, 250); // 2026-09-17 15:40:05.250Z
+eq('Tel Aviv summer time', formatLocalTime(INSTANT, 180), '2026-09-17T18:40:05+03:00');
+eq('New York, negative offset', formatLocalTime(INSTANT, -240), '2026-09-17T11:40:05-04:00');
+eq('Kathmandu, 45-minute offset', formatLocalTime(INSTANT, 345), '2026-09-17T21:25:05+05:45');
+eq('Marquesas, negative half hour', formatLocalTime(INSTANT, -570), '2026-09-17T06:10:05-09:30');
+eq('UTC is written +00:00', formatLocalTime(INSTANT, 0), '2026-09-17T15:40:05+00:00');
+eq('the local date rolls over with the offset', formatLocalTime(Date.UTC(2026, 11, 31, 22, 30), 180), '2027-01-01T01:30:00+03:00');
+eq('and back', formatLocalTime(Date.UTC(2026, 0, 1, 2, 0), -300), '2025-12-31T21:00:00-05:00');
+
+for (const offset of [180, -240, 345, -570, 0, 840, -720]) {
+  const parsedTime = parseLocalTime(formatLocalTime(INSTANT, offset));
+  eq(
+    `the server's parser reads the same instant and offset back (${offset} min)`,
+    [parsedTime?.instantMs, parsedTime?.offsetMinutes],
+    [INSTANT - 250, offset],
+  );
+}
+
+const deviceNow = new Date();
+const device = deviceLocalTime(deviceNow);
+const deviceParsed = parseLocalTime(device);
+assert('the device clock produces a string the server accepts', deviceParsed !== null, device);
+eq(
+  "with this machine's own offset and instant",
+  [deviceParsed?.offsetMinutes, deviceParsed?.instantMs],
+  [-deviceNow.getTimezoneOffset(), Math.floor(deviceNow.getTime() / 1000) * 1000],
+);
+
+eq(
+  'the request body carries context.local_time',
+  routeRequestBody({ tourId: 't', waypointIds: ['a', 'b'], transitMode: 'walking' }, '2026-09-17T18:40:05+03:00'),
+  { tour_id: 't', waypoint_ids: ['a', 'b'], transit_mode: 'walking', context: { local_time: '2026-09-17T18:40:05+03:00' } },
+);
+
+heading('TASK-902: reading the routed order');
+
+eq('waypoint_ids read from the response', parseRouteOrder({ polyline: 'x', waypoint_ids: ['b', 'a'] }), ['b', 'a']);
+eq('a pre-Epic-8 response has none', parseRouteOrder({ polyline: 'x' }), null);
+eq('a malformed one is ignored', parseRouteOrder({ waypoint_ids: ['a', 7] }), null);
+eq('a reordering is adopted', adoptableStopOrder(['wall', 'jaffa'], [JAFFA, WALL]), ['wall', 'jaffa']);
+eq('uuid case differences are tolerated', adoptableStopOrder(['WALL', 'Jaffa'], [JAFFA, WALL]), ['wall', 'jaffa']);
+eq('a missing stop is refused', adoptableStopOrder(['wall'], [JAFFA, WALL]), null);
+eq('a duplicate is refused', adoptableStopOrder(['wall', 'wall'], [JAFFA, WALL]), null);
+eq('a stranger is refused', adoptableStopOrder(['wall', 'david'], [JAFFA, WALL]), null);
+
+// -----------------------------------------------------------------------------
+// TASK-902: sequenced geofences
+// -----------------------------------------------------------------------------
+
+heading('StopSequence');
+
+{
+  const seq = new StopSequence(['a', 'b', 'c', 'd']);
+  eq('arms the first stop', seq.next(), 'a');
+  seq.reach('a');
+  eq('reaching it arms the next', seq.next(), 'b');
+  eq(
+    'a reorder must hold exactly the same stops',
+    [seq.reorder(['a', 'b', 'c']), seq.reorder(['a', 'b', 'c', 'x']), seq.reorder(['a', 'a', 'c', 'd'])],
+    [false, false, false],
+  );
+  assert('a valid reorder is accepted', seq.reorder(['a', 'd', 'c', 'b']));
+  eq('progress survives it: the first unpassed stop of the new order is armed', seq.next(), 'd');
+  seq.reach('c');
+  eq('reaching a later stop skips the ones before it', [seq.isPassed('d'), seq.next()], [true, 'b']);
+  seq.reach('a');
+  eq('reaching a passed stop changes nothing', seq.next(), 'b');
+  seq.reach('b');
+  eq('done: nothing armed', seq.next(), null);
+}
+
+heading('LocationService: only the next routed stop narrates');
+
+// Stops on a line running north, 200 m apart, 20 m zones: clear of each other
+// even with walking's x1.6 exit hysteresis.
+const SEQ_ORIGIN = { latitude: 32.08, longitude: 34.78 };
+const northOf = (metres: number): LatLng => ({
+  latitude: SEQ_ORIGIN.latitude + metres / 111_320,
+  longitude: SEQ_ORIGIN.longitude,
+});
+const zonedStop = (id: string, sortOrder: number, metres: number, zoned = true): Waypoint => ({
+  ...waypoint(id, sortOrder),
+  coordinate: northOf(metres),
+  geofence: zoned
+    ? { id: `${id}:zone`, waypointId: id, zoneType: 'radius', center: northOf(metres), radiusMeters: 20 }
+    : null,
+});
+
+function engine(stops: Waypoint[]) {
+  const service = new LocationService('walking');
+  service.loadTour(stops, 'walking');
+  const events: string[] = [];
+  service.setCallbacks({ onGeofence: (e: GeofenceEvent) => events.push(`${e.type}:${e.waypoint.id}`) });
+  let clock = 1_000_000_000;
+  // A minute per fix: every Adaptive GPS change commits at once, leaving no timer.
+  const at = (metres: number): string[] => {
+    const before = events.length;
+    clock += 60_000;
+    service.onFix(northOf(metres), 5, clock);
+    return events.slice(before);
+  };
+  return { service, at };
+}
+
+{
+  const { service, at } = engine([zonedStop('A', 1, 0), zonedStop('B', 2, 200), zonedStop('C', 3, 400), zonedStop('D', 4, 600)]);
+  eq('before any route arrives, authored order: A is armed', service.nextWaypointId(), 'A');
+  eq('the routed order puts C second', service.setStopOrder(['A', 'C', 'B', 'D']), true);
+  eq('enter A', at(0), ['enter:A']);
+  eq('walking through B, scheduled for later, is silent', at(200), ['exit:A']);
+  eq('and leaves no state: B is not "inside"', service.isInside('B'), false);
+  eq('C, the next routed stop, narrates', at(400), ['enter:C']);
+  eq('walking back to B: exit C, then B narrates, in that order', at(200), ['exit:C', 'enter:B']);
+  eq('D narrates last', at(600), ['exit:B', 'enter:D']);
+  eq('returning to a narrated stop does not replay it', [...at(400), ...at(0)], ['exit:D']);
+  eq('the tour is done', service.nextWaypointId(), null);
+  eq('with nothing armed, no zone holds the GPS on fine sampling', service.distanceToNearestZone(northOf(0)), null);
+  await service.stop();
+}
+
+{
+  const { service, at } = engine([zonedStop('A', 1, 0), zonedStop('B', 2, 200), zonedStop('C', 3, 400)]);
+  service.setStopOrder(['A', 'C', 'B']);
+  at(0);
+  eq('standing in B early is ignored', at(200), ['exit:A']);
+  eq('a mid-walk reorder arms B while the user already stands in it', service.setStopOrder(['A', 'B', 'C']), true);
+  eq('B narrates on the next fix, without walking out and back in', at(200), ['enter:B']);
+  eq(
+    'Adaptive GPS measures to the armed stop (C), not the nearer unarmed one',
+    Math.round(service.distanceToNearestZone(northOf(300)) ?? -1),
+    80,
+  );
+  eq(
+    'a reorder naming other stops is refused and changes nothing',
+    [service.setStopOrder(['A', 'B', 'X']), service.nextWaypointId()],
+    [false, 'C'],
+  );
+  await service.stop();
+}
+
+{
+  const stops = [zonedStop('A', 1, 0), zonedStop('B', 2, 200), zonedStop('C', 3, 400)];
+  const { service, at } = engine(stops);
+  at(0);
+  eq("B's zone is missed entirely: C is not armed", at(400), ['exit:A']);
+  service.markReached('B');
+  eq('reaching B by hand arms C', service.nextWaypointId(), 'C');
+  eq('and C narrates on the next fix', at(400), ['enter:C']);
+  await service.stop();
+
+  const skip = engine(stops);
+  skip.at(0);
+  skip.service.markReached('C');
+  eq('reaching a later stop by hand skips the one in between', [skip.service.nextWaypointId(), skip.at(200)], [null, ['exit:A']]);
+  await skip.service.stop();
+}
+
+{
+  const { service, at } = engine([zonedStop('A', 1, 0), zonedStop('X', 2, 100, false), zonedStop('B', 3, 200)]);
+  at(0);
+  eq('a stop with no geofence cannot block the stops after it', at(200), ['exit:A', 'enter:B']);
+  await service.stop();
+}
+
+heading('Session store follows the routed order');
+
+{
+  useTourSession.getState().sessionStarted({
+    waypoints: [waypoint('A', 1), waypoint('B', 2), waypoint('C', 3)],
+    transitMode: 'walking',
+    backgroundPermission: true,
+  });
+  useTourSession.getState().setStopOrder(['C', 'A', 'B']);
+  eq('stops are listed in narration order', useTourSession.getState().waypoints.map((w) => w.id), ['C', 'A', 'B']);
+  useTourSession.getState().setStopOrder(['C', 'A']);
+  useTourSession.getState().setStopOrder(['C', 'C', 'A']);
+  eq('an order that is not the same stops is ignored', useTourSession.getState().waypoints.map((w) => w.id), ['C', 'A', 'B']);
+  useTourSession.getState().reset();
 }
 
 // -----------------------------------------------------------------------------

@@ -198,7 +198,29 @@ class TourSessionController {
       filtered: selection.filtered,
       staticRoute: this.loadStaticRoute(tourId, selection.active, transitMode),
       bundleHash: TourBundleRepository.readManifest(tourId)?.bundle_version_hash ?? null,
+      onStopOrder: (waypointIds) => this.adoptStopOrder(service, waypointIds),
     });
+  }
+
+  /**
+   * Narrate in the order the live route visits the stops (TASK-902).
+   *
+   * The engine and the store move together or not at all, so the player's
+   * "stop N of M" always counts in the order the geofences fire. Guarded on the
+   * service: RouteManager already drops a late answer from an ended session,
+   * and this makes a restarted one safe as well.
+   */
+  private adoptStopOrder(service: LocationService, waypointIds: string[]): void {
+    if (this.location !== service) return;
+    const before = service.stopOrder().join(',');
+    if (!service.setStopOrder(waypointIds)) {
+      console.warn('[TourSession] visiting order rejected by the geofence engine; keeping the current order');
+      return;
+    }
+    useTourSession.getState().setStopOrder(waypointIds);
+    if (before !== waypointIds.join(',')) {
+      console.log(`[TourSession] narration follows the routed order; next stop ${service.nextWaypointId() ?? 'none'}`);
+    }
   }
 
   /**
@@ -277,10 +299,12 @@ class TourSessionController {
     // enters a zone and exits another - and with exit hysteresis, that is
     // reachable on the shipped test tour: the entry radii (20 m + 25 m = 45 m)
     // clear the 58.7 m gap, but the EXIT radii (x1.6, so 32 m + 40 m = 72 m) do
-    // not. evaluateGeofences() walks waypoints in sort order, so arriving at
+    // not. evaluateGeofences() walked waypoints in sort order, so arriving at
     // stop 1 from stop 2 emitted enter(1) then exit(2), and exit(2) cut off the
     // narration enter(1) had just started. The user stands at Jaffa Gate in
-    // silence. Reproduced by Phase E of npm run sim:walk.
+    // silence. Since TASK-902 exits are emitted before the entry, but this check
+    // stays: it is what makes the event ORDER irrelevant here. Phase E of
+    // npm run sim:walk.
     const exiting = waypoint.audio;
     if (exiting && this.audio.playingTrackId === exiting.id) {
       // Zone exit fades out rather than cutting (PRD Screen 4).
@@ -334,12 +358,21 @@ class TourSessionController {
    * distance test, the re-trigger cooldown and the exit hysteresis are all
    * bypassed. Repeat taps therefore replay immediately rather than being
    * suppressed by the cooldown - convenient for testing, but it means this is
-   * not a test of the debounce logic. LocationService's own zone state is
-   * untouched, so a genuine entry later still behaves normally.
+   * not a test of the debounce logic. LocationService's zone state is
+   * untouched.
+   *
+   * It DOES advance the visiting order (TASK-902): the stop, and any stop
+   * scheduled before it that was not reached, count as passed, so the engine
+   * arms the stop after it. Without that, a stop triggered by hand would still
+   * be armed and would narrate a second time on arrival, and a stop whose zone
+   * was missed would block the rest of the tour. Replaying a stop already
+   * passed (playNarration) leaves the order alone.
    */
   async triggerWaypoint(waypointId: string): Promise<void> {
     const waypoint = useTourSession.getState().waypoints.find((w) => w.id === waypointId);
     if (!waypoint) return;
+
+    this.location?.markReached(waypointId);
 
     await this.handleGeofence({
       type: 'enter',

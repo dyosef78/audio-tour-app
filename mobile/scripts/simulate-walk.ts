@@ -486,31 +486,35 @@ async function main(): Promise<void> {
 
   step(pointAtDistanceFrom(centre, approachFrom, radius - 5), 30_000);
   assert(
-    'immediate re-entry was suppressed by the cooldown',
+    'immediate re-entry did not replay the narration',
     sink.plays.length === beforeC,
     `${sink.plays.length - beforeC} replays inside the ${profile.retriggerCooldownMs / 60_000} min window`,
   );
 
   // --- Phase D: cooldown expiry ---------------------------------------------
+  //
+  // Before TASK-902 a return after the cooldown replayed the stop. Entry is now
+  // sequenced: a narrated stop is passed and never re-armed, however long the
+  // visitor is away, so the cooldown no longer decides this.
   heading(`6. Phase D - return after the ${profile.retriggerCooldownMs / 60_000} min cooldown`);
   const beforeD = sink.plays.length;
   step(pointAtDistanceFrom(centre, approachFrom, exitRadius + 6), 5_000);
   step(pointAtDistanceFrom(centre, approachFrom, radius - 5), profile.retriggerCooldownMs + 60_000);
   assert(
-    'a genuine return after the cooldown replays the narration',
-    sink.plays.length === beforeD + 1,
+    'a return after the cooldown does not replay a stop already narrated (TASK-902)',
+    sink.plays.length === beforeD,
     `${sink.plays.length - beforeD} replays`,
   );
 
   // --- Phase E: adjacent waypoints, on a FRESH engine ------------------------
   //
-  // Deliberately a new LocationService. Phases A-D left waypoint 1 inside its
-  // ten-minute cooldown, and a cooldown-suppressed entry would mask the very
-  // thing this phase exists to test: what happens when one waypoint is entered
-  // and another exited on the SAME fix.
+  // Deliberately a new LocationService. Phases A-D passed waypoint 1, and a stop
+  // that cannot fire would mask the very thing this phase exists to test: what
+  // happens when one waypoint is entered and another exited on the SAME fix.
+  // Since TASK-902 only the next stop in order is armed, so the walk goes 1 -> 2.
   const second = waypoints[1];
   if (second?.geofence?.zoneType === 'radius' && second.audio) {
-    heading('7. Phase E - one fix that both enters a zone and exits another');
+    heading('7. Phase E - out-of-order arrival, then one fix that exits a zone and enters the next');
 
     const gap = distanceMeters(centre, second.geofence.center);
     const secondExit = second.geofence.radiusMeters * profile.exitHysteresisFactor;
@@ -544,36 +548,45 @@ async function main(): Promise<void> {
     });
 
     let t = Date.now();
-    // Stand at the SECOND waypoint first, so its zone is held...
+    // Stand at the SECOND waypoint first: it is scheduled after the first, so
+    // it is not armed and must stay silent (TASK-902)...
     t += 20_000;
     fresh.onFix(second.geofence.center, 8, t);
     assert(
-      `${second.name} narration started`,
-      freshSink.nowPlaying === second.audio.id,
+      `${second.name}, scheduled second, stays silent when reached first`,
+      freshSink.plays.length === 0,
       freshSink.plays.at(-1)?.waypointName,
     );
 
-    // ...then walk back to the FIRST. That single fix is inside waypoint 1 and
-    // clear of waypoint 2's widened exit boundary, so the engine emits an enter
-    // and an exit together - waypoint 1 first, because the loop runs in sort
-    // order.
+    // ...then the FIRST, which is armed and narrates...
     t += 20_000;
     fresh.onFix(centre, 8, t);
+    assert(
+      `${target.name} narration started on arrival`,
+      freshSink.nowPlaying === targetAudio.id,
+      freshSink.plays.at(-1)?.waypointName,
+    );
+
+    // ...then back to the second. That single fix is inside waypoint 2 and clear
+    // of waypoint 1's widened exit boundary, so the engine emits an exit and an
+    // enter together - the exit first, since TASK-902.
+    t += 20_000;
+    fresh.onFix(second.geofence.center, 8, t);
 
     const started = freshSink.plays.at(-1);
     assert(
-      `${target.name} narration started on arrival`,
-      started?.trackId === targetAudio.id,
+      `${second.name} narration started on arrival, now that it is armed`,
+      started?.trackId === second.audio.id,
       started?.waypointName,
     );
 
     const silencedAfterStart =
-      started !== undefined && freshSink.stops.some((s) => s.atMs >= started.atMs);
+      started !== undefined && freshSink.stops.some((s) => s.atMs >= started.atMs && s.waypointName !== target.name);
     assert(
       'the arriving waypoint is still playing after the fix is processed',
-      freshSink.nowPlaying === targetAudio.id,
+      freshSink.nowPlaying === second.audio.id,
       silencedAfterStart
-        ? `${second.name}'s exit silenced ${target.name} in the same fix - ` +
+        ? `an exit silenced ${second.name} in the same fix - ` +
             'handleGeofence() stops whatever is playing, not the track that exited'
         : `nowPlaying=${freshSink.nowPlaying ?? 'nothing'}`,
     );

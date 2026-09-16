@@ -25,7 +25,11 @@ export interface TourSessionState {
   tourId: string | null;
   tourTitle: string | null;
   transitMode: TransitMode | null;
-  /** The stops this session RUNS - after onboarding filtering (TASK-604). */
+  /**
+   * The stops this session RUNS - after onboarding filtering (TASK-604) - in
+   * the order they narrate: authored order, until a live route supplies its
+   * own (TASK-902, setStopOrder).
+   */
   waypoints: Waypoint[];
   /** Stops removed by the preferences: no pin, no geofence. */
   skippedWaypointIds: string[];
@@ -84,6 +88,8 @@ export interface TourSessionActions {
     skippedWaypointIds?: string[];
   }) => void;
   setRoute: (route: RouteDisplay) => void;
+  /** Reorder `waypoints`. Ignored unless it names exactly the same stops. */
+  setStopOrder: (waypointIds: readonly string[]) => void;
   sessionFailed: (message: string) => void;
   reset: () => void;
 
@@ -132,6 +138,15 @@ export const useTourSession = create<TourSessionState & TourSessionActions>((set
     set({ status: 'active', waypoints, transitMode, backgroundPermission, skippedWaypointIds, error: null }),
 
   setRoute: (route) => set({ route }),
+
+  setStopOrder: (waypointIds) =>
+    set((s) => {
+      const byId = new Map(s.waypoints.map((w) => [w.id, w]));
+      const ordered = waypointIds.map((id) => byId.get(id));
+      if (ordered.length !== s.waypoints.length || new Set(waypointIds).size !== waypointIds.length) return {};
+      if (!ordered.every((w): w is Waypoint => w !== undefined)) return {};
+      return { waypoints: ordered };
+    }),
 
   sessionFailed: (message) => set({ status: 'error', error: message }),
 

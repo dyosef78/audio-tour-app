@@ -4,6 +4,7 @@ import * as TaskManager from 'expo-task-manager';
 import { profileFor, type GpsSampling, type TransitProfile } from '../../config/transitProfiles';
 import type { LatLng, TransitMode, Waypoint } from '../../types/domain';
 import { distanceMeters, distanceToZone, isInsideZone } from './geometry';
+import { StopSequence } from './stopSequence';
 
 /**
  * LocationService - Adaptive GPS + local geofencing (TASK-101 / TASK-102).
@@ -22,6 +23,8 @@ import { distanceMeters, distanceToZone, isInsideZone } from './geometry';
  *
  *   2. LOCAL GEOFENCING - decide, per fix, which zones were entered or exited,
  *      applying debounce/cooldown and exit hysteresis (PRD v2.0.0 Screen 4).
+ *      Entry is SEQUENCED (TASK-902): only the next stop in the visiting order
+ *      is armed - see StopSequence and evaluateGeofences().
  *
  * Why not expo-location's built-in `startGeofencingAsync`? It caps at 20 regions
  * on iOS, gives no polygon support, and hands back enter/exit events we cannot
@@ -85,6 +88,7 @@ export class LocationService {
   private callbacks: LocationServiceCallbacks = {};
 
   private zoneStates = new Map<string, ZoneState>();
+  private sequence = new StopSequence([]);
   private currentTier: 'coarse' | 'fine' = 'coarse';
   private watcher: Location.LocationSubscription | null = null;
 
@@ -120,6 +124,8 @@ export class LocationService {
     this.zoneStates = new Map(
       this.waypoints.map((w) => [w.id, { inside: false, lastTriggeredAt: null }]),
     );
+    // Authored order until the routing provider says otherwise (setStopOrder).
+    this.sequence = new StopSequence(this.waypoints.map((w) => w.id));
     this.currentTier = 'coarse';
 
     // Adaptive GPS state belongs to the tour that is loaded, not to the service.
@@ -130,6 +136,42 @@ export class LocationService {
 
   setCallbacks(callbacks: LocationServiceCallbacks): void {
     this.callbacks = callbacks;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Visiting order (TASK-902)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Narrate in this order from now on - the `waypoint_ids` route-stops routed.
+   *
+   * Refused (false) unless it holds exactly the loaded stops. Stops already
+   * passed stay passed; the armed zone becomes the first unpassed stop of the
+   * new order. Zone state is untouched: a stop the user is inside keeps its
+   * exit hysteresis, and a newly armed stop they already stand in fires on the
+   * next fix, because an unarmed zone is never marked inside.
+   */
+  setStopOrder(waypointIds: readonly string[]): boolean {
+    return this.sequence.reorder(waypointIds);
+  }
+
+  /**
+   * Record a stop as reached without a zone entry - the manual trigger.
+   * Skips every unpassed stop scheduled before it (StopSequence.reach), which
+   * is the only way past a stop whose zone was never entered.
+   */
+  markReached(waypointId: string): void {
+    this.sequence.reach(waypointId);
+  }
+
+  /** The stop whose zone is armed for entry, or null when the tour is done. */
+  nextWaypointId(): string | null {
+    return this.armedZoneId();
+  }
+
+  /** The current visiting order. */
+  stopOrder(): readonly string[] {
+    return this.sequence.ids();
   }
 
   // ---------------------------------------------------------------------------
@@ -254,40 +296,71 @@ export class LocationService {
     this.applyAdaptiveGps(fix, timestamp);
   }
 
+  /**
+   * Exits first, then at most one entry: the armed stop's.
+   *
+   * EXITS are checked for every zone the user is inside, whatever the order -
+   * a stop already narrated still has to fade out when they walk away. Only an
+   * armed zone is ever marked inside, so "inside" means "entered in sequence".
+   *
+   * ENTRY is checked for the armed stop alone (StopSequence.next()). A
+   * boundary crossing at any other stop is ignored and leaves no state behind,
+   * so that stop still fires normally once its turn comes, even if the user is
+   * already standing in it. Entering the armed stop passes it and arms the next
+   * one, which is first evaluated on the FOLLOWING fix: one fix, one narration.
+   *
+   * Exits go before the entry so that on a fix that leaves one zone and enters
+   * the next, the listener hears the handover in the order it happened.
+   */
   private evaluateGeofences(fix: LatLng, timestamp: number): void {
     for (const waypoint of this.waypoints) {
       const zone = waypoint.geofence;
-      if (!zone) continue;
-
       const state = this.zoneStates.get(waypoint.id);
-      if (!state) continue;
+      if (!zone || !state?.inside) continue;
 
       // Asymmetric boundaries: enter on the true zone, exit only once clearly
       // outside a widened one. A fix jittering on the edge therefore cannot
       // produce an enter/exit storm.
-      const inside = state.inside
-        ? isInsideZone(fix, zone, this.profile.exitHysteresisFactor)
-        : isInsideZone(fix, zone);
+      if (isInsideZone(fix, zone, this.profile.exitHysteresisFactor)) continue;
 
-      if (inside === state.inside) continue;
-
-      if (inside) {
-        // Debounce: suppress a re-entry inside the cooldown window, but still
-        // record the state change so the matching exit is not lost.
-        const last = state.lastTriggeredAt;
-        const cooling = last !== null && timestamp - last < this.profile.retriggerCooldownMs;
-
-        state.inside = true;
-        if (cooling) continue;
-
-        state.lastTriggeredAt = timestamp;
-        this.callbacks.onGeofence?.({ type: 'enter', waypoint, at: fix, timestamp });
-      } else {
-        state.inside = false;
-        // Consumed by the audio layer as the cue to fade out (PRD Screen 4).
-        this.callbacks.onGeofence?.({ type: 'exit', waypoint, at: fix, timestamp });
-      }
+      state.inside = false;
+      // Consumed by the audio layer as the cue to fade out (PRD Screen 4).
+      this.callbacks.onGeofence?.({ type: 'exit', waypoint, at: fix, timestamp });
     }
+
+    const armedId = this.armedZoneId();
+    if (armedId === null) return;
+    const waypoint = this.waypoints.find((w) => w.id === armedId);
+    const zone = waypoint?.geofence;
+    const state = this.zoneStates.get(armedId);
+    if (!waypoint || !zone || !state || state.inside) return;
+    if (!isInsideZone(fix, zone)) return;
+
+    state.inside = true;
+
+    // Debounce. Unreachable through the sequence alone - a stop is passed the
+    // moment it fires and is never re-armed - but kept so that no future path
+    // that re-arms a stop (a replay, a reorder rule) can bypass the cooldown.
+    const last = state.lastTriggeredAt;
+    if (last !== null && timestamp - last < this.profile.retriggerCooldownMs) return;
+
+    state.lastTriggeredAt = timestamp;
+    this.sequence.reach(armedId);
+    this.callbacks.onGeofence?.({ type: 'enter', waypoint, at: fix, timestamp });
+  }
+
+  /**
+   * The armed stop, after passing any stop with no geofence at the head of the
+   * order. Such a stop can never be entered - before TASK-902 it simply never
+   * fired - and leaving it armed would silence every stop after it.
+   */
+  private armedZoneId(): string | null {
+    let id = this.sequence.next();
+    while (id !== null && !this.waypoints.find((w) => w.id === id)?.geofence) {
+      this.sequence.reach(id);
+      id = this.sequence.next();
+    }
+    return id;
   }
 
   // ---------------------------------------------------------------------------
@@ -418,10 +491,19 @@ export class LocationService {
     return nearest <= threshold ? 'fine' : 'coarse';
   }
 
-  /** Metres to the closest zone edge, or null when the tour has no zones. */
+  /**
+   * Metres to the closest zone that can still produce an event, or null when
+   * there is none.
+   *
+   * Since TASK-902 that is the armed stop plus any zone the user is inside (its
+   * exit). Walking past a stop scheduled for later no longer escalates the GPS:
+   * fine sampling there would buy precision for a boundary the engine ignores.
+   */
   distanceToNearestZone(fix: LatLng): number | null {
+    const armedId = this.armedZoneId();
     let nearest: number | null = null;
     for (const w of this.waypoints) {
+      if (w.id !== armedId && !this.zoneStates.get(w.id)?.inside) continue;
       const d = w.geofence
         ? distanceToZone(fix, w.geofence)
         : distanceMeters(fix, w.coordinate);
