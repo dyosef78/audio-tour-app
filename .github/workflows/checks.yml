@@ -1,0 +1,78 @@
+# =============================================================================
+# Type checks and unit tests, on every push and pull request
+#
+# Until Epic 7, CI ran only db-verify, which is path-filtered to migrations and
+# seeds: no workflow type-checked the code or ran a single unit test. This one
+# runs everything that needs no database and no secrets, in three runtimes:
+#
+#   Node   root tsc (backend + shared), backend and mobile logic tests
+#   Metro  mobile tsc - the app's own TypeScript config, including ../shared
+#   Deno   the Edge Functions, resolved through supabase/functions/import_map.json
+#
+# Kept separate from db-verify so a docs-only change still gets a fast signal,
+# and so neither job's flakiness hides the other's result.
+# =============================================================================
+
+name: Checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 24, not db-verify's 22: the scripts run .ts files through Node's type
+      # stripping, and 24 is what they are developed and verified on.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            mobile/package-lock.json
+
+      - name: Install dependencies (root)
+        run: npm ci
+
+      # test:ui and test:telemetry import app modules, which resolve zustand,
+      # supabase-js and friends from mobile/node_modules.
+      - name: Install dependencies (mobile)
+        run: npm ci
+        working-directory: mobile
+
+      - name: Typecheck (backend + shared)
+        run: npm run typecheck
+
+      - name: Typecheck (mobile)
+        run: npx tsc --noEmit
+        working-directory: mobile
+
+      - name: Routing client tests
+        run: npm run test:routing
+
+      - name: CMS contract tests
+        run: npm run test:cms
+
+      - name: App logic tests
+        run: npm run test:ui
+
+      - name: Telemetry tests
+        run: npm run test:telemetry
+
+      # Pinned to the version the Edge Function checks were verified with.
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: 2.9.6
+
+      - name: Typecheck Edge Functions (Deno)
+        run: npm run check:edge
+
+      - name: Edge Function tests (Deno)
+        run: npm run test:edge

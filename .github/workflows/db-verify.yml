@@ -49,9 +49,14 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # PINNED, not `latest`. Resolving `latest` is an unauthenticated GitHub API
+      # call, and on 16 Sep it failed with "rate limit exceeded" before a single
+      # check ran (feat/epic-7-routing, 230d4f2). 2.117.0 was `latest` on the
+      # last green main run. Bump deliberately, and expect the types step to be
+      # the one that notices a generator change.
       - uses: supabase/setup-cli@v1
         with:
-          version: latest
+          version: 2.117.0
 
       # Starts Postgres, PostGIS, GoTrue, PostgREST and Storage, then applies
       # every migration in order. A migration that cannot apply from scratch
