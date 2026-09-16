@@ -10,13 +10,20 @@
  *          "waypoint_ids": [uuid, ...],          2..MAX_STOPS, unique
  *          "transit_mode"?: "walking" | "biking" | "driving",
  *          "preferences"?: { "group_type"?: string, "interests"?: string[],
- *                            "start"?: { "lon": number, "lat": number } } }
+ *                            "start"?: { "lon": number, "lat": number } },
+ *          "context"?: { "local_time": "2026-09-17T18:40:00+03:00" } }   offset required;
+ *                                                  its presence opts in to scoring (TASK-802)
  *
  *   200  { "encoding": "polyline", "precision": 6, "polyline": "...",
  *          "length_meters": int, "duration_seconds": int,
  *          "legs": [{ "length_meters", "duration_seconds" }],
  *          "waypoint_ids": [uuid, ...],           THE ORDER ROUTED - see smartSorter.ts
- *          "sort_strategy": "order_index" | "nearest_neighbour", "sorter_version": "v1" }
+ *          "sort_strategy": "scored" | "order_index" | "nearest_neighbour", "sorter_version": "v2" }
+ *
+ *   X-Route-Cache   hit      this isolate's memory cache
+ *                   legs     every hop from route_legs_cache, no provider call (TASK-801)
+ *                   partial  some hops cached, the rest from ONE provider call
+ *                   miss     every hop from the provider
  *
  *   400  malformed body, a stop not in the tour, transit_mode not the tour's
  *   404  tour not visible to the caller (unpublished, or no such id)
@@ -33,14 +40,16 @@
  *
  * AUTHORISATION is the database's: loadTour runs get_tour_bundle AS THE CALLER,
  * so RLS decides which stops exist (published tours for everyone, drafts for CMS
- * admins). The lookup runs BEFORE the cache, so a cached route is never served
- * to a caller who could not see the tour.
+ * admins). The lookup runs BEFORE either cache, so a cached route is never
+ * served to a caller who could not see the tour - which is what makes it safe
+ * for the leg store to read with the service role.
  */
 
 import { PROFILE_FOR_TRANSIT_MODE, type LonLat, type RoutingError, type ValhallaProfile, type ValhallaRoute } from '@shared/routing/index.ts';
+import { SORTER_VERSION, parseLocalTime, smartSort, type SortablePoi, type SortContext, type SortPreferences } from '@shared/smartSorter.ts';
 
+import { routeViaLegCache, type LegStore } from './legCache.ts';
 import { RouteMemoryCache, routeCacheKey, routeEtag } from './routeCache.ts';
-import { SORTER_VERSION, smartSort, type SortablePoi, type SortPreferences } from './smartSorter.ts';
 
 /** Matches DEFAULT_MAX_LOCATIONS; also bounds the work a single anonymous request can cause. */
 export const MAX_STOPS = 20;
@@ -60,6 +69,11 @@ export interface RouteStopsDeps {
   router: Router | null;
   routerUnavailableReason?: string;
   cache: RouteMemoryCache;
+  /** route_legs_cache. null = not configured (no service role key); routes uncached. */
+  legStore?: LegStore | null;
+  /** Keeps background work (cache writes) alive after the response - EdgeRuntime.waitUntil. */
+  defer?: (work: Promise<unknown>) => void;
+  now?: () => number;
   log?: (event: Record<string, unknown>) => void;
 }
 
@@ -109,6 +123,7 @@ export async function handleRouteStops(request: Request, deps: RouteStopsDeps): 
   const { ordered, strategy } = smartSort(
     body.waypointIds.map((id) => byId.get(id) as SortablePoi),
     body.preferences,
+    body.context,
   );
   const locations: LonLat[] = ordered.map((s) => [s.lon, s.lat]);
   const profile = PROFILE_FOR_TRANSIT_MODE[tour.transitMode];
@@ -117,8 +132,18 @@ export async function handleRouteStops(request: Request, deps: RouteStopsDeps): 
   // Not the request's signal: other requests may join this computation, and a
   // result that lands after this caller hung up still serves their retry.
   const router = deps.router;
-  const { outcome, hit } = await deps.cache.getOrCompute(key, () => router.route(locations, profile));
-  const cacheHeader = { 'X-Route-Cache': hit ? 'hit' : 'miss' };
+  let legs: { cachedLegs: number; fetchedLegs: number } | undefined;
+  const { outcome, hit } = await deps.cache.getOrCompute(key, async () => {
+    const result = await routeViaLegCache(ordered, profile, router, {
+      store: deps.legStore ?? null,
+      now: deps.now,
+      defer: deps.defer,
+      log,
+    });
+    legs = result;
+    return result.route;
+  });
+  const cacheHeader = { 'X-Route-Cache': routeCacheHeader(hit, legs) };
 
   if (!outcome.ok) {
     log({
@@ -166,6 +191,7 @@ interface RouteStopsRequest {
   waypointIds: string[];
   transitMode: TransitMode | undefined;
   preferences: SortPreferences;
+  context: SortContext | undefined;
 }
 
 type Parsed<T> = { ok: true; value: T } | { ok: false; message: string };
@@ -243,7 +269,16 @@ async function parseRequest(request: Request): Promise<Parsed<RouteStopsRequest>
     }
   }
 
-  return { ok: true, value: { tourId: raw.tour_id.toLowerCase(), waypointIds, transitMode, preferences } };
+  let context: SortContext | undefined;
+  if (raw.context !== undefined && raw.context !== null) {
+    const c = raw.context;
+    if (!isRecord(c) || typeof c.local_time !== 'string' || c.local_time.length > 40 || !parseLocalTime(c.local_time)) {
+      return fail('context.local_time must be an ISO 8601 time with its UTC offset, e.g. 2026-09-17T18:40:00+03:00.');
+    }
+    context = { localTime: c.local_time };
+  }
+
+  return { ok: true, value: { tourId: raw.tour_id.toLowerCase(), waypointIds, transitMode, preferences, context } };
 }
 
 // -----------------------------------------------------------------------------
@@ -280,6 +315,14 @@ export function parseBundle(bundle: unknown): TourStops | null {
 
 // -----------------------------------------------------------------------------
 // Responses
+
+function routeCacheHeader(hit: boolean, legs: { cachedLegs: number; fetchedLegs: number } | undefined): string {
+  if (hit) return 'hit';
+  // No stats: the computation threw (a routing error), which is a miss.
+  if (!legs) return 'miss';
+  if (legs.fetchedLegs === 0) return 'legs';
+  return legs.cachedLegs > 0 ? 'partial' : 'miss';
+}
 
 function routingError(e: RoutingError, headers: Record<string, string>): Response {
   switch (e.code) {

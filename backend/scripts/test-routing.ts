@@ -13,6 +13,7 @@ import { encodePolyline, decodePolyline, type RoutePoint } from '../../shared/sr
 import {
   RoutingError,
   ValhallaClient,
+  joinLegPolylines,
   parseRetryAfter,
   valhallaConfigFromEnv,
   type LonLat,
@@ -154,10 +155,12 @@ heading('Response');
   eq('declares precision 6', [route.encoding, route.precision], ['polyline', 6]);
   eq('distance in whole metres', route.distanceMeters, 365);
   eq('duration in whole seconds', route.durationSeconds, 261);
-  eq('per-leg figures', route.legs, [
+  eq('per-leg figures', route.legs.map(({ distanceMeters, durationSeconds }) => ({ distanceMeters, durationSeconds })), [
     { distanceMeters: 152, durationSeconds: 110 },
     { distanceMeters: 213, durationSeconds: 151 },
   ]);
+  eq('each leg keeps its own shape', route.legs.map((l) => decodePolyline(l.polyline, 6)), [LEG_A, LEG_B]);
+  eq('joinLegPolylines rebuilds the trip line from the legs', joinLegPolylines(route.legs.map((l) => l.polyline)), route.polyline);
   eq('stops on the line are 0 m off it', route.locationOffsetsMeters, [0, 0, 0]);
   eq('echoes the profile', route.profile, 'auto');
 }

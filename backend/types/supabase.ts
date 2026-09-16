@@ -148,6 +148,54 @@ export type Database = {
           },
         ]
       }
+      route_legs_cache: {
+        Row: {
+          coords_key: string
+          distance_meters: number
+          duration_seconds: number
+          end_poi_id: string
+          polyline: string
+          profile: string
+          start_poi_id: string
+          updated_at: string
+        }
+        Insert: {
+          coords_key: string
+          distance_meters: number
+          duration_seconds: number
+          end_poi_id: string
+          polyline: string
+          profile: string
+          start_poi_id: string
+          updated_at?: string
+        }
+        Update: {
+          coords_key?: string
+          distance_meters?: number
+          duration_seconds?: number
+          end_poi_id?: string
+          polyline?: string
+          profile?: string
+          start_poi_id?: string
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "route_legs_cache_end_poi_id_fkey"
+            columns: ["end_poi_id"]
+            isOneToOne: false
+            referencedRelation: "waypoints"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "route_legs_cache_start_poi_id_fkey"
+            columns: ["start_poi_id"]
+            isOneToOne: false
+            referencedRelation: "waypoints"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       telemetry_events: {
         Row: {
           app_version: string | null

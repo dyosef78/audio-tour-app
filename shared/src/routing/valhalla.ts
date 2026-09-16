@@ -83,6 +83,12 @@ export interface RouteOptions {
 }
 
 export interface RouteLeg {
+  /**
+   * This hop alone, precision 6. Its first point is the previous leg's last
+   * (Valhalla repeats the joint) - join legs with joinLegPolylines, never by
+   * string concatenation. Kept per leg so route-stops can cache hops (TASK-801).
+   */
+  polyline: string;
   distanceMeters: number;
   durationSeconds: number;
 }
@@ -341,17 +347,17 @@ function parseTrip(text: string, profile: ValhallaProfile, locations: readonly L
       }
     }
 
-    // Exact comparison is sound: both came from dividing the same integers by 1e6.
-    const last = points[points.length - 1];
-    const first = legPoints[0] as RoutePoint;
-    const start = last && last.lat === first.lat && last.lng === first.lng ? 1 : 0;
-    for (let k = start; k < legPoints.length; k++) points.push(legPoints[k] as RoutePoint);
+    appendLeg(points, legPoints);
 
     const summary = leg.summary;
     if (!isRecord(summary) || !isNonNegative(summary.length) || !isNonNegative(summary.time)) {
       throw invalid(`Leg ${i} has no usable summary.`);
     }
-    legs.push({ distanceMeters: Math.round(summary.length * toMeters), durationSeconds: Math.round(summary.time) });
+    legs.push({
+      polyline: encodePolyline(legPoints, 6),
+      distanceMeters: Math.round(summary.length * toMeters),
+      durationSeconds: Math.round(summary.time),
+    });
   }
 
   // A route of one point can't be drawn, and cms_set_tour_route rejects it.
@@ -372,6 +378,28 @@ function parseTrip(text: string, profile: ValhallaProfile, locations: readonly L
     legs,
     locationOffsetsMeters: locations.map(([lng, lat]) => Math.round(distanceToRouteMeters({ lat, lng }, points))),
   };
+}
+
+/**
+ * One precision-6 polyline from per-leg polylines, in order, dropping each
+ * joint Valhalla repeats. The legs may come from different requests (a cached
+ * hop beside a fresh one); where Valhalla snapped the shared stop differently
+ * the joint is kept as a short straight segment rather than faked.
+ *
+ * Throws PolylineError for a leg that does not decode.
+ */
+export function joinLegPolylines(polylines: readonly string[]): string {
+  const points: RoutePoint[] = [];
+  for (const polyline of polylines) appendLeg(points, decodePolyline(polyline, 6));
+  return encodePolyline(points, 6);
+}
+
+function appendLeg(points: RoutePoint[], legPoints: readonly RoutePoint[]): void {
+  // Exact comparison is sound: both came from dividing the same integers by 1e6.
+  const last = points[points.length - 1];
+  const first = legPoints[0];
+  const start = last && first && last.lat === first.lat && last.lng === first.lng ? 1 : 0;
+  for (let k = start; k < legPoints.length; k++) points.push(legPoints[k] as RoutePoint);
 }
 
 function unitsToMeters(units: unknown): number | undefined {

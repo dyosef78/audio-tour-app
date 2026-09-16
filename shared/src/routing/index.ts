@@ -24,6 +24,7 @@ export {
   PROFILE_FOR_TRANSIT_MODE,
   STADIA_ROUTE_URL,
   ValhallaClient,
+  joinLegPolylines,
   parseRetryAfter,
   valhallaConfigFromEnv,
 } from './valhalla.ts';
