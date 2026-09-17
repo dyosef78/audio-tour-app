@@ -26,6 +26,7 @@ import { usePreferences, usePreferencesBoot } from '../src/personalization/prefe
 import { AudioService, type PlaybackError } from '../src/services/audio/AudioService.ts';
 import { useTourSession } from '../src/session/tourSessionStore.ts';
 import { cueIndexAt, isRtlText, parseVtt, VttParseError } from '../src/transcript/vtt.ts';
+import { MAX_REMOTE_TRANSCRIPT_BYTES, RemoteTranscriptStore } from '../src/transcript/remoteTranscripts.ts';
 import type { AudioTrack, EncodedRoute, LatLng, Waypoint } from '../src/types/domain.ts';
 import { encodePolyline } from '../../shared/src/polyline.ts';
 import { RouteManager, type RouteSessionContext } from '../src/routing/RouteManager.ts';
@@ -1151,6 +1152,73 @@ eq(
 );
 
 // -----------------------------------------------------------------------------
+
+// -----------------------------------------------------------------------------
+// Streamed transcripts (TASK-1003)
+// -----------------------------------------------------------------------------
+
+heading('Transcript beside a streamed track');
+
+{
+  const AUDIO = 'tours/t1/wp01_start.m4a';
+  const VTT = 'WEBVTT\n\n00:00.000 --> 00:02.000\nShalom\n\n00:02.000 --> 00:04.000\nTel Aviv';
+  const signed: string[][] = [];
+  const fetched: string[] = [];
+  let body: string | (() => Promise<Response>) = VTT;
+
+  const store = new RemoteTranscriptStore({
+    sign: async (paths) => {
+      signed.push([...paths]);
+      return new Map(paths.filter((p) => !p.includes('no_transcript')).map((p) => [p, `https://signed/${p}`]));
+    },
+    fetch: async (url) => {
+      fetched.push(url);
+      return typeof body === 'string' ? new Response(body, { status: 200 }) : body();
+    },
+  });
+
+  let notified = 0;
+  const unsubscribe = store.subscribe(() => notified++);
+  const before = store.getRevision();
+
+  const pending = store.prefetch(AUDIO);
+  eq('loading while the fetch is in flight', store.get(AUDIO), { status: 'loading' });
+  const ready = await pending;
+  eq('signs the sidecar path, not the audio', signed[0], ['tours/t1/wp01_start.vtt']);
+  eq('parsed with the bundle parser', ready.status === 'ready' ? ready.cues.map((c) => c.text) : ready.status, ['Shalom', 'Tel Aviv']);
+  assert('subscribers told on loading and on ready', notified === 2 && store.getRevision() === before + 2, `${notified}`);
+
+  await store.prefetch(AUDIO);
+  eq('a loaded transcript is not fetched again', fetched.length, 1);
+
+  eq(
+    'no transcript published -> unavailable, no download attempted',
+    await store.prefetch('tours/t1/wp02_no_transcript.m4a'),
+    { status: 'unavailable' },
+  );
+  eq('...and nothing fetched', fetched.length, 1);
+
+  const signedBefore = signed.length;
+  eq('a path with no audio extension -> unavailable', await store.prefetch('tours/t1/x.opus'), { status: 'unavailable' });
+  eq('...and nothing signed', signed.length, signedBefore);
+
+  const warn = mock.method(console, 'warn', () => {});
+  body = async () => new Response('gone', { status: 403 });
+  eq('an expired or refused URL -> unavailable, never a throw', await store.prefetch('tours/t1/wp03.m4a'), { status: 'unavailable' });
+
+  body = '<html>error page</html>';
+  eq('an HTML page is not rendered as a transcript', await store.prefetch('tours/t1/wp04.m4a'), { status: 'unavailable' });
+
+  body = async () => new Response('WEBVTT', { status: 200, headers: { 'content-length': String(MAX_REMOTE_TRANSCRIPT_BYTES + 1) } });
+  eq('an oversized object is not read', await store.prefetch('tours/t1/wp05.m4a'), { status: 'unavailable' });
+
+  body = async () => Promise.reject(new TypeError('Network request failed'));
+  eq('a dropped connection -> unavailable', await store.prefetch('tours/t1/wp06.m4a'), { status: 'unavailable' });
+  body = VTT;
+  eq('...and an unavailable one is retried once the stream recovers', (await store.prefetch('tours/t1/wp06.m4a')).status, 'ready');
+  warn.mock.restore();
+  unsubscribe();
+}
 
 console.log(`\n${checks - failures}/${checks} checks passed`);
 if (failures > 0) process.exit(1);

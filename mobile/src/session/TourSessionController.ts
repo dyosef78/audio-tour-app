@@ -16,6 +16,7 @@ import { routeCriteria } from '../personalization/options';
 import { usePreferences } from '../personalization/preferencesStore';
 import { decodeRoute } from '../routing/routeGeometry';
 import { selectStops } from '../routing/stopSelection';
+import { remoteTranscripts } from '../transcript/TranscriptRepository';
 import { routeManager } from './routing';
 import { useTourSession } from './tourSessionStore';
 import type { AudioTrack, LatLng, TransitMode, Waypoint } from '../types/domain';
@@ -326,6 +327,10 @@ class TourSessionController {
    *
    * Offline with no file, the local path is returned unchanged so AudioService
    * fails loudly exactly as it did before, rather than silently.
+   *
+   * A streamed track's transcript is fetched alongside it (TASK-1003), so the
+   * karaoke text survives the fallback too. Not awaited: playback must not
+   * wait on an accessibility extra, and the view shows "loading" meanwhile.
    */
   private async playableUri(track: AudioTrack): Promise<string | null> {
     const local = track.localUri ?? null;
@@ -336,6 +341,7 @@ class TourSessionController {
       const remote = (await signedAudioUrls([track.storagePath])).get(track.storagePath);
       if (remote) {
         console.warn(`[TourSession] ${track.storagePath} is not on disk; streaming it instead`);
+        void remoteTranscripts.prefetch(track.storagePath);
         return remote;
       }
     } catch (err) {

@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import {
   Pressable,
   ScrollView,
@@ -9,7 +9,7 @@ import {
 } from 'react-native';
 
 import { useTourSession } from '../../session/tourSessionStore';
-import { TranscriptRepository } from '../../transcript/TranscriptRepository';
+import { remoteTranscripts, TranscriptRepository } from '../../transcript/TranscriptRepository';
 import { cueIndexAt, isRtlText, type Cue } from '../../transcript/vtt';
 import type { AudioTrack } from '../../types/domain';
 import { colors, MIN_TOUCH } from '../../ui/theme';
@@ -43,8 +43,14 @@ interface Props {
  * visual highlight is the signal. Every line is still a focusable button.
  */
 export default function TranscriptView({ tourId, track, reduceMotion, onSeek }: Props) {
-  const load = useMemo(() => TranscriptRepository.load(tourId, track), [tourId, track]);
+  // Re-read when a streamed track's transcript arrives (TASK-1003). The
+  // revision is not used in the body; it is the invalidation signal.
+  const remoteRevision = useSyncExternalStore(remoteTranscripts.subscribe, remoteTranscripts.getRevision);
+  const load = useMemo(() => TranscriptRepository.load(tourId, track), [tourId, track, remoteRevision]);
 
+  if (load.status === 'loading') {
+    return <Text style={styles.empty}>Loading the transcript…</Text>;
+  }
   if (load.status === 'missing') {
     return <Text style={styles.empty}>No transcript is available for this stop yet.</Text>;
   }

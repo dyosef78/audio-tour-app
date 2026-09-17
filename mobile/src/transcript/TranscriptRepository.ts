@@ -1,10 +1,14 @@
 import { bundleDir, mediaFile } from '../services/bundle/paths';
+import { signedAudioUrls } from '../services/supabase/client';
 import type { AudioTrack } from '../types/domain';
+import { RemoteTranscriptStore } from './remoteTranscripts';
 import { transcriptPathFor } from './sidecar';
 import { parseVtt, type Cue } from './vtt';
 
 export type TranscriptLoad =
-  | { status: 'ready'; cues: Cue[]; source: 'bundle' | 'dev-sample' }
+  | { status: 'ready'; cues: Cue[]; source: 'bundle' | 'stream' | 'dev-sample' }
+  /** Not on disk; being fetched beside a streamed track. */
+  | { status: 'loading' }
   | { status: 'missing' }
   | { status: 'invalid'; message: string };
 
@@ -15,6 +19,15 @@ export type TranscriptLoad =
  * when it was downloaded, with no path stored anywhere, which keeps the
  * derive-never-store rule from paths.ts.
  */
+
+/**
+ * Transcripts of tracks streamed because their file was missing from disk
+ * (TASK-1003). TourSessionController fills it; load() reads it after the bundle.
+ */
+export const remoteTranscripts = new RemoteTranscriptStore({
+  sign: (paths) => signedAudioUrls(paths),
+  fetch: (url, init) => fetch(url, init),
+});
 
 export class TranscriptRepository {
   /**
@@ -51,6 +64,12 @@ export class TranscriptRepository {
         };
       }
     }
+
+    // Not in the bundle: the track may be streaming, with its transcript
+    // fetched beside it. After the disk, so a bundled file always wins.
+    const remote = remoteTranscripts.get(track.storagePath);
+    if (remote?.status === 'ready') return { status: 'ready', cues: remote.cues, source: 'stream' };
+    if (remote?.status === 'loading') return { status: 'loading' };
 
     // Development builds only, so the karaoke view can be reviewed before any
     // real transcript exists. Visibly badged in the UI as a sample.
