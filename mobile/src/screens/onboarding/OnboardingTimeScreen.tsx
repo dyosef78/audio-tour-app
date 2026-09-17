@@ -3,12 +3,14 @@ import { View } from 'react-native';
 import ChoiceCard from '../../components/onboarding/ChoiceCard';
 import OnboardingScaffold from '../../components/onboarding/OnboardingScaffold';
 import type { OnboardingTimeScreenProps } from '../../navigation/types';
+import { stepPosition } from '../../personalization/onboardingFlow';
 import { TIME_BUDGETS } from '../../personalization/options';
 import { usePreferences } from '../../personalization/preferencesStore';
 
-/** Onboarding 3/3 - time available (TASK-601). Single choice; finishing lands on Discovery. */
+/** Onboarding - time available (TASK-601). Single choice; finishing lands on Discovery. */
 export default function OnboardingTimeScreen({ navigation, route }: OnboardingTimeScreenProps) {
   const editing = route.params?.editing === true;
+  const { step, total } = stepPosition('OnboardingTime', route.params?.includeCity === true);
   const timeBudget = usePreferences((s) => s.timeBudget);
   const setTimeBudget = usePreferences((s) => s.setTimeBudget);
   const completeOnboarding = usePreferences((s) => s.completeOnboarding);
@@ -22,9 +24,10 @@ export default function OnboardingTimeScreen({ navigation, route }: OnboardingTi
 
   return (
     <OnboardingScaffold
-      step={3}
+      step={step}
+      totalSteps={total}
       title="How much time do you have?"
-      subtitle="You can change this before any tour."
+      subtitle="We'll put the tours that fit first. You can change this any time."
       back={{ label: 'Back', onPress: () => navigation.goBack() }}
       ctaLabel={editing ? 'Save preferences' : 'Start exploring'}
       ctaDisabled={timeBudget === null}

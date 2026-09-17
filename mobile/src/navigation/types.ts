@@ -8,10 +8,16 @@ import type { NativeStackScreenProps } from '@react-navigation/native-stack';
  * params would let a stale copy of a tour outlive the fetch that produced it.
  */
 
-/** `editing` when reopened from Discovery rather than on first run. */
-type OnboardingParams = { editing?: boolean } | undefined;
+/**
+ * `editing` when reopened from Discovery rather than on first run.
+ * `includeCity` when this run shows the City step (TASK-1101), which shifts the
+ * step numbers and gives Group a Back button.
+ */
+type OnboardingParams = { editing?: boolean; includeCity?: boolean } | undefined;
 
 export type RootStackParamList = {
+  Welcome: undefined;
+  OnboardingCity: OnboardingParams;
   OnboardingGroup: OnboardingParams;
   OnboardingInterests: OnboardingParams;
   OnboardingTime: OnboardingParams;
@@ -20,6 +26,8 @@ export type RootStackParamList = {
   ActiveTour: { tourId: string };
 };
 
+export type WelcomeScreenProps = NativeStackScreenProps<RootStackParamList, 'Welcome'>;
+export type OnboardingCityScreenProps = NativeStackScreenProps<RootStackParamList, 'OnboardingCity'>;
 export type OnboardingGroupScreenProps = NativeStackScreenProps<RootStackParamList, 'OnboardingGroup'>;
 export type OnboardingInterestsScreenProps = NativeStackScreenProps<RootStackParamList, 'OnboardingInterests'>;
 export type OnboardingTimeScreenProps = NativeStackScreenProps<RootStackParamList, 'OnboardingTime'>;

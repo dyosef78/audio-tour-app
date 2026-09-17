@@ -4,10 +4,10 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { colors, MIN_TOUCH } from '../../ui/theme';
 
-export const ONBOARDING_STEPS = 3;
-
 interface Props {
   step: number;
+  /** Varies: the City step appears only when there is a choice (TASK-1101). */
+  totalSteps: number;
   title: string;
   subtitle: string;
   /** Omitted on the very first screen of a first run: there is nowhere to go back to. */
@@ -19,12 +19,13 @@ interface Props {
 }
 
 /**
- * Shared frame for the three onboarding steps: progress, a scrolling body of
+ * Shared frame for the numbered onboarding steps: progress, a scrolling body of
  * choices, and a primary action pinned above the home indicator so it never
  * scrolls out of reach on a small phone with large text.
  */
 export default function OnboardingScaffold({
   step,
+  totalSteps,
   title,
   subtitle,
   back,
@@ -49,9 +50,9 @@ export default function OnboardingScaffold({
           style={styles.progress}
           accessible
           accessibilityRole="progressbar"
-          accessibilityLabel={`Step ${step} of ${ONBOARDING_STEPS}`}
+          accessibilityLabel={`Step ${step} of ${totalSteps}`}
         >
-          {Array.from({ length: ONBOARDING_STEPS }, (_, i) => (
+          {Array.from({ length: totalSteps }, (_, i) => (
             <View key={i} style={[styles.segment, i < step && styles.segmentDone]} />
           ))}
         </View>
@@ -61,7 +62,7 @@ export default function OnboardingScaffold({
       <ScrollView contentContainerStyle={styles.content}>
         {/* The progress bar already announces the step to screen readers. */}
         <Text style={styles.eyebrow} importantForAccessibility="no" accessibilityElementsHidden>
-          STEP {step} OF {ONBOARDING_STEPS}
+          STEP {step} OF {totalSteps}
         </Text>
         <Text style={styles.title} accessibilityRole="header">
           {title}

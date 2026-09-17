@@ -6,9 +6,11 @@ import AudioPlayerSheet from '../components/AudioPlayerSheet';
 import { usePreferences, usePreferencesBoot } from '../personalization/preferencesStore';
 import ActiveTourScreen from '../screens/ActiveTourScreen';
 import DiscoveryScreen from '../screens/DiscoveryScreen';
+import OnboardingCityScreen from '../screens/onboarding/OnboardingCityScreen';
 import OnboardingGroupScreen from '../screens/onboarding/OnboardingGroupScreen';
 import OnboardingInterestsScreen from '../screens/onboarding/OnboardingInterestsScreen';
 import OnboardingTimeScreen from '../screens/onboarding/OnboardingTimeScreen';
+import WelcomeScreen from '../screens/onboarding/WelcomeScreen';
 import TourDetailScreen from '../screens/TourDetailScreen';
 import { navigationRef } from './navigationRef';
 import type { RootStackParamList } from './types';
@@ -16,12 +18,17 @@ import type { RootStackParamList } from './types';
 const Stack = createNativeStackNavigator<RootStackParamList>();
 
 /**
- * Root stack: [Onboarding x3] -> Discovery -> TourDetail -> ActiveTour.
+ * Root stack: Welcome -> [City] -> Group -> Interests -> Time -> Discovery ->
+ * TourDetail -> ActiveTour.
  *
- * Onboarding (TASK-601) is three ordinary stack screens rather than a pager, so
- * back and the iOS edge-swipe step between them natively. They stay registered
- * after onboarding so Discovery can reopen them to edit preferences; finishing
- * resets the stack onto Discovery either way.
+ * Onboarding (TASK-601, Welcome and City since TASK-1101) is ordinary stack
+ * screens rather than a pager, so back and the iOS edge-swipe step between them
+ * natively. They stay registered after onboarding so Discovery can reopen them
+ * to edit preferences or switch city; finishing resets the stack onto Discovery.
+ *
+ * Where a launch starts: Welcome until it has been answered once (signed in or
+ * guest), then the first unfinished step, then Discovery. Welcome is never
+ * shown again after that - signing out returns the app to guest, not to it.
  *
  * The navigator is not mounted until saved preferences have been read back:
  * initialRouteName is consulted exactly once, so mounting early would send every
@@ -45,6 +52,7 @@ export default function RootNavigator() {
   const [routeName, setRouteName] = useState<string | undefined>(undefined);
   const preferencesReady = usePreferencesBoot((s) => s.ready);
   const onboarded = usePreferences((s) => s.onboardingComplete);
+  const welcomeSeen = usePreferences((s) => s.welcomeSeen);
 
   const syncRoute = useCallback(() => {
     setRouteName(navigationRef.getCurrentRoute()?.name);
@@ -55,13 +63,15 @@ export default function RootNavigator() {
   return (
     <NavigationContainer ref={navigationRef} onReady={syncRoute} onStateChange={syncRoute}>
       <Stack.Navigator
-        initialRouteName={onboarded ? 'Discovery' : 'OnboardingGroup'}
+        initialRouteName={!welcomeSeen ? 'Welcome' : onboarded ? 'Discovery' : 'OnboardingGroup'}
         screenOptions={{
           headerTitleStyle: { fontWeight: '600' },
           contentStyle: { backgroundColor: '#FFFFFF' },
         }}
       >
         <Stack.Group screenOptions={{ headerShown: false }}>
+          <Stack.Screen name="Welcome" component={WelcomeScreen} />
+          <Stack.Screen name="OnboardingCity" component={OnboardingCityScreen} />
           <Stack.Screen name="OnboardingGroup" component={OnboardingGroupScreen} />
           <Stack.Screen name="OnboardingInterests" component={OnboardingInterestsScreen} />
           <Stack.Screen name="OnboardingTime" component={OnboardingTimeScreen} />

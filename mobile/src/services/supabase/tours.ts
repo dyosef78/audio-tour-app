@@ -1,3 +1,4 @@
+import { cityCatalogueFilter } from '../../personalization/onboardingFlow';
 import type { Topology, Tour, TransitMode } from '../../types/domain';
 import { supabase } from './client';
 
@@ -38,12 +39,17 @@ function mapTour(row: TourRow): Tour {
  * Reads with the anon key, so this exercises the public-read RLS policy. An
  * empty array is a legitimate result, not an error - the caller must render an
  * empty state rather than treating it as a failure.
+ *
+ * `cityId` (TASK-1101) narrows to one city's tours; null lists everything.
+ * city_id is only ever named in the query when a city is given, and a city can
+ * only have been saved from a server that has the column - so this still works
+ * against a database without migration 20260918090000.
  */
-export async function fetchTours(): Promise<Tour[]> {
-  const { data, error } = await supabase
-    .from('tours')
-    .select(TOUR_COLUMNS)
-    .order('title');
+export async function fetchTours(cityId: string | null = null): Promise<Tour[]> {
+  const filter = cityCatalogueFilter(cityId);
+  let query = supabase.from('tours').select(TOUR_COLUMNS);
+  if (filter !== null) query = query.or(filter);
+  const { data, error } = await query.order('title');
 
   if (error) throw new Error(error.message);
   return (data ?? []).map(mapTour);

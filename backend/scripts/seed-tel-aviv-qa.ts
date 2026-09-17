@@ -106,6 +106,8 @@ type TransitMode = keyof typeof EXIT_HYSTERESIS_FACTOR;
 
 const TOUR_TITLE = '[QA] Tel Aviv Field Walk - TASK-508';
 const TRANSIT_MODE: TransitMode = 'walking';
+/** cities.slug created by migration 20260918090000 (TASK-1101). */
+const CITY_SLUG = 'tel-aviv';
 const TOPOLOGY = 'in_city';
 
 /**
@@ -599,7 +601,29 @@ async function upsertTour(supabase: SupabaseClient): Promise<string> {
   if (id === undefined) throw new Error('cms_upsert_tour returned no id.');
 
   console.log(`  tour ${existingId === undefined ? 'created' : 'updated'}  ${id}`);
+  await assignCity(supabase, id);
   return id;
+}
+
+/**
+ * Put the tour under Tel Aviv (TASK-1101). cms_validate_tour refuses to publish
+ * a tour with no city, and migration 20260918090000 creates the `tel-aviv` row,
+ * so a missing row here means that migration has not been pushed.
+ */
+async function assignCity(supabase: SupabaseClient, tourId: string): Promise<void> {
+  const { data: city, error: cityError } = await supabase
+    .from('cities')
+    .select('id')
+    .eq('slug', CITY_SLUG)
+    .maybeSingle();
+  if (cityError) throw new Error(`Could not look up city ${CITY_SLUG}: ${cityError.message}`);
+  const cityId = (city as { id?: string } | null)?.id;
+  if (cityId === undefined) {
+    throw new Error(`City ${CITY_SLUG} does not exist. Push migration 20260918090000_cities.sql first.`);
+  }
+
+  const { error } = await supabase.rpc('cms_set_tour_city', { p_tour_id: tourId, p_city_id: cityId });
+  if (error) throw new Error(`cms_set_tour_city failed: ${error.message}`);
 }
 
 /**

@@ -8,6 +8,12 @@
 export const colors = {
   ink: '#1C1C1E',
   inkMuted: '#6E6E73',
+  /**
+   * Secondary text that can sit on a TINTED fill (a selected card or bubble).
+   * inkMuted clears AA on white but falls to ~4.3:1 on accentSoft and the
+   * interest tints; test:ui checks this one against all of them (TASK-1101).
+   */
+  inkSecondary: '#636366',
   canvas: '#FFFFFF',
   surface: '#F5F5F7',
   hairline: '#D1D1D6',

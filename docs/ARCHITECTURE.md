@@ -56,8 +56,11 @@ it. So:
 
 Onboarding asks three questions: **group type** (`solo`, `couple`, `friends`,
 `family_kids`), **interests** (`history`, `culinary`, `nature`, `architecture`,
-`art_culture`) and a **time budget**. These ids are also the database tag
-vocabulary. They personalise a tour in three layers:
+`art_culture`) and a **time budget** (`quick` 120 min, `half_day` 240,
+`full_day` 480). These ids are also the database tag vocabulary. Culinary is
+one tag: street food, markets and fine dining are how the screen presents it,
+not separate ids (PM, Epic 11). Before them, the app picks the **city**, which
+scopes Discovery (§4). The preferences personalise a tour in three layers:
 
 | Layer | Where | Effect |
 |---|---|---|
@@ -122,6 +125,7 @@ matching indexes), never degree arithmetic.
 
 ```mermaid
 erDiagram
+  cities ||--o{ tours : lists
   tours ||--o{ waypoints : has
   waypoints ||--o{ geofence_zones : has
   waypoints ||--o{ audio_tracks : has
@@ -133,7 +137,8 @@ erDiagram
 
 | Table | Purpose | Key constraints |
 |---|---|---|
-| `tours` | A tour. `status` draft/published/archived, `topology` (in_city, point_to_point, star_loop), `transit_mode` (walking, biking, driving), `audiences[]`, `interests[]`, optional bundled `route` (LineString), derived start point. | Tags ⊆ vocabulary functions; route valid with ≥ 2 points. |
+| `cities` | A city visitors can choose (Epic 11). `slug`, `name`, `country_code`, `center` (geography Point). | Readable only while the city has a published tour; admin-only writes. |
+| `tours` | A tour. `city_id` (nullable; required to publish), `status` draft/published/archived, `topology` (in_city, point_to_point, star_loop), `transit_mode` (walking, biking, driving), `audiences[]`, `interests[]`, optional bundled `route` (LineString), derived start point. | Tags ⊆ vocabulary functions; route valid with ≥ 2 points. |
 | `waypoints` | A stop. `geom` Point, `sort_order` (authored order), `poi_type` (anchor, transition, viewpoint, facility), `audiences[]`, `interests[]`. | GiST + geography indexes. |
 | `geofence_zones` | Trigger zone per stop: `radius` (with `trigger_radius_meters`) or `polygon`. | Radius zones must carry a radius. |
 | `audio_tracks` | One file per stop per `track_kind` (`narration`, `deep_dive`). `storage_path` (bucket-relative, never a URL), `size_bytes`, `duration_seconds`, `format`, `lufs_normalization`. | Unique per (waypoint, kind); relative path; `format` **AAC only**, path must end `.m4a`; **`size_bytes` ≤ 5,242,880**. |
@@ -195,7 +200,8 @@ so RLS remains the enforcement layer.
 | `cms_replace_tour_waypoints` | Replace a tour's stops and geofences atomically from JSON. |
 | `cms_register_audio_track` | Register an uploaded file for a stop and track kind. |
 | `cms_set_tour_route` | Store the bundled route polyline (validated against the stops). |
-| `cms_validate_tour` | Report everything that blocks publishing. |
+| `cms_set_tour_city` | Put a tour under a city. Cannot be cleared. |
+| `cms_validate_tour` | Report everything that blocks publishing, including `tour_without_city`. |
 | `cms_publish_tour` / `cms_set_tour_status` | Lifecycle transitions. |
 
 The **ingest service** (`backend/cms`) carries the **admin's own access token**,
@@ -343,8 +349,17 @@ own:** `TourSessionController` is the single owner of GPS and audio hardware.
 
 ```mermaid
 flowchart LR
-  Onboarding --> Discovery --> Detail[Tour Detail<br/>download] --> Active[Active Tour<br/>map + player sheet]
+  Welcome[Welcome<br/>optional sign-in] --> City[City<br/>only if 2+] --> Prefs[Group → Interests → Time] --> Discovery --> Detail[Tour Detail<br/>download] --> Active[Active Tour<br/>map + player sheet]
 ```
+
+**Onboarding (Epic 11).** Welcome is shown once. Its primary action is
+*Continue without account*; Apple (iOS) and Google sign-in are optional (§3.2).
+The City step appears only when two or more cities have published tours. With
+one, it is selected silently; with no city list (offline first run), Discovery
+resolves it later. Discovery lists the saved city's tours, plus any tour with no
+city. Downloaded tours shown offline are never filtered by city. Bundles stay
+per tour, downloaded from Tour Detail. The rules are pure functions in
+`personalization/onboardingFlow.ts`, covered by `test:ui`.
 
 ### 4.1 Offline pre-fetch bundle
 
@@ -638,6 +653,7 @@ needs a PM decision or a task; none should be assumed.
 | Audio | `mobile/src/services/audio/AudioService.ts` |
 | Transcripts | `mobile/src/transcript/` |
 | Telemetry | `mobile/src/services/telemetry/` |
-| Personalisation | `mobile/src/personalization/` (`preferencesStore.ts` is persisted, v2) |
+| Personalisation | `mobile/src/personalization/` (`preferencesStore.ts` is persisted, v2; `onboardingFlow.ts`, `cityCatalogue.ts`) |
+| Onboarding screens | `mobile/src/screens/onboarding/`, `mobile/src/components/onboarding/` |
 | Auth (optional sign-in) | `mobile/src/services/auth/` (`secureSessionStorage.ts`, `authStore.ts`, `AuthService.ts`) |
 | Tests & harnesses | `mobile/scripts/` (`test-ui-logic.ts`, `test-auth.ts`, `simulate-walk.ts`), `backend/scripts/` |

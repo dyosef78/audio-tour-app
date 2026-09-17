@@ -13,11 +13,25 @@
 import { mock } from 'node:test';
 
 import {
+  INTERESTS,
   parseGroupTypes,
   parseInterests,
   routeCriteria,
+  TIME_BUDGETS,
   tourFitsBudget,
 } from '../src/personalization/options.ts';
+import { refreshCities, refreshCitiesWithin, useCityCatalogue } from '../src/personalization/cityCatalogue.ts';
+import {
+  catalogueCityId,
+  cityCatalogueFilter,
+  onboardingSteps,
+  parseCities,
+  resolveCity,
+  stepPosition,
+  type CitySummary,
+} from '../src/personalization/onboardingFlow.ts';
+import { contrastRatio, INTEREST_TINTS } from '../src/ui/interestTints.ts';
+import { colors } from '../src/ui/theme.ts';
 import { planBundleFiles } from '../src/services/bundle/plan.ts';
 import { tourFromManifest } from '../src/services/bundle/catalogue.ts';
 import type { WireBundle } from '../src/services/bundle/types.ts';
@@ -165,10 +179,21 @@ heading('routeCriteria / tourFitsBudget');
 
 eq('incomplete preferences give no criteria', routeCriteria({ groupType: 'solo', interests: [], timeBudget: 'quick' }), null);
 const quick = routeCriteria({ groupType: 'couple', interests: ['history'], timeBudget: 'quick' });
-eq('complete preferences', quick, { groupType: 'couple', interests: ['history'], maxMinutes: 60 });
-eq('a 45 min tour fits a quick walk', tourFitsBudget(45, quick), true);
-eq('a 60 min tour fits exactly', tourFitsBudget(60, quick), true);
-eq('a 90 min tour does not', tourFitsBudget(90, quick), false);
+eq('complete preferences', quick, { groupType: 'couple', interests: ['history'], maxMinutes: 120 });
+eq('a 90 min tour fits 2 hours', tourFitsBudget(90, quick), true);
+eq('a 120 min tour fits exactly', tourFitsBudget(120, quick), true);
+eq('a 150 min tour does not', tourFitsBudget(150, quick), false);
+// TASK-1101: PM-confirmed budgets. The ids are a storage contract and must not move.
+eq(
+  'time budgets are 120 / 240 / 480 under unchanged ids',
+  TIME_BUDGETS.map((b) => [b.id, b.maxMinutes]),
+  [['quick', 120], ['half_day', 240], ['full_day', 480]],
+);
+eq(
+  'interests stay the five database tags - culinary is ONE id',
+  INTERESTS.map((i) => i.id).sort(),
+  ['architecture', 'art_culture', 'culinary', 'history', 'nature'],
+);
 eq('no criteria means no opinion, not "no"', tourFitsBudget(90, null), null);
 
 heading('preferences store');
@@ -237,6 +262,91 @@ await usePreferences.persist.rehydrate();
 eq('a stored v1 blob rehydrates through the migration', usePreferences.getState().welcomeSeen, true);
 eq('...keeping its choices', usePreferences.getState().groupType, 'friends');
 eq('...and the boot gate opens cleanly', usePreferencesBoot.getState(), { ready: true, restoreFailed: false });
+
+// -----------------------------------------------------------------------------
+// TASK-1101: onboarding flow, cities, interest colours
+// -----------------------------------------------------------------------------
+
+heading('Onboarding flow and city resolution');
+
+const TLV: CitySummary = { id: '11111111-0000-4000-8000-000000000001', slug: 'tel-aviv', name: 'Tel Aviv' };
+const JLM: CitySummary = { id: '11111111-0000-4000-8000-000000000002', slug: 'jerusalem', name: 'Jerusalem' };
+
+eq('one city, nothing saved -> selected silently', resolveCity([TLV], null), { kind: 'auto', cityId: TLV.id });
+eq('one city, already saved -> kept', resolveCity([TLV], TLV.id), { kind: 'keep' });
+eq('one city, a stale saved id -> replaced silently', resolveCity([TLV], JLM.id), { kind: 'auto', cityId: TLV.id });
+eq('two cities, nothing saved -> the visitor chooses', resolveCity([TLV, JLM], null), { kind: 'choose' });
+eq('two cities, a valid saved one -> kept', resolveCity([TLV, JLM], JLM.id), { kind: 'keep' });
+eq('never fetched (offline first run) -> unknown', resolveCity(null, null), { kind: 'unknown' });
+eq('an empty list is not a reason to ask', resolveCity([], TLV.id), { kind: 'unknown' });
+
+eq('catalogue: keep filters by the saved city', catalogueCityId({ kind: 'keep' }, JLM.id), JLM.id);
+eq('catalogue: auto filters by the chosen city', catalogueCityId({ kind: 'auto', cityId: TLV.id }, null), TLV.id);
+eq('catalogue: choose lists every city until answered', catalogueCityId({ kind: 'choose' }, JLM.id), null);
+eq('catalogue: unknown keeps the saved city (offline)', catalogueCityId({ kind: 'unknown' }, TLV.id), TLV.id);
+
+eq('one city: three numbered steps, no City', onboardingSteps(false), ['OnboardingGroup', 'OnboardingInterests', 'OnboardingTime']);
+eq('several cities: City leads', onboardingSteps(true)[0], 'OnboardingCity');
+eq('Group is step 1 of 3 without City', stepPosition('OnboardingGroup', false), { step: 1, total: 3 });
+eq('Group is step 2 of 4 with City', stepPosition('OnboardingGroup', true), { step: 2, total: 4 });
+eq('Time is always last', stepPosition('OnboardingTime', true), { step: 4, total: 4 });
+
+eq(
+  'city rows: malformed ones are dropped',
+  parseCities([TLV, { id: 'not-a-uuid', slug: 'x', name: 'X' }, { id: JLM.id, slug: 'jerusalem', name: '  ' }, null, 'x']),
+  [TLV],
+);
+eq('city rows: a non-array is no cities', parseCities({ error: true }), []);
+
+eq('catalogue filter includes city-less tours', cityCatalogueFilter(TLV.id), `city_id.eq.${TLV.id},city_id.is.null`);
+eq('no city -> no filter', cityCatalogueFilter(null), null);
+eq(
+  'a non-uuid from storage is refused, never interpolated into the filter',
+  cityCatalogueFilter('x,status.eq.draft'),
+  null,
+);
+
+heading('City catalogue refresh');
+{
+  const warnCities = mock.method(console, 'warn', () => {});
+  useCityCatalogue.setState({ cities: null });
+  let calls = 0;
+  const slow = () =>
+    new Promise<CitySummary[]>((resolve) => {
+      calls++;
+      setTimeout(() => resolve([TLV]), 30);
+    });
+  const [a, b] = await Promise.all([refreshCities(slow), refreshCities(slow)]);
+  eq('two screens asking at once cause ONE fetch', calls, 1);
+  eq('...and both hear it succeeded', [a, b], [true, true]);
+  eq('...and the list is stored', useCityCatalogue.getState().cities, [TLV]);
+
+  eq('a failed refresh reports false', await refreshCities(async () => Promise.reject(new Error('offline'))), false);
+  eq('...and keeps the last good list', useCityCatalogue.getState().cities, [TLV]);
+
+  const hanging = () => new Promise<CitySummary[]>(() => {});
+  const started = Date.now();
+  eq('a hung network gives up at the deadline', await refreshCitiesWithin(40, hanging), false);
+  assert('...promptly', Date.now() - started < 1000);
+  warnCities.mock.restore();
+}
+
+heading('Interest bubble colours (WCAG AA)');
+for (const [id, tint] of Object.entries(INTEREST_TINTS)) {
+  const onSoft = contrastRatio(tint.strong, tint.soft);
+  const onWhite = contrastRatio(tint.strong, colors.canvas);
+  const secondaryOnSoft = contrastRatio(colors.inkSecondary, tint.soft);
+  assert(`${id}: strong on soft >= 4.5`, onSoft >= 4.5, onSoft.toFixed(2));
+  assert(`${id}: strong on white, and white tick on strong >= 4.5`, onWhite >= 4.5, onWhite.toFixed(2));
+  assert(`${id}: description on the selected fill >= 4.5`, secondaryOnSoft >= 4.5, secondaryOnSoft.toFixed(2));
+}
+{
+  const r = contrastRatio(colors.inkSecondary, colors.accentSoft);
+  assert('ChoiceCard: description on its selected fill >= 4.5', r >= 4.5, r.toFixed(2));
+  const muted = contrastRatio(colors.inkMuted, colors.accentSoft);
+  assert('...which inkMuted did not (why inkSecondary exists)', muted < 4.5, muted.toFixed(2));
+}
+eq('contrast sanity: black on white is 21', Math.round(contrastRatio('#000000', '#FFFFFF')), 21);
 
 // -----------------------------------------------------------------------------
 // Deep Dive session semantics
