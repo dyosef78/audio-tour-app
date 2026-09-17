@@ -438,6 +438,14 @@ for (const [id, tint] of Object.entries(INTEREST_TINTS)) {
   const muted = contrastRatio(colors.inkMuted, colors.accentSoft);
   assert('...which inkMuted did not (why inkSecondary exists)', muted < 4.5, muted.toFixed(2));
 }
+{
+  // TASK-1104: "Delete account" is text on white rows that press to `surface`,
+  // and the delete button is white text on it.
+  for (const [label, bg] of [['white', colors.canvas], ['pressed row', colors.surface]] as const) {
+    const r = contrastRatio(colors.dangerInk, bg);
+    assert(`dangerInk on ${label} >= 4.5`, r >= 4.5, r.toFixed(2));
+  }
+}
 eq('contrast sanity: black on white is 21', Math.round(contrastRatio('#000000', '#FFFFFF')), 21);
 
 // -----------------------------------------------------------------------------

@@ -91,6 +91,10 @@ export default function DiscoveryScreen({ navigation }: DiscoveryScreenProps) {
     [groupType, interests, timeBudget],
   );
 
+  const openSettings = useCallback(() => {
+    navigation.navigate('Settings');
+  }, [navigation]);
+
   const editPreferences = useCallback(() => {
     navigation.navigate('OnboardingGroup', { editing: true });
   }, [navigation]);
@@ -103,12 +107,14 @@ export default function DiscoveryScreen({ navigation }: DiscoveryScreenProps) {
     navigation.setOptions({
       title: cityName ?? 'Audio Tours',
       headerRight: () => (
-        <Pressable hitSlop={12} onPress={editPreferences} accessibilityRole="button">
-          <Text style={styles.headerLink}>Preferences</Text>
+        // Settings holds preferences, city and the account (TASK-1104); the
+        // "Planned for you" card below still edits preferences in one tap.
+        <Pressable hitSlop={12} onPress={openSettings} accessibilityRole="button">
+          <Text style={styles.headerLink}>Settings</Text>
         </Pressable>
       ),
     });
-  }, [navigation, editPreferences, cityName]);
+  }, [navigation, openSettings, cityName]);
 
   const load = useCallback(async () => {
     // The tours on this device, or the error if there are none.

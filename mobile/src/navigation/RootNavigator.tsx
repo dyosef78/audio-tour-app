@@ -5,12 +5,14 @@ import { useCallback, useState } from 'react';
 import AudioPlayerSheet from '../components/AudioPlayerSheet';
 import { usePreferences, usePreferencesBoot } from '../personalization/preferencesStore';
 import ActiveTourScreen from '../screens/ActiveTourScreen';
+import DeleteAccountScreen from '../screens/DeleteAccountScreen';
 import DiscoveryScreen from '../screens/DiscoveryScreen';
 import OnboardingCityScreen from '../screens/onboarding/OnboardingCityScreen';
 import OnboardingGroupScreen from '../screens/onboarding/OnboardingGroupScreen';
 import OnboardingInterestsScreen from '../screens/onboarding/OnboardingInterestsScreen';
 import OnboardingTimeScreen from '../screens/onboarding/OnboardingTimeScreen';
 import WelcomeScreen from '../screens/onboarding/WelcomeScreen';
+import SettingsScreen from '../screens/SettingsScreen';
 import TourDetailScreen from '../screens/TourDetailScreen';
 import { navigationRef } from './navigationRef';
 import type { RootStackParamList } from './types';
@@ -82,6 +84,13 @@ export default function RootNavigator() {
           name="TourDetail"
           component={TourDetailScreen}
           options={({ route }) => ({ title: route.params.title })}
+        />
+        <Stack.Screen name="Settings" component={SettingsScreen} options={{ title: 'Settings' }} />
+        <Stack.Screen
+          name="DeleteAccount"
+          component={DeleteAccountScreen}
+          // No swipe-away mid-deletion; the screen's own buttons are the exits.
+          options={{ title: 'Delete account', gestureEnabled: false }}
         />
         <Stack.Screen
           name="ActiveTour"

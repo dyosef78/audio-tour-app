@@ -21,6 +21,11 @@ export const colors = {
   accentSoft: '#E3F1F0',
   live: '#34C759',
   danger: '#FF6B57',
+  /**
+   * Destructive TEXT on light surfaces (TASK-1104). `danger` is 2.8:1 on white,
+   * fine on the dark player sheet but below AA as text here. test:ui checks it.
+   */
+  dangerInk: '#C62F1E',
 
   sheet: '#1C1C1E',
   sheetRaised: '#2C2C2E',

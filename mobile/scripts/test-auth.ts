@@ -13,6 +13,12 @@ import { mock } from 'node:test';
 
 import type { Session } from '@supabase/supabase-js';
 
+import {
+  runAccountDeletion,
+  type AccountDeletionDeps,
+  type AppleReauthentication,
+  type InvokeResult,
+} from '../src/services/auth/accountDeletion.ts';
 import { accountFromSession, startAuth, useAuth } from '../src/services/auth/authStore.ts';
 import {
   ciphertextKeyFor,
@@ -248,6 +254,93 @@ assert('sign-out could not reach the (placeholder) server', signOutError !== nul
 for (let i = 0; i < 50 && useAuth.getState().status !== 'signed_out'; i++) await flush();
 eq('...yet the device is signed out', useAuth.getState(), { status: 'signed_out', account: null });
 eq('...and nothing is left in either store', [Object.keys(dumpAsync()), Object.keys(dumpKeychain())], [[], []]);
+
+// -----------------------------------------------------------------------------
+heading('Account deletion flow (TASK-1104)');
+// -----------------------------------------------------------------------------
+
+function deletionHarness(opts: {
+  provider: string | null;
+  apple?: AppleReauthentication;
+  invoke?: InvokeResult;
+  signOutThrows?: boolean;
+}) {
+  const calls: string[] = [];
+  const bodies: Record<string, unknown>[] = [];
+  const deps: AccountDeletionDeps = {
+    provider: opts.provider,
+    reauthenticateWithApple: async () => {
+      calls.push('apple');
+      return opts.apple ?? { authorizationCode: 'apple-code' };
+    },
+    invokeDelete: async (body) => {
+      calls.push('invoke');
+      bodies.push(body);
+      return opts.invoke ?? { status: 200, data: { deleted: true, apple_token_revoked: null } };
+    },
+    signOutLocally: async () => {
+      calls.push('signOut');
+      if (opts.signOutThrows) throw new Error('storage gone');
+    },
+    revokeGoogleAccess: async () => {
+      calls.push('google');
+    },
+    log: () => {},
+  };
+  return { deps, calls, bodies };
+}
+
+{
+  const h = deletionHarness({ provider: 'google' });
+  eq('Google: deleted', await runAccountDeletion(h.deps), { kind: 'deleted', appleTokenRevoked: null });
+  eq('...server FIRST, then local sign-out, then Google revoke; never Apple', h.calls, ['invoke', 'signOut', 'google']);
+  eq('...and the body names no user', h.bodies, [{}]);
+}
+{
+  const h = deletionHarness({ provider: 'apple', invoke: { status: 200, data: { deleted: true, apple_token_revoked: true } } });
+  eq('Apple: deleted, revocation reported', await runAccountDeletion(h.deps), { kind: 'deleted', appleTokenRevoked: true });
+  eq('...confirms with Apple before anything is sent', h.calls, ['apple', 'invoke', 'signOut']);
+  eq('...and sends the fresh authorization code', h.bodies, [{ apple_authorization_code: 'apple-code' }]);
+}
+{
+  const h = deletionHarness({ provider: 'apple', apple: 'cancelled' });
+  eq('Apple: backing out of the Apple sheet cancels', await runAccountDeletion(h.deps), { kind: 'cancelled' });
+  eq('...with nothing sent and nothing signed out', h.calls, ['apple']);
+}
+{
+  const h = deletionHarness({ provider: 'apple', apple: 'unavailable' });
+  eq('Apple account on Android: still deletable', (await runAccountDeletion(h.deps)).kind, 'deleted');
+  eq('...without a code', h.bodies, [{}]);
+}
+{
+  const h = deletionHarness({ provider: 'google', invoke: { networkError: 'Failed to fetch' } });
+  eq('offline: failed, reason offline', await runAccountDeletion(h.deps), { kind: 'failed', reason: 'offline' });
+  eq('...and still signed in - nothing changed', h.calls, ['invoke']);
+}
+{
+  const h = deletionHarness({ provider: 'google', invoke: { status: 403, data: null } });
+  eq('CMS admin: refused', await runAccountDeletion(h.deps), { kind: 'failed', reason: 'admin_account' });
+  eq('...and left signed in', h.calls, ['invoke']);
+}
+{
+  const h = deletionHarness({ provider: 'google', invoke: { status: 401, data: null } });
+  eq('dead session (e.g. already deleted): session_expired', await runAccountDeletion(h.deps), { kind: 'failed', reason: 'session_expired' });
+  eq('...and the useless local session is dropped, but Google is not revoked', h.calls, ['invoke', 'signOut']);
+}
+for (const invoke of [
+  { status: 500, data: null },
+  { status: 502, data: null },
+  { status: 200, data: { deleted: false } },
+  { status: 200, data: 'ok' },
+] as InvokeResult[]) {
+  const h = deletionHarness({ provider: 'google', invoke });
+  eq(`server answer ${JSON.stringify(invoke)} is a failure, never "deleted"`, await runAccountDeletion(h.deps), { kind: 'failed', reason: 'server' });
+  eq('...and nothing local is touched', h.calls, ['invoke']);
+}
+{
+  const h = deletionHarness({ provider: 'google', signOutThrows: true });
+  eq('a local sign-out error after a real deletion is still "deleted"', (await runAccountDeletion(h.deps)).kind, 'deleted');
+}
 
 stop();
 stopRefresh.mock.restore();

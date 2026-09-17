@@ -1,0 +1,141 @@
+import { useState, type ReactNode } from 'react';
+import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+
+import type { DeleteAccountScreenProps } from '../navigation/types';
+import { deleteAccount } from '../services/auth/AccountService';
+import type { DeleteAccountOutcome } from '../services/auth/accountDeletion';
+import { useAuth } from '../services/auth/authStore';
+import { colors } from '../ui/theme';
+
+const FAILURE_MESSAGE: Record<Extract<DeleteAccountOutcome, { kind: 'failed' }>['reason'], string> = {
+  offline: "You're offline. Connect to the internet and try again - nothing has been deleted.",
+  session_expired:
+    "Your sign-in had expired, so you've been signed out. If you'd already deleted your account, it's gone. Otherwise, sign in again from Settings and retry.",
+  admin_account: 'This is a content administrator account and cannot be deleted from the app. Please ask the Audio Tour team to remove it.',
+  server: "Something went wrong on our side and nothing was deleted. Please try again in a moment.",
+};
+
+/**
+ * Delete account (TASK-1104, App Store Review Guideline 5.1.1(v)).
+ *
+ * Says plainly what goes and what stays, asks once more, then deletes
+ * immediately - no email, no waiting period, no support contact. Apple users
+ * confirm with Apple as the final step (see accountDeletion.ts). The outcome is
+ * shown before leaving, so a person is never left guessing whether it worked.
+ */
+export default function DeleteAccountScreen({ navigation }: DeleteAccountScreenProps) {
+  const insets = useSafeAreaInsets();
+  const provider = useAuth((s) => s.account?.provider ?? null);
+  const signedIn = useAuth((s) => s.status === 'signed_in');
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+
+  const run = async () => {
+    setMessage(null);
+    setBusy(true);
+    const outcome = await deleteAccount();
+    setBusy(false);
+
+    if (outcome.kind === 'cancelled') return;
+    if (outcome.kind === 'failed') {
+      setMessage(FAILURE_MESSAGE[outcome.reason]);
+      return;
+    }
+    Alert.alert('Account deleted', 'Your account and its data have been deleted. You can keep using Audio Tour without an account.', [
+      { text: 'OK', onPress: () => navigation.reset({ index: 0, routes: [{ name: 'Discovery' }] }) },
+    ]);
+  };
+
+  const confirm = () => {
+    Alert.alert(
+      'Delete your account?',
+      provider === 'apple'
+        ? "This can't be undone. You'll confirm with Apple one last time."
+        : "This can't be undone.",
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Delete', style: 'destructive', onPress: () => void run() },
+      ],
+    );
+  };
+
+  return (
+    <View style={styles.root}>
+      <ScrollView contentContainerStyle={styles.content}>
+        <Text style={styles.title} accessibilityRole="header">
+          Delete your account
+        </Text>
+        <Text style={styles.body}>Your account is deleted straight away and can't be recovered.</Text>
+
+        <Text style={styles.section}>WHAT'S DELETED</Text>
+        <Bullet>Your account, and the name and email address it holds</Bullet>
+        <Bullet>Its connection to your {provider === 'google' ? 'Google' : provider === 'apple' ? 'Apple' : 'sign-in'} account</Bullet>
+        <Bullet>Anything saved to your account</Bullet>
+
+        <Text style={styles.section}>WHAT STAYS ON THIS PHONE</Text>
+        <Bullet>Tours you've downloaded, and your tour preferences. They were never tied to your account; you can keep using the app without one.</Bullet>
+
+        <Text style={styles.note}>
+          Anonymous usage statistics use a random ID on this device and aren't connected to your account, so there is nothing
+          of yours in them to delete.
+        </Text>
+
+        {message !== null && (
+          <Text style={styles.message} accessibilityRole="alert">
+            {message}
+          </Text>
+        )}
+      </ScrollView>
+
+      <View style={[styles.footer, { paddingBottom: insets.bottom + 14 }]}>
+        <Pressable
+          onPress={confirm}
+          disabled={busy || !signedIn}
+          accessibilityRole="button"
+          accessibilityState={{ disabled: busy || !signedIn, busy }}
+          style={({ pressed }) => [styles.delete, (busy || !signedIn) && styles.deleteDisabled, pressed && styles.pressed]}
+        >
+          {busy ? <ActivityIndicator color={colors.canvas} /> : <Text style={styles.deleteText}>Delete account</Text>}
+        </Pressable>
+        <Pressable onPress={() => navigation.goBack()} disabled={busy} accessibilityRole="button" style={styles.keep}>
+          <Text style={styles.keepText}>Keep my account</Text>
+        </Pressable>
+      </View>
+    </View>
+  );
+}
+
+function Bullet({ children }: { children: ReactNode }) {
+  return (
+    <View style={styles.bullet}>
+      <Text style={styles.dot} importantForAccessibility="no" accessibilityElementsHidden>
+        •
+      </Text>
+      <Text style={styles.bulletText}>{children}</Text>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  root: { flex: 1, backgroundColor: colors.canvas },
+  content: { padding: 20, paddingBottom: 32 },
+  title: { fontSize: 26, fontWeight: '700', color: colors.ink },
+  body: { fontSize: 16, lineHeight: 22, color: colors.ink, marginTop: 8 },
+  section: { fontSize: 12, fontWeight: '700', letterSpacing: 0.8, color: colors.inkSecondary, marginTop: 24, marginBottom: 6 },
+  bullet: { flexDirection: 'row', gap: 8, marginTop: 6 },
+  dot: { fontSize: 16, lineHeight: 22, color: colors.inkSecondary },
+  bulletText: { flex: 1, fontSize: 15, lineHeight: 22, color: colors.ink },
+  note: { fontSize: 13, lineHeight: 18, color: colors.inkSecondary, marginTop: 20 },
+  message: { fontSize: 15, lineHeight: 21, color: colors.dangerInk, marginTop: 20 },
+  footer: {
+    paddingHorizontal: 20, paddingTop: 12, gap: 4,
+    borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: colors.hairline,
+  },
+  delete: { minHeight: 54, borderRadius: 14, backgroundColor: colors.dangerInk, alignItems: 'center', justifyContent: 'center' },
+  deleteDisabled: { opacity: 0.5 },
+  pressed: { opacity: 0.85 },
+  deleteText: { color: colors.canvas, fontSize: 17, fontWeight: '700' },
+  keep: { minHeight: 48, alignItems: 'center', justifyContent: 'center' },
+  keepText: { fontSize: 16, fontWeight: '600', color: colors.accent },
+});

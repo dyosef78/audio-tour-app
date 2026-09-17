@@ -171,6 +171,16 @@ CMS admins.
   keychain read that throws keeps the session and is retried on foreground. A
   session whose key is gone (restored from a backup) is discarded, which signs
   the user out, and never crashes.
+- **Account deletion (TASK-1104, App Store 5.1.1(v)).** Settings > Account >
+  Delete account calls the `delete-account` Edge Function. The function takes
+  the user ONLY from the verified token, refuses CMS administrators (403; the
+  team removes those), and hard-deletes with `auth.admin.deleteUser`. That
+  cascades to identities, sessions and `user_itineraries`. Apple users confirm
+  with Apple first; the fresh authorization code lets the function revoke their
+  Apple tokens when the `APPLE_*` secrets are set (recommended by Apple, not
+  required; deletion never depends on it). Telemetry is not deleted because it
+  is not linked to accounts: events carry a random device id and no user id.
+  Downloads and preferences stay on the phone.
 - **Authorisation lives in the database, not in roles.** Because the anon key
   is public and OAuth sign-in is open to anyone with a Google or Apple account,
   `TO authenticated` grants nothing on its own. Every protected policy and RPC
@@ -589,7 +599,7 @@ The extension must match the codec because AVFoundation infers the format from i
 
 | CI workflow | Runs on | Checks |
 |---|---|---|
-| `checks.yml` | Every push | Typecheck backend + shared and the mobile app; routing, CMS contract, app logic (`test:ui`), auth storage (`test:auth`) and telemetry tests; Deno typecheck and Edge Function tests |
+| `checks.yml` | Every push | Typecheck backend + shared and the mobile app; routing, CMS contract, app logic (`test:ui`), auth storage and account deletion (`test:auth`) and telemetry tests; Deno typecheck and Edge Function tests |
 | `db-verify.yml` | Changes to migrations, seed, `config.toml` | Fresh `supabase db reset`, bundle verification as anon, generated types match `backend/types/supabase.ts` |
 
 ### 6.3 Rules that cost hours when forgotten
@@ -632,7 +642,7 @@ needs a PM decision or a task; none should be assumed.
 | **Max 1.5 MB per file** (PRD) | 5 MiB hard limit, 64–96 kbps | Superseded by PM decision (Epic 10, TASK-1002). Live in production since 17 Sep 2026 (migration `20260917180100`). |
 | **Skip to next stop** for a missed zone | Only the debug manual trigger; a missed zone blocks the remaining stops | Post-MVP backlog |
 | **Proximity-based start** (`preferences.start`) | Not sent; scored routes start at the first authored stop | Post-MVP backlog |
-| **In-app account deletion** (App Store guideline 5.1.1(v)) | Sign-in exists (TASK-1102); deleting the account does not | **Required before App Store submission.** Needs a service-role Edge Function (`auth.admin.deleteUser`; `user_itineraries` and `app_admins` already `ON DELETE CASCADE`) plus a Settings button. Scheduled as **TASK-1104** (after TASK-1103). |
+| **In-app account deletion** (App Store guideline 5.1.1(v)) | Built (TASK-1104): Settings > Delete account → `delete-account` Edge Function | **Not yet deployed.** Needs `supabase functions deploy delete-account`; Apple token revocation additionally needs the `APPLE_TEAM_ID` / `APPLE_KEY_ID` / `APPLE_CLIENT_ID` / `APPLE_PRIVATE_KEY` secrets. Required before App Store submission. |
 | **Future trip planning** (travel dates, time-simulated routing) | Routing scores the device's current `context.local_time`; onboarding asks for no dates | Post-MVP backlog (PM, Epic 11 kickoff). The server already takes any `local_time`, so the backend gap is small; the work is the dates UI and offline bundles for a trip that is weeks away. |
 | **Precise kids' ages** scoring | One `family_kids` audience tag; no ages collected | Post-MVP backlog (PM, Epic 11 kickoff) |
 | **User-selectable bicycle / car modes** | Walking only in onboarding. `transit_mode` belongs to the tour, and `route-stops` refuses a mismatch (400 `transit_mode_mismatch`) | Post-MVP backlog (PM, Epic 11 kickoff). The engine already has biking/driving profiles, but geofence radii are authored for each tour's own mode, so this is a content change as well as a code change. |
@@ -649,7 +659,7 @@ needs a PM decision or a task; none should be assumed.
 | Area | Path |
 |---|---|
 | Migrations & seeds | `supabase/migrations/`, `supabase/seed.sql`, `prod_test_seed.sql` |
-| Edge Function | `supabase/functions/route-stops/` (`handler.ts` contract, `legCache.ts`, `routeCache.ts`, `rateLimit.ts`) |
+| Edge Functions | `supabase/functions/route-stops/` (`handler.ts` contract, `legCache.ts`, `routeCache.ts`, `rateLimit.ts`); `supabase/functions/delete-account/` (`handler.ts` contract, `appleRevoke.ts`) |
 | Shared (Deno + Node + Metro) | `shared/src/` (`smartSorter.ts`, `polyline.ts`, `routeTolerance.ts`, `routing/valhalla.ts`) |
 | CMS ingest | `backend/cms/` |
 | Media pipeline | `backend/media/` (`presets.ts` is the audio standard, per-file limit and bitrate planning) |
@@ -663,5 +673,6 @@ needs a PM decision or a task; none should be assumed.
 | Telemetry | `mobile/src/services/telemetry/` |
 | Personalisation | `mobile/src/personalization/` (`preferencesStore.ts` is persisted, v2; `onboardingFlow.ts`, `cityCatalogue.ts`) |
 | Onboarding screens | `mobile/src/screens/onboarding/`, `mobile/src/components/onboarding/` |
-| Auth (optional sign-in) | `mobile/src/services/auth/` (`secureSessionStorage.ts`, `authStore.ts`, `AuthService.ts`) |
+| Auth (optional sign-in) | `mobile/src/services/auth/` (`secureSessionStorage.ts`, `authStore.ts`, `AuthService.ts`, `accountDeletion.ts`, `AccountService.ts`) |
+| Settings & account | `mobile/src/screens/SettingsScreen.tsx`, `DeleteAccountScreen.tsx`, `mobile/src/components/auth/SignInButtons.tsx` |
 | Tests & harnesses | `mobile/scripts/` (`test-ui-logic.ts`, `test-auth.ts`, `simulate-walk.ts`), `backend/scripts/` |

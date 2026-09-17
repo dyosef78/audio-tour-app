@@ -24,6 +24,8 @@ export type RootStackParamList = {
   Discovery: undefined;
   TourDetail: { tourId: string; title: string };
   ActiveTour: { tourId: string };
+  Settings: undefined;
+  DeleteAccount: undefined;
 };
 
 export type WelcomeScreenProps = NativeStackScreenProps<RootStackParamList, 'Welcome'>;
@@ -34,6 +36,8 @@ export type OnboardingTimeScreenProps = NativeStackScreenProps<RootStackParamLis
 export type DiscoveryScreenProps = NativeStackScreenProps<RootStackParamList, 'Discovery'>;
 export type TourDetailScreenProps = NativeStackScreenProps<RootStackParamList, 'TourDetail'>;
 export type ActiveTourScreenProps = NativeStackScreenProps<RootStackParamList, 'ActiveTour'>;
+export type SettingsScreenProps = NativeStackScreenProps<RootStackParamList, 'Settings'>;
+export type DeleteAccountScreenProps = NativeStackScreenProps<RootStackParamList, 'DeleteAccount'>;
 
 /** Makes useNavigation() typed app-wide without a cast at each call site. */
 declare global {

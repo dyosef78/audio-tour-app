@@ -117,7 +117,8 @@ export function isGoogleSignInConfigured(): boolean {
 
 let googleConfigured = false;
 
-function configureGoogle(): void {
+/** Idempotent. Every GoogleSignin call needs it in this process, including revokeAccess (TASK-1104). */
+export function configureGoogle(): void {
   if (googleConfigured) return;
   GoogleSignin.configure({
     webClientId: GOOGLE_WEB_CLIENT_ID,

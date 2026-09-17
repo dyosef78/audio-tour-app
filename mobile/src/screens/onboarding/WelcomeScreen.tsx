@@ -1,22 +1,13 @@
-import { GoogleSigninButton } from '@react-native-google-signin/google-signin';
-import * as AppleAuthentication from 'expo-apple-authentication';
 import { useEffect, useState } from 'react';
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import SignInButtons from '../../components/auth/SignInButtons';
 import type { WelcomeScreenProps } from '../../navigation/types';
 import { refreshCities, refreshCitiesWithin, useCityCatalogue } from '../../personalization/cityCatalogue';
 import { resolveCity } from '../../personalization/onboardingFlow';
 import { usePreferences } from '../../personalization/preferencesStore';
-import {
-  isAppleSignInAvailable,
-  isGoogleSignInConfigured,
-  signInWithApple,
-  signInWithGoogle,
-  type SignInOutcome,
-} from '../../services/auth/AuthService';
 import { useAuth } from '../../services/auth/authStore';
-import { networkMonitor } from '../../services/network/NetworkMonitor';
 import { colors, MIN_TOUCH } from '../../ui/theme';
 
 /** How long "Continue" may wait for the city list before moving on without it. */
@@ -32,43 +23,31 @@ const FEATURES = [
  * Welcome and optional sign-in (TASK-1101; auth from TASK-1102).
  *
  * GUEST-FIRST (PM, Epic 11). "Continue without account" is the primary action,
- * and nothing about the app is locked behind the buttons above it. Sign-in
- * needs a connection; a tourist opening the app offline abroad just continues.
- * The copy promises nothing an account does not actually do today.
- *
- * Apple's and Google's own buttons are used, as both providers' guidelines
- * require. Apple is iOS-only; Google appears only in builds with client IDs.
+ * and nothing about the app is locked behind the buttons above it. An account
+ * gives no user-facing feature in the MVP (PM, 18 Sep), so the copy promises
+ * none.
  *
  * Not a numbered step. Leaving it resets the stack, so Back from the first step
- * cannot return here after signing in.
+ * cannot return here after signing in. Sign-in stays available later from
+ * Settings.
  */
 export default function WelcomeScreen({ navigation }: WelcomeScreenProps) {
   const insets = useSafeAreaInsets();
   const auth = useAuth();
   const markWelcomeSeen = usePreferences((s) => s.markWelcomeSeen);
 
-  const [appleAvailable, setAppleAvailable] = useState(false);
-  const [online, setOnline] = useState(networkMonitor.isOnline());
-  const [busy, setBusy] = useState<'apple' | 'google' | 'continue' | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [continuing, setContinuing] = useState(false);
+  const [signingIn, setSigningIn] = useState(false);
 
-  const googleAvailable = isGoogleSignInConfigured();
   const signedIn = auth.status === 'signed_in';
 
   useEffect(() => {
-    let alive = true;
-    void isAppleSignInAvailable().then((ok) => alive && setAppleAvailable(ok));
     // Warm the city list now, so Continue rarely has to wait for it.
     void refreshCities();
-    const unsubscribe = networkMonitor.subscribe(setOnline);
-    return () => {
-      alive = false;
-      unsubscribe();
-    };
   }, []);
 
   const proceed = async (): Promise<void> => {
-    setBusy('continue');
+    setContinuing(true);
     await refreshCitiesWithin(CITY_WAIT_MS);
     const prefs = usePreferences.getState();
     const resolution = resolveCity(useCityCatalogue.getState().cities, prefs.cityId);
@@ -86,20 +65,7 @@ export default function WelcomeScreen({ navigation }: WelcomeScreenProps) {
     });
   };
 
-  const signIn = async (provider: 'apple' | 'google'): Promise<void> => {
-    setNotice(null);
-    setBusy(provider);
-    const outcome: SignInOutcome = provider === 'apple' ? await signInWithApple() : await signInWithGoogle();
-    setBusy(null);
-    if (outcome.kind === 'signed_in') {
-      await proceed();
-    } else if (outcome.kind === 'failed') {
-      setNotice("Sign-in didn't work this time. You can try again, or continue without an account.");
-    }
-  };
-
-  const disabled = busy !== null;
-  const showSignIn = !signedIn && (appleAvailable || googleAvailable);
+  const disabled = continuing || signingIn;
 
   return (
     <View style={[styles.root, { paddingTop: insets.top }]}>
@@ -128,48 +94,21 @@ export default function WelcomeScreen({ navigation }: WelcomeScreenProps) {
 
       <View style={[styles.panel, { paddingBottom: insets.bottom + 14 }]}>
         {signedIn ? (
-          <Text style={styles.signedIn} accessibilityRole="text">
+          <Text style={styles.signedIn}>
             Signed in{auth.account?.displayName ? ` as ${auth.account.displayName}` : ''}
           </Text>
         ) : (
-          showSignIn && (
-            <View style={styles.providers} pointerEvents={disabled || !online ? 'none' : 'auto'}>
-              {appleAvailable && (
-                <AppleAuthentication.AppleAuthenticationButton
-                  buttonType={AppleAuthentication.AppleAuthenticationButtonType.CONTINUE}
-                  buttonStyle={AppleAuthentication.AppleAuthenticationButtonStyle.BLACK}
-                  cornerRadius={14}
-                  style={[styles.providerButton, (!online || disabled) && styles.dimmed]}
-                  onPress={() => void signIn('apple')}
-                />
-              )}
-              {googleAvailable && (
-                <GoogleSigninButton
-                  size={GoogleSigninButton.Size.Wide}
-                  color={GoogleSigninButton.Color.Light}
-                  style={[styles.providerButton, (!online || disabled) && styles.dimmed]}
-                  onPress={() => void signIn('google')}
-                />
-              )}
-              {!online && <Text style={styles.hint}>Signing in needs a connection.</Text>}
-            </View>
-          )
-        )}
-
-        {notice !== null && (
-          <Text style={styles.notice} accessibilityRole="alert">
-            {notice}
-          </Text>
+          <SignInButtons onSignedIn={() => void proceed()} onBusyChange={setSigningIn} disabled={continuing} />
         )}
 
         <Pressable
           onPress={() => void proceed()}
           disabled={disabled}
           accessibilityRole="button"
-          accessibilityState={{ disabled, busy: busy === 'continue' }}
+          accessibilityState={{ disabled, busy: continuing }}
           style={({ pressed }) => [styles.cta, pressed && !disabled && styles.ctaPressed]}
         >
-          {busy === 'continue' ? (
+          {continuing ? (
             <ActivityIndicator color={colors.canvas} />
           ) : (
             <Text style={styles.ctaText}>{signedIn ? 'Continue' : 'Continue without account'}</Text>
@@ -200,12 +139,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20, paddingTop: 16, gap: 12,
     borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: colors.hairline, backgroundColor: colors.canvas,
   },
-  providers: { gap: 10 },
-  providerButton: { width: '100%', height: 50 },
-  dimmed: { opacity: 0.4 },
-  hint: { fontSize: 13, color: colors.inkMuted, textAlign: 'center' },
   signedIn: { fontSize: 15, fontWeight: '600', color: colors.accent, textAlign: 'center' },
-  notice: { fontSize: 14, lineHeight: 20, color: colors.ink, textAlign: 'center' },
   cta: {
     minHeight: 54, borderRadius: 14, backgroundColor: colors.ink,
     alignItems: 'center', justifyContent: 'center', minWidth: MIN_TOUCH,
