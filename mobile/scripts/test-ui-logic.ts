@@ -22,7 +22,7 @@ import { planBundleFiles } from '../src/services/bundle/plan.ts';
 import { tourFromManifest } from '../src/services/bundle/catalogue.ts';
 import type { WireBundle } from '../src/services/bundle/types.ts';
 import { transcriptPathFor } from '../src/transcript/sidecar.ts';
-import { usePreferences, usePreferencesBoot } from '../src/personalization/preferencesStore.ts';
+import { migratePreferences, usePreferences, usePreferencesBoot } from '../src/personalization/preferencesStore.ts';
 import { AudioService, type PlaybackError } from '../src/services/audio/AudioService.ts';
 import { useTourSession } from '../src/session/tourSessionStore.ts';
 import { cueIndexAt, isRtlText, parseVtt, VttParseError } from '../src/transcript/vtt.ts';
@@ -188,11 +188,11 @@ eq('toggle adds and removes', usePreferences.getState().interests, ['culinary'])
 await flush();
 const raw = __dump()['user-preferences'];
 const saved = raw === undefined ? null : (JSON.parse(raw) as { version: number; state: Record<string, unknown> });
-eq('persisted with a schema version', saved?.version, 1);
+eq('persisted with a schema version', saved?.version, 2);
 eq(
-  'persists exactly the four preference fields - no actions',
+  'persists exactly the six preference fields - no actions',
   Object.keys(saved?.state ?? {}).sort(),
-  ['groupType', 'interests', 'onboardingComplete', 'timeBudget'],
+  ['cityId', 'groupType', 'interests', 'onboardingComplete', 'timeBudget', 'welcomeSeen'],
 );
 
 // Simulated relaunch. Clearing memory writes through persist, so put the saved
@@ -214,6 +214,29 @@ assert(
   'if this starts passing, zustand changed and the boot store could be simplified',
 );
 eq('boot gate still opens, flagged as failed', usePreferencesBoot.getState(), { ready: true, restoreFailed: true });
+
+// TASK-1102: v1 -> v2. A literal v1 blob, as a device updated from the store holds it.
+eq(
+  'v1 migration: an onboarded user is treated as having chosen guest',
+  migratePreferences({ groupType: 'couple', interests: ['history'], timeBudget: 'quick', onboardingComplete: true }, 1),
+  { groupType: 'couple', interests: ['history'], timeBudget: 'quick', onboardingComplete: true, welcomeSeen: true, cityId: null },
+);
+eq(
+  'v1 migration: a user mid-onboarding still sees Welcome',
+  migratePreferences({ groupType: 'solo', interests: [], timeBudget: null, onboardingComplete: false }, 1).welcomeSeen,
+  false,
+);
+eq('migration survives a non-object blob', migratePreferences(null, 1).onboardingComplete, false);
+
+usePreferencesBoot.setState({ ready: false, restoreFailed: false });
+await AsyncStorage.setItem(
+  'user-preferences',
+  JSON.stringify({ version: 1, state: { groupType: 'friends', interests: ['nature'], timeBudget: 'full_day', onboardingComplete: true } }),
+);
+await usePreferences.persist.rehydrate();
+eq('a stored v1 blob rehydrates through the migration', usePreferences.getState().welcomeSeen, true);
+eq('...keeping its choices', usePreferences.getState().groupType, 'friends');
+eq('...and the boot gate opens cleanly', usePreferencesBoot.getState(), { ready: true, restoreFailed: false });
 
 // -----------------------------------------------------------------------------
 // Deep Dive session semantics

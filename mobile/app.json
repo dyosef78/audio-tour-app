@@ -10,6 +10,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.davidyosef.audiotour",
+      "usesAppleSignIn": true,
       "infoPlist": {
         "UIBackgroundModes": [
           "location",
@@ -56,7 +57,8 @@
           "isAndroidForegroundServiceEnabled": true
         }
       ],
-      "expo-asset"
+      "expo-asset",
+      "expo-secure-store"
     ],
     "extra": {
       "eas": {

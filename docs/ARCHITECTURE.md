@@ -154,8 +154,18 @@ CMS admins.
 
 - **Supabase Auth** issues **JWTs** (1-hour expiry). Sign-in is **OAuth2 via
   Google and Apple**; email sign-up is disabled; anonymous sign-in is off.
-- **The mobile app does not sign in.** It uses the anon key, which ships inside
-  the app, for published content and telemetry.
+- **Sign-in on the phone is optional (Epic 11, TASK-1102).** Guest is the
+  default and loses nothing: every grant the app uses is `TO anon, authenticated`,
+  and telemetry is keyed by device, not user. Apple (iOS) and Google hand an ID
+  token to `signInWithIdToken`, with no browser redirect. Google stays hidden until
+  `EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID` (and, on iOS, `EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID`)
+  are set.
+- **The session is encrypted at rest** (`secureSessionStorage.ts`). An AES-256-GCM
+  key in the Keychain/Keystore, `AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY` so a
+  locked-phone tour can still read it; the ciphertext is in AsyncStorage. A
+  keychain read that throws keeps the session and is retried on foreground. A
+  session whose key is gone (restored from a backup) is discarded, which signs
+  the user out, and never crashes.
 - **Authorisation lives in the database, not in roles.** Because the anon key
   is public and OAuth sign-in is open to anyone with a Google or Apple account,
   `TO authenticated` grants nothing on its own. Every protected policy and RPC
@@ -564,7 +574,7 @@ The extension must match the codec because AVFoundation infers the format from i
 
 | CI workflow | Runs on | Checks |
 |---|---|---|
-| `checks.yml` | Every push | Typecheck backend + shared and the mobile app; routing, CMS contract, app logic (`test:ui`) and telemetry tests; Deno typecheck and Edge Function tests |
+| `checks.yml` | Every push | Typecheck backend + shared and the mobile app; routing, CMS contract, app logic (`test:ui`), auth storage (`test:auth`) and telemetry tests; Deno typecheck and Edge Function tests |
 | `db-verify.yml` | Changes to migrations, seed, `config.toml` | Fresh `supabase db reset`, bundle verification as anon, generated types match `backend/types/supabase.ts` |
 
 ### 6.3 Rules that cost hours when forgotten
@@ -576,6 +586,9 @@ The extension must match the codec because AVFoundation infers the format from i
 - **Never run `types:generate` blind:** errors are written into
   `backend/types/supabase.ts`.
 - **`TO authenticated` is a public grant** (§3.2).
+- **Never put the auth session back in plain AsyncStorage**, and never weaken
+  its keychain accessibility to `WHEN_UNLOCKED`: the background tour runs locked.
+  `npm run test:auth` asserts both.
 - **Keep `shared/` free of npm imports and use real `.ts` specifiers:** Deno,
   Node and Metro all consume it.
 - **Manual harnesses** (not in CI, hit a real project): `npm run sim:walk`
@@ -596,6 +609,10 @@ needs a PM decision or a task; none should be assumed.
 | **Max 1.5 MB per file** (PRD) | 5 MiB hard limit, 64–96 kbps | Superseded by PM decision (Epic 10, TASK-1002). Live in production since 17 Sep 2026 (migration `20260917180100`). |
 | **Skip to next stop** for a missed zone | Only the debug manual trigger; a missed zone blocks the remaining stops | Post-MVP backlog |
 | **Proximity-based start** (`preferences.start`) | Not sent; scored routes start at the first authored stop | Post-MVP backlog |
+| **In-app account deletion** (App Store guideline 5.1.1(v)) | Sign-in exists (TASK-1102); deleting the account does not | **Required before App Store submission.** Needs a service-role Edge Function (`auth.admin.deleteUser`; `user_itineraries` and `app_admins` already `ON DELETE CASCADE`) plus a Settings button. Scheduled as **TASK-1104** (after TASK-1103). |
+| **Future trip planning** (travel dates, time-simulated routing) | Routing scores the device's current `context.local_time`; onboarding asks for no dates | Post-MVP backlog (PM, Epic 11 kickoff). The server already takes any `local_time`, so the backend gap is small; the work is the dates UI and offline bundles for a trip that is weeks away. |
+| **Precise kids' ages** scoring | One `family_kids` audience tag; no ages collected | Post-MVP backlog (PM, Epic 11 kickoff) |
+| **User-selectable bicycle / car modes** | Walking only in onboarding. `transit_mode` belongs to the tour, and `route-stops` refuses a mismatch (400 `transit_mode_mismatch`) | Post-MVP backlog (PM, Epic 11 kickoff). The engine already has biking/driving profiles, but geofence radii are authored for each tour's own mode, so this is a content change as well as a code change. |
 | **Rate limiting** of `route-stops` | Per-IP + global token buckets in Postgres (§3.4) | Live in production since 17 Sep 2026 (TASK-1001). The global 120/min is PM-approved **for now**, to be recalibrated when the Stadia budget is final. |
 | **MP3 fallback** (TASK-301) | Removed: not uploadable, not registrable, refused by the format constraint | AAC-LC `.m4a` only (PM, Epic 10). `transcript_path_for()` / `sidecar.ts` still map `.mp3`; that branch is unreachable. |
 | **"Public CDN"** audio URLs (PRD Screen 2) | Private bucket, 1-hour signed URLs | PRD is out of date. |
@@ -621,5 +638,6 @@ needs a PM decision or a task; none should be assumed.
 | Audio | `mobile/src/services/audio/AudioService.ts` |
 | Transcripts | `mobile/src/transcript/` |
 | Telemetry | `mobile/src/services/telemetry/` |
-| Personalisation | `mobile/src/personalization/` |
-| Tests & harnesses | `mobile/scripts/` (`test-ui-logic.ts`, `simulate-walk.ts`), `backend/scripts/` |
+| Personalisation | `mobile/src/personalization/` (`preferencesStore.ts` is persisted, v2) |
+| Auth (optional sign-in) | `mobile/src/services/auth/` (`secureSessionStorage.ts`, `authStore.ts`, `AuthService.ts`) |
+| Tests & harnesses | `mobile/scripts/` (`test-ui-logic.ts`, `test-auth.ts`, `simulate-walk.ts`), `backend/scripts/` |

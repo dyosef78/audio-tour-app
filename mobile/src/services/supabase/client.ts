@@ -1,6 +1,7 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { createClient } from '@supabase/supabase-js';
 import 'react-native-url-polyfill/auto';
+
+import { secureSessionStorage } from '../auth/secureSessionStorage';
 
 /**
  * Supabase client for the mobile app.
@@ -27,7 +28,11 @@ export const supabase = createClient(
   supabaseAnonKey || 'placeholder-anon-key',
   {
     auth: {
-      storage: AsyncStorage,
+      // Encrypted, keyed from the Keychain / Keystore (TASK-1102). A guest has
+      // no session, so for most users this is never written at all.
+      storage: secureSessionStorage,
+      // On a phone this ticker would otherwise run for as long as the process
+      // does, background included; authStore pauses it with AppState.
       autoRefreshToken: true,
       persistSession: true,
       // No URL-based session detection in a native app.

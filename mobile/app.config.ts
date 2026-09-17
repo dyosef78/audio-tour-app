@@ -35,8 +35,25 @@ export default ({ config }: ConfigContext): ExpoConfig => {
     );
   }
 
+  // TASK-1102. Google Sign-In's config plugin, given no options, assumes Firebase
+  // and fails prebuild without GoogleService-Info.plist - so it is added only
+  // with a client ID. The URL scheme is DERIVED from the same variable the JS
+  // configures GoogleSignin with (AuthService.ts), so the two cannot disagree:
+  // "123-abc.apps.googleusercontent.com" -> "com.googleusercontent.apps.123-abc".
+  // A public client ID, correctly EXPO_PUBLIC_.
+  const googleIosClientId = process.env.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID ?? '';
+  const googleSuffix = '.apps.googleusercontent.com';
+  const googlePlugins: NonNullable<ExpoConfig['plugins']> = [];
+  if (googleIosClientId.endsWith(googleSuffix)) {
+    const iosUrlScheme = `com.googleusercontent.apps.${googleIosClientId.slice(0, -googleSuffix.length)}`;
+    googlePlugins.push(['@react-native-google-signin/google-signin', { iosUrlScheme }]);
+  } else if (googleIosClientId !== '') {
+    console.warn(`\n[app.config] EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID does not end in ${googleSuffix}; Google Sign-In is off for iOS.\n`);
+  }
+
   return {
     ...config,
+    plugins: [...(config.plugins ?? []), ...googlePlugins],
     name: config.name ?? 'Audio Tour',
     slug: config.slug ?? 'audio-tour-app',
     android: {

@@ -24,6 +24,8 @@ const STUBS = new Map([
   ['expo-constants', './stubs/expo-constants.ts'],
   ['react-native', './stubs/react-native.ts'],
   ['@react-native-async-storage/async-storage', './stubs/async-storage.ts'],
+  ['expo-secure-store', './stubs/expo-secure-store.ts'],
+  ['expo-crypto', './stubs/expo-crypto.ts'],
   // Imported for its side effect only; there is no URL to polyfill in Node.
   ['react-native-url-polyfill/auto', './stubs/noop.ts'],
 ]);

@@ -29,6 +29,7 @@
     "check:edge": "deno check --import-map=supabase/functions/import_map.json supabase/functions/route-stops/index.ts",
     "routing:ping": "node --env-file-if-exists=.env --env-file-if-exists=mobile/.env backend/scripts/ping-routing.ts",
     "test:ui": "node --import ./mobile/scripts/register-stubs.mjs mobile/scripts/test-ui-logic.ts",
+    "test:auth": "node --import ./mobile/scripts/register-stubs.mjs mobile/scripts/test-auth.ts",
     "seed:telaviv": "node --env-file-if-exists=.env backend/scripts/seed-tel-aviv-qa.ts"
   },
   "keywords": [],
