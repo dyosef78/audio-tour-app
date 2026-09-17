@@ -29,7 +29,10 @@
  *   404  tour not visible to the caller (unpublished, or no such id)
  *   405  not POST
  *   422  Valhalla cannot route these stops (unroutable, too far, too many)
- *   429  provider rate limit; Retry-After passed through
+ *   429  too_many_requests  this function's own limit (TASK-1001), per client IP or
+ *                           global; checked before the body is read or the
+ *                           database is asked. Retry-After in seconds.
+ *        rate_limited       the provider's limit; Retry-After passed through
  *   500  database lookup failed
  *   501  routing not configured, or the provider rejected our key
  *   502  provider unreachable, 5xx, or an unusable response
@@ -49,6 +52,7 @@ import { PROFILE_FOR_TRANSIT_MODE, type LonLat, type RoutingError, type Valhalla
 import { SORTER_VERSION, parseLocalTime, smartSort, type SortablePoi, type SortContext, type SortPreferences } from '@shared/smartSorter.ts';
 
 import { routeViaLegCache, type LegStore } from './legCache.ts';
+import type { RateLimiter } from './rateLimit.ts';
 import { RouteMemoryCache, routeCacheKey, routeEtag } from './routeCache.ts';
 
 /** Matches DEFAULT_MAX_LOCATIONS; also bounds the work a single anonymous request can cause. */
@@ -71,6 +75,8 @@ export interface RouteStopsDeps {
   cache: RouteMemoryCache;
   /** route_legs_cache. null = not configured (no service role key); routes uncached. */
   legStore?: LegStore | null;
+  /** Token buckets per client IP and global (TASK-1001). null = not configured; unlimited. */
+  rateLimit?: RateLimiter | null;
   /** Keeps background work (cache writes) alive after the response - EdgeRuntime.waitUntil. */
   defer?: (work: Promise<unknown>) => void;
   now?: () => number;
@@ -94,6 +100,18 @@ export async function handleRouteStops(request: Request, deps: RouteStopsDeps): 
   if (!deps.router || !deps.loadTour) {
     log({ event: 'route_stops_not_configured', reason: deps.routerUnavailableReason ?? 'database client missing' });
     return error(501, 'routing_not_configured', 'Routing is not configured on this server.');
+  }
+
+  // Before the body is read or the database is asked: a refused request should
+  // cost as little as possible, and every POST counts, malformed ones included.
+  if (deps.rateLimit) {
+    const decision = await deps.rateLimit(request);
+    if (!decision.allowed) {
+      log({ event: 'route_stops_rate_limited', scope: decision.scope, retry_after_seconds: decision.retryAfterSeconds });
+      return error(429, 'too_many_requests', 'Too many route requests; try again later.', {
+        'Retry-After': String(decision.retryAfterSeconds),
+      });
+    }
   }
 
   const parsed = await parseRequest(request);

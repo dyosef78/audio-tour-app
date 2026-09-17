@@ -148,6 +148,24 @@ export type Database = {
           },
         ]
       }
+      rate_limit_buckets: {
+        Row: {
+          bucket_key: string
+          tokens: number
+          updated_at: string
+        }
+        Insert: {
+          bucket_key: string
+          tokens: number
+          updated_at?: string
+        }
+        Update: {
+          bucket_key?: string
+          tokens?: number
+          updated_at?: string
+        }
+        Relationships: []
+      }
       route_legs_cache: {
         Row: {
           coords_key: string
@@ -649,6 +667,14 @@ export type Database = {
           severity: string
           waypoint_id: string
         }[]
+      }
+      consume_rate_limit: {
+        Args: {
+          p_capacities: number[]
+          p_keys: string[]
+          p_refill_per_second: number[]
+        }
+        Returns: Json
       }
       get_tour_bundle: { Args: { p_tour_id: string }; Returns: Json }
       interest_tag_vocabulary: { Args: never; Returns: string[] }

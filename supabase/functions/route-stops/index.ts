@@ -10,6 +10,10 @@
  *                                     (TASK-801) is off without it, routing still works
  *   STADIA_API_KEY                    `supabase secrets set STADIA_API_KEY=...`
  *   VALHALLA_ROUTE_URL                optional; defaults to Stadia Maps
+ *   ROUTE_RATE_LIMIT_{CLIENT,GLOBAL}_{BURST,PER_MINUTE}
+ *                                     optional; rate limit overrides (TASK-1001, rateLimit.ts).
+ *                                     The limiter also needs the service role key; without it
+ *                                     requests are not limited
  *
  * `@shared/` resolves through supabase/functions/import_map.json, which
  * supabase/config.toml names for this function.
@@ -20,6 +24,7 @@ import { ValhallaClient, isRoutingError, valhallaConfigFromEnv } from '@shared/r
 
 import { handleRouteStops, type RouteStopsDeps } from './handler.ts';
 import type { CachedLeg, LegStore } from './legCache.ts';
+import { createRateLimiter, rateLimitPolicyFromEnv, type BucketOutcome, type RateLimiter } from './rateLimit.ts';
 import { RouteMemoryCache } from './routeCache.ts';
 
 const env = Deno.env.toObject();
@@ -121,6 +126,45 @@ const legStore: LegStore | null = admin
 
 if (!legStore) console.log(JSON.stringify({ event: 'route_legs_cache_disabled', reason: 'SUPABASE_SERVICE_ROLE_KEY missing' }));
 
+// -----------------------------------------------------------------------------
+// Rate limiting (TASK-1001)
+//
+// Shared token buckets in Postgres, because isolate memory is not shared (see
+// the migration). Service role for the same reason as the leg cache: anyone who
+// could call consume_rate_limit could drain the global bucket.
+
+/** Every request pays this round trip, so it is kept short. Past it, fail open. */
+const RATE_LIMIT_TIMEOUT_MS = 1_000;
+
+const rateLimit: RateLimiter | null = admin
+  ? createRateLimiter({
+      policy: rateLimitPolicyFromEnv(env),
+      // An HMAC key the table's readers cannot see, so a stored bucket key
+      // cannot be reversed to an IP address. Rotating the service role key
+      // just starts every client bucket afresh.
+      secret: serviceKey as string,
+      store: async (buckets) => {
+        const { data, error } = await admin
+          .rpc('consume_rate_limit', {
+            p_keys: buckets.map((b) => b.key),
+            p_capacities: buckets.map((b) => b.capacity),
+            p_refill_per_second: buckets.map((b) => b.refillPerSecond),
+          })
+          .abortSignal(AbortSignal.timeout(RATE_LIMIT_TIMEOUT_MS));
+        if (error) throw new Error(`consume_rate_limit: ${error.message}`);
+        const r = data as { allowed: boolean; retry_after_seconds: number; remaining: number; exhausted: string[] };
+        return {
+          allowed: r.allowed,
+          retryAfterSeconds: r.retry_after_seconds,
+          remaining: r.remaining,
+          exhausted: r.exhausted,
+        } satisfies BucketOutcome;
+      },
+    })
+  : null;
+
+if (!rateLimit) console.log(JSON.stringify({ event: 'route_stops_rate_limit_disabled', reason: 'SUPABASE_SERVICE_ROLE_KEY missing' }));
+
 // The response is sent before the cache write finishes. waitUntil keeps the
 // isolate alive for it; without it the write can be cut off mid-flight.
 const edgeRuntime = (globalThis as { EdgeRuntime?: { waitUntil(work: Promise<unknown>): void } }).EdgeRuntime;
@@ -130,5 +174,5 @@ const defer: RouteStopsDeps['defer'] = (work) => edgeRuntime?.waitUntil(work);
 const cache = new RouteMemoryCache();
 
 Deno.serve((request) =>
-  handleRouteStops(request, { loadTour, router, routerUnavailableReason, cache, legStore, defer }),
+  handleRouteStops(request, { loadTour, router, routerUnavailableReason, cache, legStore, rateLimit, defer }),
 );
