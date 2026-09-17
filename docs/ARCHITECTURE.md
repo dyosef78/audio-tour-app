@@ -1,7 +1,8 @@
 # Audio Tour Platform — System Architecture
 
 > **Single Source of Truth.** This document describes the system as it is
-> implemented on `main` after Epic 9 (17 Sep 2026). Where it disagrees with an
+> implemented on `main` after Epic 9 (17 Sep 2026), plus the Epic 10 work on
+> `feat/epic-10-content-qa` (route-stops rate limiting, 5 MiB per-file limit). Where it disagrees with an
 > older document (`prd_user_flows.md`, `architecture_schema.md`), this one wins.
 > Where it disagrees with the code, the code wins and this document has a bug.
 >
@@ -13,8 +14,8 @@
 |---|---|
 | **Stack** | Supabase (PostgreSQL 15 + PostGIS, Auth, Storage, Edge Functions on Deno) · React Native 0.86 / Expo SDK 57 · TypeScript throughout |
 | **Routing** | Valhalla via Stadia Maps, behind the `route-stops` Edge Function |
-| **Audio** | AAC-LC `.m4a`, mono 48 kHz 96 kbps, EBU R128 −16 LUFS |
-| **Status** | Epics 1–9 closed. Next: Epic 10, Content Injection & Production Readiness |
+| **Audio** | AAC-LC `.m4a`, mono 48 kHz, 96 kbps (64 kbps for long tracks), EBU R128 −16 LUFS, **≤ 5 MiB per file** |
+| **Status** | Epics 1–9 closed. In progress: Epic 10, Content Pipeline & Production Readiness |
 
 ## Contents
 
@@ -92,6 +93,7 @@ flowchart LR
     ST[(Storage<br/>audio-tracks, private)]
     EF[Edge Function<br/>route-stops]
     LEG[(route_legs_cache)]
+    RL[(rate_limit_buckets)]
     AUTH[Auth<br/>Google / Apple OAuth]
   end
 
@@ -104,6 +106,7 @@ flowchart LR
   RM -->|POST route-stops| EF
   EF -->|get_tour_bundle as caller| PG
   EF <-->|service role| LEG
+  EF <-->|service role| RL
   EF -->|missing legs only| VAL[Valhalla<br/>Stadia Maps]
   TEL -->|insert-only| PG
 ```
@@ -133,8 +136,9 @@ erDiagram
 | `tours` | A tour. `status` draft/published/archived, `topology` (in_city, point_to_point, star_loop), `transit_mode` (walking, biking, driving), `audiences[]`, `interests[]`, optional bundled `route` (LineString), derived start point. | Tags ⊆ vocabulary functions; route valid with ≥ 2 points. |
 | `waypoints` | A stop. `geom` Point, `sort_order` (authored order), `poi_type` (anchor, transition, viewpoint, facility), `audiences[]`, `interests[]`. | GiST + geography indexes. |
 | `geofence_zones` | Trigger zone per stop: `radius` (with `trigger_radius_meters`) or `polygon`. | Radius zones must carry a radius. |
-| `audio_tracks` | One file per stop per `track_kind` (`narration`, `deep_dive`). `storage_path` (bucket-relative, never a URL), `size_bytes`, `duration_seconds`, `format`, `lufs_normalization`. | Unique per (waypoint, kind); relative path; AAC/MP3 only. |
+| `audio_tracks` | One file per stop per `track_kind` (`narration`, `deep_dive`). `storage_path` (bucket-relative, never a URL), `size_bytes`, `duration_seconds`, `format`, `lufs_normalization`. | Unique per (waypoint, kind); relative path; `format` AAC/MP3 (MP3 can no longer be uploaded, see §7); **`size_bytes` ≤ 5,242,880**. |
 | `route_legs_cache` | Durable cache of routed legs between two stops (Epic 8). | **Service role only**; RLS on with no policies. |
+| `rate_limit_buckets` | Token buckets for `route-stops` rate limiting (Epic 10). `UNLOGGED`: a crash leaves every bucket full. | **Service role only**; RLS on with no policies; written only through `consume_rate_limit()`. |
 | `app_admins` | CMS administrators roster. | Deny-all RLS; read only via `is_cms_admin()`. |
 | `telemetry_events` | Append-only product analytics. | Insert-only for clients; unique `client_event_id`. |
 | `user_itineraries`, `user_itinerary_waypoints` | Per-user saved itineraries with `sync_pull_itineraries()`. | Owner-only RLS. *Not yet used by the app.* |
@@ -163,8 +167,10 @@ CMS admins.
   - **Ownership**: `user_id = auth.uid()`.
 - **Storage bucket `audio-tracks` is private.** Clients receive **signed URLs**
   (1-hour life) only for objects belonging to published tours. Uploads and
-  deletes need `is_cms_admin()`. 50 MiB file limit; MIME allowlist `audio/mp4`,
-  `audio/m4a`, `audio/x-m4a`, `text/vtt`.
+  deletes need `is_cms_admin()`. **5 MiB (5,242,880 bytes) file limit** per
+  object, enforced by Storage itself. MIME allowlist `audio/mp4`, `audio/m4a`,
+  `audio/x-m4a`, `audio/aac`, `text/vtt`. The uploader declares the type, so
+  the allowlist catches mistakes and is not a security boundary.
 
 ### 3.3 CMS API
 
@@ -214,7 +220,9 @@ stops and returns a walkable route through them.
 
 ```mermaid
 flowchart TD
-  A[Parse & validate body] --> B[get_tour_bundle AS CALLER<br/>404 if not visible]
+  L{Rate limit<br/>per IP + global} -- refused --> T[429 + Retry-After]
+  L -- allowed --> A[Parse & validate body]
+  A --> B[get_tour_bundle AS CALLER<br/>404 if not visible]
   B --> C[Smart Sorter<br/>shared/src/smartSorter.ts]
   C --> D{Isolate memory cache<br/>keyed on ordered coordinates}
   D -- hit --> R[200]
@@ -279,6 +287,35 @@ route.
 | **At most one provider call** per request, spanning the first to last missing hop | Stadia bills per request, not per leg. |
 | **Service role only** | A writable shared cache would let anyone forge a route onto every phone. |
 | **The cache never fails a request** | Read errors route uncached; write errors are logged. |
+
+#### Rate limiting ("The Shield")
+
+Every `POST` spends one token from **two buckets at once, or from neither**.
+This runs before the body is read or the database is asked:
+
+| Bucket | Default | Protects against |
+|---|---|---|
+| **Client**: per IP (IPv6 grouped by /64) | burst 20, refill 10/min | One device or script bursting |
+| **Global**: the whole function | burst 300, refill 120/min | IP rotation draining the routing budget |
+
+- **State is in Postgres** (`consume_rate_limit()`, service role), not isolate
+  memory. Requests spread across isolates, so a per-isolate counter would
+  multiply the limit by the isolate count.
+- **All-or-nothing:** a request refused by its IP bucket does not drain the
+  global bucket.
+- **No raw IPs are stored.** The bucket key is an HMAC of the address, keyed by
+  a server secret.
+- **Address source:** `cf-connecting-ip`, then `x-real-ip`, then the first
+  `x-forwarded-for` entry. No address means the global bucket only, logged once
+  per isolate.
+- **Fails open:** if the store errors or takes longer than 1 s, the request
+  proceeds and `route_stops_rate_limit_unavailable` is logged. It is also off
+  without the service role key.
+- **Tunable without a redeploy** through secrets
+  `ROUTE_RATE_LIMIT_{CLIENT,GLOBAL}_{BURST,PER_MINUTE}`.
+- A refusal returns **`429 too_many_requests`** with `Retry-After` in seconds.
+  The provider's own limit stays `429 rate_limited`. For a visitor, a refusal
+  only delays the live route: the bundled route stays drawn.
 
 **Status codes the app relies on:** `404` / `501` and other permanent 4xx mean
 *stop asking this session*; `401`, `408`, `429` and `5xx` are retried with backoff.
@@ -470,9 +507,9 @@ that has not passed it.
 | **True peak** | −1.5 dBTP (re-measured ceiling −1.0) | AAC encoding adds 0.5–1 dB of overshoot. |
 | **Verification** | Encoded file **re-measured**; must land within ±1.0 LU | `lufs_normalization = -16` is stored only when it is true. |
 | **Channels / rate** | Mono, 48 kHz explicit | Halves bundle size; stops `loudnorm` handing the encoder a 192 kHz stream. |
-| **Bitrate** | 96 kbps | Transparent for speech; ≈ 2.2 MB for a 3-minute stop. |
+| **Bitrate** | 96 kbps; **64 kbps** when a track would not fit 5 MiB at 96 | 96 is transparent for speech (≈ 2.2 MB for a 3-minute stop). The approved range is 64–96 kbps. The bitrate is chosen from the probed duration **before** encoding, and a step-down adds a warning. |
 | **Filter** | 80 Hz high-pass | Removes handling noise and wind rumble below the voice. |
-| **Limits** | Source ≤ 60 min and ≤ 500 MiB; output ≤ 50 MiB (bucket limit); transcript ≤ 512 KiB | — |
+| **Limits** | Source ≤ 60 min and ≤ 500 MiB; **output ≤ 5 MiB** (5,242,880 bytes: about 6.8 min at 96 kbps, 10 min at 64); transcript ≤ 512 KiB | PM hard limit (Epic 10). The same number is enforced in four places: pipeline, bucket `file_size_limit`, the `audio_tracks` CHECK and `npm run test:cms`, which pins them together. A longer recording is refused before encoding, with a message to split it. |
 
 `audio_tracks.format` is `AAC` (`MP3` is permitted by the schema as an emergency
 fallback only). The file extension must match the codec: AVFoundation infers
@@ -548,10 +585,11 @@ needs a PM decision or a task; none should be assumed.
 | **Audio ducking** to 20% under navigation prompts | Removed; `doNotMix`, unity volume | PM decision TASK-502. The PRD is out of date. |
 | **Zone-exit fade-out** (2 s) | Abrupt stop (`fadeOutAndStop` TODO) | Open: stepped volume ramp not built. |
 | **Opus** encoding | AAC-LC only | Abandoned (iOS). Do not reintroduce. |
-| **Max 1.5 MB per file** | No per-file cap below the 50 MiB bucket limit; ≈ 2.2 MB per 3 min at 96 kbps | Open: 1.5 MB would mean ≤ ~2 min per stop at 96 kbps, or a lower bitrate. Needs a decision before content injection. |
+| **Max 1.5 MB per file** (PRD) | 5 MiB hard limit, 64–96 kbps | Superseded by PM decision (Epic 10, TASK-1002). Migration `20260917180100` is not yet pushed to production. |
 | **Skip to next stop** for a missed zone | Only the debug manual trigger; a missed zone blocks the remaining stops | Post-MVP backlog |
 | **Proximity-based start** (`preferences.start`) | Not sent; scored routes start at the first authored stop | Post-MVP backlog |
-| **Rate limiting** of `route-stops` | None; each uncached call costs a provider request | Open (production readiness) |
+| **Rate limiting** of `route-stops` | Per-IP + global token buckets in Postgres (§3.4) | Built (TASK-1001). Not yet deployed: migration `20260917180000` and the function await approval. Limits are provisional until the routing budget is set. |
+| **MP3 fallback** (TASK-301) | `audio/mpeg` removed from the bucket allowlist; `audio_tracks.format` still accepts `MP3` | AAC-only by PM decision. The format CHECK is left for a separate decision. |
 | **"Public CDN"** audio URLs (PRD Screen 2) | Private bucket, 1-hour signed URLs | PRD is out of date. |
 | **Android background tracking** | Pauses in the background | Foreground service planned |
 | **User itineraries sync** | Schema and RPC exist; app does not use them | Unscheduled |
@@ -563,10 +601,10 @@ needs a PM decision or a task; none should be assumed.
 | Area | Path |
 |---|---|
 | Migrations & seeds | `supabase/migrations/`, `supabase/seed.sql`, `prod_test_seed.sql` |
-| Edge Function | `supabase/functions/route-stops/` (`handler.ts` contract, `legCache.ts`, `routeCache.ts`) |
+| Edge Function | `supabase/functions/route-stops/` (`handler.ts` contract, `legCache.ts`, `routeCache.ts`, `rateLimit.ts`) |
 | Shared (Deno + Node + Metro) | `shared/src/` (`smartSorter.ts`, `polyline.ts`, `routeTolerance.ts`, `routing/valhalla.ts`) |
 | CMS ingest | `backend/cms/` |
-| Media pipeline | `backend/media/` (`presets.ts` is the audio standard) |
+| Media pipeline | `backend/media/` (`presets.ts` is the audio standard, per-file limit and bitrate planning) |
 | Session owner | `mobile/src/session/TourSessionController.ts` |
 | GPS + geofencing | `mobile/src/services/location/` (`LocationService.ts`, `stopSequence.ts`, `geometry.ts`) |
 | Transit profiles | `mobile/src/config/transitProfiles.ts` |
