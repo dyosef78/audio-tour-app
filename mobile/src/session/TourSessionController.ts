@@ -15,6 +15,7 @@ import { signedAudioUrls } from '../services/supabase/client';
 import { routeCriteria } from '../personalization/options';
 import { usePreferences } from '../personalization/preferencesStore';
 import { decodeRoute } from '../routing/routeGeometry';
+import { routePreferencesOf } from '../routing/routeRequest';
 import { selectStops } from '../routing/stopSelection';
 import { remoteTranscripts } from '../transcript/TranscriptRepository';
 import { routeManager } from './routing';
@@ -199,7 +200,7 @@ class TourSessionController {
       tourId,
       transitMode,
       stops: selection.active,
-      preferences: criteria ? { groupType: criteria.groupType, interests: criteria.interests } : null,
+      preferences: routePreferencesOf(criteria),
       staticRoute: this.loadStaticRoute(tourId, selection.active, transitMode),
       bundleHash: TourBundleRepository.readManifest(tourId)?.bundle_version_hash ?? null,
       onStopOrder: (waypointIds) => this.adoptStopOrder(service, waypointIds),

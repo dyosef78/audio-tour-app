@@ -10,6 +10,8 @@
  * Run:  npm run test:ui
  */
 
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { mock } from 'node:test';
 
 import {
@@ -19,6 +21,8 @@ import {
   routeCriteria,
   TIME_BUDGETS,
   tourFitsBudget,
+  type GroupType,
+  type Interest,
 } from '../src/personalization/options.ts';
 import { refreshCities, refreshCitiesWithin, useCityCatalogue } from '../src/personalization/cityCatalogue.ts';
 import {
@@ -59,6 +63,7 @@ import {
   formatLocalTime,
   parseRouteOrder,
   predictStopOrder,
+  routePreferencesOf,
   routeRequestBody,
 } from '../src/routing/routeRequest.ts';
 import { LocationService, type GeofenceEvent } from '../src/services/location/LocationService.ts';
@@ -305,6 +310,93 @@ eq(
   cityCatalogueFilter('x,status.eq.draft'),
   null,
 );
+
+heading('TASK-1103: the wizard produces the route-stops contract');
+{
+  const contract = JSON.parse(
+    readFileSync(join(import.meta.dirname, '../../shared/src/contracts/route-stops.onboarding.json'), 'utf8'),
+  ) as {
+    wizard: { city_slug: string; group_type: 'family_kids'; interests_in_tap_order: Interest[]; time_budget: 'half_day' };
+    stops: { waypoint_id: string; sort_order: number; poi_type: string; lon: number; lat: number; audiences: GroupType[]; interests: Interest[] }[];
+    request: { tour_id: string; waypoint_ids: string[]; transit_mode: 'walking'; context: { local_time: string } };
+    expected_order: string[];
+    expected_order_without_preferences: string[];
+  };
+
+  // Drive the REAL store through the wizard, as the screens do.
+  const store = usePreferences.getState();
+  store.resetPreferences();
+  store.setCity(TLV.id);
+  store.setGroupType(contract.wizard.group_type);
+  for (const interest of contract.wizard.interests_in_tap_order) usePreferences.getState().toggleInterest(interest);
+  store.setTimeBudget(contract.wizard.time_budget);
+  store.completeOnboarding();
+
+  // The same two calls TourSessionController.start() makes.
+  const criteria = routeCriteria(usePreferences.getState());
+  const preferences = routePreferencesOf(criteria);
+  const stops: Waypoint[] = contract.stops.map((s) => ({
+    id: s.waypoint_id,
+    tourId: contract.request.tour_id,
+    name: s.waypoint_id,
+    poiType: s.poi_type as Waypoint['poiType'],
+    coordinate: { latitude: s.lat, longitude: s.lon },
+    sortOrder: s.sort_order,
+    geofence: null,
+    audio: null,
+    audiences: s.audiences,
+    interests: s.interests,
+  }));
+  const body = routeRequestBody({
+    tourId: contract.request.tour_id,
+    waypointIds: selectStops(stops, criteria).active.map((w) => w.id),
+    transitMode: 'walking',
+    localTime: formatLocalTime(Date.parse(contract.request.context.local_time), 180),
+    preferences,
+  });
+
+  eq('the body the wizard builds IS the contract request, key for key', body, contract.request);
+  eq(
+    'no time budget or city in the body: they chose the tour, not the route',
+    Object.keys(body).sort(),
+    ['context', 'preferences', 'tour_id', 'transit_mode', 'waypoint_ids'],
+  );
+  eq(
+    'the device predicts the order the server must return (shared contract)',
+    predictStopOrder(stops, preferences, contract.request.context.local_time),
+    contract.expected_order,
+  );
+  const localTime = contract.request.context.local_time;
+  eq(
+    '...and only the FULL preferences produce it (none / group only / interests only / one interest)',
+    [
+      predictStopOrder(stops, null, localTime),
+      predictStopOrder(stops, { groupType: 'family_kids', interests: [] }, localTime),
+      predictStopOrder(stops, { groupType: '', interests: ['nature', 'culinary'] }, localTime),
+      predictStopOrder(stops, { groupType: 'family_kids', interests: ['nature'] }, localTime),
+    ],
+    Array(4).fill(contract.expected_order_without_preferences),
+  );
+
+  const permutations = [['culinary', 'nature'], ['nature', 'culinary']] as const;
+  eq(
+    'interest TAP order never changes the route',
+    permutations.map((interests) =>
+      predictStopOrder(stops, { groupType: 'family_kids', interests }, contract.request.context.local_time),
+    ),
+    [contract.expected_order, contract.expected_order],
+  );
+
+  store.resetPreferences();
+  const beforeOnboarding = routeRequestBody({
+    tourId: contract.request.tour_id,
+    waypointIds: contract.request.waypoint_ids,
+    transitMode: 'walking',
+    localTime: contract.request.context.local_time,
+    preferences: routePreferencesOf(routeCriteria(usePreferences.getState())),
+  });
+  eq('before onboarding completes there is no preferences key at all', 'preferences' in beforeOnboarding, false);
+}
 
 heading('City catalogue refresh');
 {

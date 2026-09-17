@@ -15,7 +15,7 @@
 | **Stack** | Supabase (PostgreSQL 15 + PostGIS, Auth, Storage, Edge Functions on Deno) · React Native 0.86 / Expo SDK 57 · TypeScript throughout |
 | **Routing** | Valhalla via Stadia Maps, behind the `route-stops` Edge Function |
 | **Audio** | AAC-LC `.m4a`, mono 48 kHz, 96 kbps (64 kbps for long tracks), EBU R128 −16 LUFS, **≤ 5 MiB per file** |
-| **Status** | Epics 1–10 closed (backend, media and infrastructure). Next: the mobile client UI, starting with the Onboarding Wizard |
+| **Status** | Epics 1–10 closed (backend, media and infrastructure). Epic 11 (Onboarding Wizard, optional sign-in, cities) built on `feat/epic-11-onboarding`; its `cities` migration is **live in production** since 18 Sep 2026. Next: TASK-1104 (account management & deletion) |
 
 ## Contents
 
@@ -606,6 +606,14 @@ The extension must match the codec because AVFoundation infers the format from i
   `npm run test:auth` asserts both.
 - **Keep `shared/` free of npm imports and use real `.ts` specifiers:** Deno,
   Node and Metro all consume it.
+- **The onboarding → `route-stops` payload is a pinned contract** (TASK-1103):
+  `shared/src/contracts/route-stops.onboarding.json`. `test:ui` drives the real
+  preferences store through the wizard and must build its `request` exactly;
+  `test:edge` sends that request to the real handler and must get its
+  `expected_order`. The stops are placed so ONLY the full preferences reorder
+  them, so a side that drops `group_type` or an interest fails. Change the wire
+  shape there first. The time budget and city are deliberately not in the
+  request: they pick the tour, not the route.
 - **Manual harnesses** (not in CI, hit a real project): `npm run sim:walk`
   (end-to-end geofence → offline file → audio), `npm run routing:ping`.
 

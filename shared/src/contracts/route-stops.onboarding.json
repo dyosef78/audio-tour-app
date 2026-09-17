@@ -1,0 +1,43 @@
+{
+  "//": [
+    "TASK-1103: the route-stops request a finished onboarding produces, pinned for BOTH sides.",
+    "mobile/scripts/test-ui-logic.ts drives the real preferences store through the wizard and must build `request` byte-for-byte;",
+    "supabase/functions/route-stops/route-stops.test.ts sends `request` to the real handler and must get `expected_order`.",
+    "Interests are listed in TAP order (nature before culinary) on purpose: the answer must not depend on it.",
+    "`stops` are chosen so ONLY the full preferences reorder them: stop 3 is 820 m out, inside the 800-840 m band where group type",
+    "alone, interests alone, or just the first interest all leave the authored order. A side that drops a field fails.",
+    "Change the payload shape here and both suites fail until both sides agree."
+  ],
+  "wizard": {
+    "city_slug": "tel-aviv",
+    "group_type": "family_kids",
+    "interests_in_tap_order": ["nature", "culinary"],
+    "time_budget": "half_day"
+  },
+  "stops": [
+    { "waypoint_id": "aaaaaaaa-0001-4000-8000-000000000001", "sort_order": 1, "poi_type": "anchor", "lon": 34.78, "lat": 32.08, "audiences": [], "interests": ["history"] },
+    { "waypoint_id": "aaaaaaaa-0001-4000-8000-000000000002", "sort_order": 2, "poi_type": "anchor", "lon": 34.78212, "lat": 32.08, "audiences": [], "interests": ["architecture"] },
+    { "waypoint_id": "aaaaaaaa-0001-4000-8000-000000000003", "sort_order": 3, "poi_type": "anchor", "lon": 34.78, "lat": 32.087366, "audiences": ["family_kids"], "interests": ["culinary", "nature"] }
+  ],
+  "request": {
+    "tour_id": "aaaaaaaa-0000-4000-8000-000000000001",
+    "waypoint_ids": [
+      "aaaaaaaa-0001-4000-8000-000000000001",
+      "aaaaaaaa-0001-4000-8000-000000000002",
+      "aaaaaaaa-0001-4000-8000-000000000003"
+    ],
+    "transit_mode": "walking",
+    "preferences": { "group_type": "family_kids", "interests": ["nature", "culinary"] },
+    "context": { "local_time": "2026-09-18T09:30:00+03:00" }
+  },
+  "expected_order": [
+    "aaaaaaaa-0001-4000-8000-000000000001",
+    "aaaaaaaa-0001-4000-8000-000000000003",
+    "aaaaaaaa-0001-4000-8000-000000000002"
+  ],
+  "expected_order_without_preferences": [
+    "aaaaaaaa-0001-4000-8000-000000000001",
+    "aaaaaaaa-0001-4000-8000-000000000002",
+    "aaaaaaaa-0001-4000-8000-000000000003"
+  ]
+}
