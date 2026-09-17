@@ -1,7 +1,7 @@
 -- =============================================================================
 -- TASK-1001 - Rate limiting for route-stops ("The Shield")
 --
--- STATUS: DRAFT - awaiting PM approval. Do not push.
+-- STATUS: APPROVED 17 Sep 2026 (PM, Epic 10 handover review). Safe to push.
 --
 -- WHY THE STATE LIVES IN POSTGRES, NOT IN THE FUNCTION
 --

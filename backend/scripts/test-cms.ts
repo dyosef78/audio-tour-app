@@ -362,13 +362,19 @@ eq('audio_tracks size CHECK == pipeline limit', Number(rowLimit?.[1]), MAX_AUDIO
 const mimeList = latestMatch(/allowed_mime_types\s*=\s*ARRAY\[([^\]]+)\]/);
 const mimes = [...(mimeList?.[1] ?? '').matchAll(/'([^']+)'/g)].map((m) => m[1]);
 eq(
-  'MIME allowlist is AAC containers plus transcripts',
+  'MIME allowlist is .m4a plus transcripts',
   [...mimes].sort(),
-  ['audio/aac', 'audio/m4a', 'audio/mp4', 'audio/x-m4a', 'text/vtt'],
+  ['audio/m4a', 'audio/mp4', 'audio/x-m4a', 'text/vtt'],
 );
 assert("the pipeline's upload type is allowed", mimes.includes('audio/mp4'));
 assert('the transcript upload type is allowed', mimes.includes('text/vtt'));
 assert('MP3 is no longer uploadable', !mimes.includes('audio/mpeg'));
+assert('raw ADTS .aac is no longer uploadable', !mimes.includes('audio/aac'));
+
+const formatCheck = latestMatch(/audio_tracks_format_check\s+CHECK \(([^)]*)\)/);
+eq('audio_tracks.format accepts AAC only', formatCheck?.[1], "format = 'AAC'");
+const register = latestMatch(/FUNCTION public\.cms_register_audio_track\([\s\S]*?\$fn\$;/);
+assert('cms_register_audio_track no longer derives MP3', register !== null && !/THEN 'MP3'|[.]mp3/.test(register[0]));
 
 heading('TASK-1002: bitrate planning');
 
