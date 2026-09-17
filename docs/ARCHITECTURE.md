@@ -2,7 +2,9 @@
 
 > **Single Source of Truth.** This document describes the system as it is
 > implemented on `main` after Epic 9 (17 Sep 2026), plus the Epic 10 work on
-> `feat/epic-10-content-qa` (route-stops rate limiting, 5 MiB per-file limit). Where it disagrees with an
+> `feat/epic-10-content-qa` (route-stops rate limiting, 5 MiB per-file limit,
+> AAC-only format, streamed transcripts). That work is **live in production**.
+> The branch is not yet merged. Where it disagrees with an
 > older document (`prd_user_flows.md`, `architecture_schema.md`), this one wins.
 > Where it disagrees with the code, the code wins and this document has a bug.
 >
@@ -136,7 +138,7 @@ erDiagram
 | `tours` | A tour. `status` draft/published/archived, `topology` (in_city, point_to_point, star_loop), `transit_mode` (walking, biking, driving), `audiences[]`, `interests[]`, optional bundled `route` (LineString), derived start point. | Tags ⊆ vocabulary functions; route valid with ≥ 2 points. |
 | `waypoints` | A stop. `geom` Point, `sort_order` (authored order), `poi_type` (anchor, transition, viewpoint, facility), `audiences[]`, `interests[]`. | GiST + geography indexes. |
 | `geofence_zones` | Trigger zone per stop: `radius` (with `trigger_radius_meters`) or `polygon`. | Radius zones must carry a radius. |
-| `audio_tracks` | One file per stop per `track_kind` (`narration`, `deep_dive`). `storage_path` (bucket-relative, never a URL), `size_bytes`, `duration_seconds`, `format`, `lufs_normalization`. | Unique per (waypoint, kind); relative path; `format` AAC/MP3 (MP3 can no longer be uploaded, see §7); **`size_bytes` ≤ 5,242,880**. |
+| `audio_tracks` | One file per stop per `track_kind` (`narration`, `deep_dive`). `storage_path` (bucket-relative, never a URL), `size_bytes`, `duration_seconds`, `format`, `lufs_normalization`. | Unique per (waypoint, kind); relative path; `format` **AAC only**, path must end `.m4a`; **`size_bytes` ≤ 5,242,880**. |
 | `route_legs_cache` | Durable cache of routed legs between two stops (Epic 8). | **Service role only**; RLS on with no policies. |
 | `rate_limit_buckets` | Token buckets for `route-stops` rate limiting (Epic 10). `UNLOGGED`: a crash leaves every bucket full. | **Service role only**; RLS on with no policies; written only through `consume_rate_limit()`. |
 | `app_admins` | CMS administrators roster. | Deny-all RLS; read only via `is_cms_admin()`. |
@@ -169,8 +171,9 @@ CMS admins.
   (1-hour life) only for objects belonging to published tours. Uploads and
   deletes need `is_cms_admin()`. **5 MiB (5,242,880 bytes) file limit** per
   object, enforced by Storage itself. MIME allowlist `audio/mp4`, `audio/m4a`,
-  `audio/x-m4a`, `audio/aac`, `text/vtt`. The uploader declares the type, so
-  the allowlist catches mistakes and is not a security boundary.
+  `audio/x-m4a`, `text/vtt`: `.m4a` audio and transcripts only. The uploader
+  declares the type, so the allowlist catches mistakes and is not a security
+  boundary.
 
 ### 3.3 CMS API
 
@@ -307,7 +310,10 @@ This runs before the body is read or the database is asked:
   a server secret.
 - **Address source:** `cf-connecting-ip`, then `x-real-ip`, then the first
   `x-forwarded-for` entry. No address means the global bucket only, logged once
-  per isolate.
+  per isolate. **Spoofing was verified closed on production (17 Sep 2026):**
+  forged `X-Forwarded-For`, `X-Real-IP` and `True-Client-IP` headers do not
+  change a caller's bucket, and Cloudflare rejects a client-supplied
+  `cf-connecting-ip` with 403 before it reaches Supabase.
 - **Fails open:** if the store errors or takes longer than 1 s, the request
   proceeds and `route_stops_rate_limit_unavailable` is logged. It is also off
   without the service role key.
@@ -351,7 +357,10 @@ Tapping **Download** on Tour Detail:
 
 Files live under `<documents>/<tourId>/media/<storage_path>`. A new
 `bundle_version_hash` means a new bundle. If a file later disappears from disk
-while online, playback streams the same object through a signed URL instead.
+while online, playback streams the same object through a signed URL instead,
+and **fetches that track's `.vtt` transcript alongside it** (held in memory,
+never written into the bundle), so the karaoke text survives the fallback. A
+bundled transcript always wins over a streamed one.
 
 ### 4.2 Adaptive GPS
 
@@ -511,9 +520,10 @@ that has not passed it.
 | **Filter** | 80 Hz high-pass | Removes handling noise and wind rumble below the voice. |
 | **Limits** | Source ≤ 60 min and ≤ 500 MiB; **output ≤ 5 MiB** (5,242,880 bytes: about 6.8 min at 96 kbps, 10 min at 64); transcript ≤ 512 KiB | PM hard limit (Epic 10). The same number is enforced in four places: pipeline, bucket `file_size_limit`, the `audio_tracks` CHECK and `npm run test:cms`, which pins them together. A longer recording is refused before encoding, with a message to split it. |
 
-`audio_tracks.format` is `AAC` (`MP3` is permitted by the schema as an emergency
-fallback only). The file extension must match the codec: AVFoundation infers
-format from it.
+`audio_tracks.format` is always `AAC`, and the path must end `.m4a`. Both are
+validated constraints, and `cms_register_audio_track` refuses any other
+extension. **MP3, raw ADTS `.aac` and Opus are not supported** (PM, Epic 10).
+The extension must match the codec because AVFoundation infers the format from it.
 
 ### 5.3 Playback logic
 
@@ -526,7 +536,7 @@ format from it.
 | **Zone exit** | An exit stops **only the track its own stop owns**, recorded as `audio_stopped`. The fade is **not yet implemented**; the stop is abrupt. See §7. |
 | **Deep Dive** | Survives its stop's exit; the next stop's narration displaces it. |
 | **Failure safety** | `.opus/.ogg/.oga/.webm` refused on iOS before a player is created. 5 s load and 8 s stall watchdogs, because `expo-audio` has no error event. Every failure resets the transport UI rather than leaving it at "playing 0:00". |
-| **Subtitles** | WebVTT sidecar parsed on the device (cue text, entities and voice tags handled; a sentence-level subset). The line under the playhead is highlighted, with right-to-left text supported, and a seek moves the highlight at once. |
+| **Subtitles** | WebVTT sidecar parsed on the device (cue text, entities and voice tags handled; a sentence-level subset). The line under the playhead is highlighted, with right-to-left text supported, and a seek moves the highlight at once. A streamed track's transcript is fetched beside it (§4.1). |
 
 ---
 
@@ -585,11 +595,11 @@ needs a PM decision or a task; none should be assumed.
 | **Audio ducking** to 20% under navigation prompts | Removed; `doNotMix`, unity volume | PM decision TASK-502. The PRD is out of date. |
 | **Zone-exit fade-out** (2 s) | Abrupt stop (`fadeOutAndStop` TODO) | Open: stepped volume ramp not built. |
 | **Opus** encoding | AAC-LC only | Abandoned (iOS). Do not reintroduce. |
-| **Max 1.5 MB per file** (PRD) | 5 MiB hard limit, 64–96 kbps | Superseded by PM decision (Epic 10, TASK-1002). Migration `20260917180100` is not yet pushed to production. |
+| **Max 1.5 MB per file** (PRD) | 5 MiB hard limit, 64–96 kbps | Superseded by PM decision (Epic 10, TASK-1002). Live in production since 17 Sep 2026 (migration `20260917180100`). |
 | **Skip to next stop** for a missed zone | Only the debug manual trigger; a missed zone blocks the remaining stops | Post-MVP backlog |
 | **Proximity-based start** (`preferences.start`) | Not sent; scored routes start at the first authored stop | Post-MVP backlog |
-| **Rate limiting** of `route-stops` | Per-IP + global token buckets in Postgres (§3.4) | Built (TASK-1001). Not yet deployed: migration `20260917180000` and the function await approval. Limits are provisional until the routing budget is set. |
-| **MP3 fallback** (TASK-301) | `audio/mpeg` removed from the bucket allowlist; `audio_tracks.format` still accepts `MP3` | AAC-only by PM decision. The format CHECK is left for a separate decision. |
+| **Rate limiting** of `route-stops` | Per-IP + global token buckets in Postgres (§3.4) | Live in production since 17 Sep 2026 (TASK-1001). The global 120/min is PM-approved **for now**, to be recalibrated when the Stadia budget is final. |
+| **MP3 fallback** (TASK-301) | Removed: not uploadable, not registrable, refused by the format constraint | AAC-LC `.m4a` only (PM, Epic 10). `transcript_path_for()` / `sidecar.ts` still map `.mp3`; that branch is unreachable. |
 | **"Public CDN"** audio URLs (PRD Screen 2) | Private bucket, 1-hour signed URLs | PRD is out of date. |
 | **Android background tracking** | Pauses in the background | Foreground service planned |
 | **User itineraries sync** | Schema and RPC exist; app does not use them | Unscheduled |

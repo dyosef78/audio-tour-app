@@ -37,8 +37,9 @@ export interface RateLimitPolicy {
 }
 
 /**
- * PROVISIONAL numbers, pending the PM's routing budget. Override without a
- * redeploy: `supabase secrets set ROUTE_RATE_LIMIT_CLIENT_BURST=...`.
+ * PM-approved for now (17 Sep 2026), to be recalibrated once the Stadia budget
+ * is final. Override without a redeploy:
+ * `supabase secrets set ROUTE_RATE_LIMIT_GLOBAL_PER_MINUTE=...`.
  *
  * client 20 burst, 10/min
  *   One device needs 1-3 calls per tour session (Epic 9 retry policy). The
@@ -94,10 +95,15 @@ export function rateLimitPolicyFromEnv(env: Record<string, string | undefined>):
  * Headers that may carry the caller's address, most trustworthy first.
  *
  * `cf-connecting-ip` is written by Cloudflare, which fronts the hosted API
- * gateway, and replaces whatever a client sent. `x-forwarded-for`'s FIRST entry
- * is whatever the client claimed, so it is the last resort. VERIFY ON DEPLOY
- * (see the Handover Report): send a forged `X-Forwarded-For` and confirm the
- * refusal still follows the real address.
+ * gateway. `x-forwarded-for`'s FIRST entry is whatever the client claimed
+ * wherever no proxy rewrites it, so it is the last resort.
+ *
+ * VERIFIED on hosted Supabase, 17 Sep 2026: with the caller's bucket empty,
+ * forged `X-Forwarded-For` (IPv4, IPv6, lists), `X-Real-IP` and
+ * `True-Client-IP` were still refused, 5 requests in a row each, so no
+ * forgery picks the bucket. A client-supplied `cf-connecting-ip` never
+ * arrives: Cloudflare's edge answers 403 (error 1000) before Supabase. Re-run
+ * the check if the project moves off Cloudflare-fronted hosting.
  */
 const ADDRESS_HEADERS = ['cf-connecting-ip', 'x-real-ip', 'x-forwarded-for'] as const;
 
