@@ -15,7 +15,7 @@
 | **Stack** | Supabase (PostgreSQL 15 + PostGIS, Auth, Storage, Edge Functions on Deno) · React Native 0.86 / Expo SDK 57 · TypeScript throughout |
 | **Routing** | Valhalla via Stadia Maps, behind the `route-stops` Edge Function |
 | **Audio** | AAC-LC `.m4a`, mono 48 kHz, 96 kbps (64 kbps for long tracks), EBU R128 −16 LUFS, **≤ 5 MiB per file** |
-| **Status** | Epics 1–10 closed (backend, media and infrastructure). Next: the mobile client UI, starting with the Onboarding Wizard |
+| **Status** | Epics 1–10 closed. **Epic 11 (Mobile UI & Onboarding Wizard) is feature-complete and awaiting on-device QA** (§6.4). Its branch `feat/epic-11-onboarding` is **held and NOT merged to `main`** until the engineering team clears that pass, so the mobile code described in §4 is on that branch, not here. Already live in production regardless: the `cities` migration and the `delete-account` Edge Function |
 
 ## Contents
 
@@ -25,7 +25,7 @@
 4. [Mobile client](#4-mobile-client)
 5. [Content & audio](#5-content--audio)
 6. [Development workflow](#6-development-workflow)
-7. [Spec vs. implementation](#7-spec-vs-implementation)
+7. [Spec vs. implementation](#7-spec-vs-implementation) · [Post-MVP backlog](#71-post-mvp-backlog)
 8. [Code map](#8-code-map)
 
 ---
@@ -56,8 +56,11 @@ it. So:
 
 Onboarding asks three questions: **group type** (`solo`, `couple`, `friends`,
 `family_kids`), **interests** (`history`, `culinary`, `nature`, `architecture`,
-`art_culture`) and a **time budget**. These ids are also the database tag
-vocabulary. They personalise a tour in three layers:
+`art_culture`) and a **time budget** (`quick` 120 min, `half_day` 240,
+`full_day` 480). These ids are also the database tag vocabulary. Culinary is
+one tag: street food, markets and fine dining are how the screen presents it,
+not separate ids (PM, Epic 11). Before them, the app picks the **city**, which
+scopes Discovery (§4). The preferences personalise a tour in three layers:
 
 | Layer | Where | Effect |
 |---|---|---|
@@ -122,6 +125,7 @@ matching indexes), never degree arithmetic.
 
 ```mermaid
 erDiagram
+  cities ||--o{ tours : lists
   tours ||--o{ waypoints : has
   waypoints ||--o{ geofence_zones : has
   waypoints ||--o{ audio_tracks : has
@@ -133,7 +137,8 @@ erDiagram
 
 | Table | Purpose | Key constraints |
 |---|---|---|
-| `tours` | A tour. `status` draft/published/archived, `topology` (in_city, point_to_point, star_loop), `transit_mode` (walking, biking, driving), `audiences[]`, `interests[]`, optional bundled `route` (LineString), derived start point. | Tags ⊆ vocabulary functions; route valid with ≥ 2 points. |
+| `cities` | A city visitors can choose (Epic 11). `slug`, `name`, `country_code`, `center` (geography Point). | Readable only while the city has a published tour; admin-only writes. |
+| `tours` | A tour. `city_id` (nullable; required to publish), `status` draft/published/archived, `topology` (in_city, point_to_point, star_loop), `transit_mode` (walking, biking, driving), `audiences[]`, `interests[]`, optional bundled `route` (LineString), derived start point. | Tags ⊆ vocabulary functions; route valid with ≥ 2 points. |
 | `waypoints` | A stop. `geom` Point, `sort_order` (authored order), `poi_type` (anchor, transition, viewpoint, facility), `audiences[]`, `interests[]`. | GiST + geography indexes. |
 | `geofence_zones` | Trigger zone per stop: `radius` (with `trigger_radius_meters`) or `polygon`. | Radius zones must carry a radius. |
 | `audio_tracks` | One file per stop per `track_kind` (`narration`, `deep_dive`). `storage_path` (bucket-relative, never a URL), `size_bytes`, `duration_seconds`, `format`, `lufs_normalization`. | Unique per (waypoint, kind); relative path; `format` **AAC only**, path must end `.m4a`; **`size_bytes` ≤ 5,242,880**. |
@@ -154,8 +159,28 @@ CMS admins.
 
 - **Supabase Auth** issues **JWTs** (1-hour expiry). Sign-in is **OAuth2 via
   Google and Apple**; email sign-up is disabled; anonymous sign-in is off.
-- **The mobile app does not sign in.** It uses the anon key, which ships inside
-  the app, for published content and telemetry.
+- **Sign-in on the phone is optional (Epic 11, TASK-1102).** Guest is the
+  default and loses nothing: every grant the app uses is `TO anon, authenticated`,
+  and telemetry is keyed by device, not user. Apple (iOS) and Google hand an ID
+  token to `signInWithIdToken`, with no browser redirect. Google stays hidden until
+  `EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID` (and, on iOS, `EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID`)
+  are set.
+- **The session is encrypted at rest** (`secureSessionStorage.ts`). An AES-256-GCM
+  key in the Keychain/Keystore, `AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY` so a
+  locked-phone tour can still read it; the ciphertext is in AsyncStorage. A
+  keychain read that throws keeps the session and is retried on foreground. A
+  session whose key is gone (restored from a backup) is discarded, which signs
+  the user out, and never crashes.
+- **Account deletion (TASK-1104, App Store 5.1.1(v)).** Settings > Account >
+  Delete account calls the `delete-account` Edge Function. The function takes
+  the user ONLY from the verified token, refuses CMS administrators (403; the
+  team removes those), and hard-deletes with `auth.admin.deleteUser`. That
+  cascades to identities, sessions and `user_itineraries`. Apple users confirm
+  with Apple first; the fresh authorization code lets the function revoke their
+  Apple tokens when the `APPLE_*` secrets are set (recommended by Apple, not
+  required; deletion never depends on it). Telemetry is not deleted because it
+  is not linked to accounts: events carry a random device id and no user id.
+  Downloads and preferences stay on the phone.
 - **Authorisation lives in the database, not in roles.** Because the anon key
   is public and OAuth sign-in is open to anyone with a Google or Apple account,
   `TO authenticated` grants nothing on its own. Every protected policy and RPC
@@ -185,7 +210,8 @@ so RLS remains the enforcement layer.
 | `cms_replace_tour_waypoints` | Replace a tour's stops and geofences atomically from JSON. |
 | `cms_register_audio_track` | Register an uploaded file for a stop and track kind. |
 | `cms_set_tour_route` | Store the bundled route polyline (validated against the stops). |
-| `cms_validate_tour` | Report everything that blocks publishing. |
+| `cms_set_tour_city` | Put a tour under a city. Cannot be cleared. |
+| `cms_validate_tour` | Report everything that blocks publishing, including `tour_without_city`. |
 | `cms_publish_tour` / `cms_set_tour_status` | Lifecycle transitions. |
 
 The **ingest service** (`backend/cms`) carries the **admin's own access token**,
@@ -333,8 +359,17 @@ own:** `TourSessionController` is the single owner of GPS and audio hardware.
 
 ```mermaid
 flowchart LR
-  Onboarding --> Discovery --> Detail[Tour Detail<br/>download] --> Active[Active Tour<br/>map + player sheet]
+  Welcome[Welcome<br/>optional sign-in] --> City[City<br/>only if 2+] --> Prefs[Group → Interests → Time] --> Discovery --> Detail[Tour Detail<br/>download] --> Active[Active Tour<br/>map + player sheet]
 ```
+
+**Onboarding (Epic 11).** Welcome is shown once. Its primary action is
+*Continue without account*; Apple (iOS) and Google sign-in are optional (§3.2).
+The City step appears only when two or more cities have published tours. With
+one, it is selected silently; with no city list (offline first run), Discovery
+resolves it later. Discovery lists the saved city's tours, plus any tour with no
+city. Downloaded tours shown offline are never filtered by city. Bundles stay
+per tour, downloaded from Tour Detail. The rules are pure functions in
+`personalization/onboardingFlow.ts`, covered by `test:ui`.
 
 ### 4.1 Offline pre-fetch bundle
 
@@ -564,7 +599,7 @@ The extension must match the codec because AVFoundation infers the format from i
 
 | CI workflow | Runs on | Checks |
 |---|---|---|
-| `checks.yml` | Every push | Typecheck backend + shared and the mobile app; routing, CMS contract, app logic (`test:ui`) and telemetry tests; Deno typecheck and Edge Function tests |
+| `checks.yml` | Every push | Typecheck backend + shared and the mobile app; routing, CMS contract, app logic (`test:ui`), auth storage and account deletion (`test:auth`) and telemetry tests; Deno typecheck and Edge Function tests |
 | `db-verify.yml` | Changes to migrations, seed, `config.toml` | Fresh `supabase db reset`, bundle verification as anon, generated types match `backend/types/supabase.ts` |
 
 ### 6.3 Rules that cost hours when forgotten
@@ -576,10 +611,36 @@ The extension must match the codec because AVFoundation infers the format from i
 - **Never run `types:generate` blind:** errors are written into
   `backend/types/supabase.ts`.
 - **`TO authenticated` is a public grant** (§3.2).
+- **Never put the auth session back in plain AsyncStorage**, and never weaken
+  its keychain accessibility to `WHEN_UNLOCKED`: the background tour runs locked.
+  `npm run test:auth` asserts both.
 - **Keep `shared/` free of npm imports and use real `.ts` specifiers:** Deno,
   Node and Metro all consume it.
+- **The onboarding → `route-stops` payload is a pinned contract** (TASK-1103):
+  `shared/src/contracts/route-stops.onboarding.json`. `test:ui` drives the real
+  preferences store through the wizard and must build its `request` exactly;
+  `test:edge` sends that request to the real handler and must get its
+  `expected_order`. The stops are placed so ONLY the full preferences reorder
+  them, so a side that drops `group_type` or an interest fails. Change the wire
+  shape there first. The time budget and city are deliberately not in the
+  request: they pick the tour, not the route.
 - **Manual harnesses** (not in CI, hit a real project): `npm run sim:walk`
   (end-to-end geofence → offline file → audio), `npm run routing:ping`.
+
+### 6.4 Epic 11 — feature-complete, awaiting device QA
+
+Branch `feat/epic-11-onboarding` (head `0622216`), CI green. **Not merged to
+`main`**: the on-device pass owns animations, UI scaling at large text sizes,
+the native Apple/Google flows, offline states, and the one path no automated
+test could reach — deleting a real account with live Apple and Google test
+accounts.
+
+| Task | Built | Live in production? |
+|---|---|---|
+| **TASK-1101** Onboarding | Welcome → City → Group → Interests → Time (§4). Interests are tinted bubbles led by a featured Culinary bubble; time budgets 120/240/480 min. WCAG AA contrast is computed by `test:ui`, which also fixed a pre-existing failure in the TASK-601 cards (`colors.inkSecondary`). | **Yes, the `cities` migration** (18 Sep). Backfilled the Tel Aviv tour; every bundle hash unchanged. The app itself is on the branch. |
+| **TASK-1102** Session & auth | Guest-first: sign-in is optional and grants nothing on the server. The session is encrypted with AES-GCM from `expo-crypto`, keyed from the Keychain/Keystore so a locked-phone tour can still read it (§3.2). | No (branch) |
+| **TASK-1103** Wire contract | `shared/src/contracts/route-stops.onboarding.json` pins the wizard → `route-stops` payload for both sides (§6.3). | n/a (test fixture) |
+| **TASK-1104** Account deletion | Settings → Account → Delete account, and the `delete-account` Edge Function: hard delete, CMS admins refused, Apple token revocation when the secrets are set (§3.2). Telemetry is deliberately **not** purged — it carries a random device id and no user id, so nothing in it is account-linked, and linking it would be the less private design. | **Yes, the function** (18 Sep). Live checks passed: 405/401/400, and a real admin session refused with 403 while keeping its CMS rights. |
 
 ---
 
@@ -591,16 +652,35 @@ needs a PM decision or a task; none should be assumed.
 | Spec | Reality | Status |
 |---|---|---|
 | **Audio ducking** to 20% under navigation prompts | Removed; `doNotMix`, unity volume | PM decision TASK-502. The PRD is out of date. |
-| **Zone-exit fade-out** (2 s) | Abrupt stop (`fadeOutAndStop` TODO) | Open: stepped volume ramp not built. |
+| **Zone-exit fade-out** (2 s) | Abrupt stop (`fadeOutAndStop` TODO) | Post-MVP backlog (PM, Epic 11 wrap-up). Deferred from Epic 1; the stepped volume ramp is not built. |
 | **Opus** encoding | AAC-LC only | Abandoned (iOS). Do not reintroduce. |
 | **Max 1.5 MB per file** (PRD) | 5 MiB hard limit, 64–96 kbps | Superseded by PM decision (Epic 10, TASK-1002). Live in production since 17 Sep 2026 (migration `20260917180100`). |
 | **Skip to next stop** for a missed zone | Only the debug manual trigger; a missed zone blocks the remaining stops | Post-MVP backlog |
 | **Proximity-based start** (`preferences.start`) | Not sent; scored routes start at the first authored stop | Post-MVP backlog |
+| **In-app account deletion** (App Store guideline 5.1.1(v)) | Built (TASK-1104); the `delete-account` Edge Function is **live in production** since 18 Sep 2026 | Two things outstanding before submission: the `APPLE_TEAM_ID` / `APPLE_KEY_ID` / `APPLE_CLIENT_ID` / `APPLE_PRIVATE_KEY` secrets, without which Apple token revocation is skipped (recommended by Apple; deletion is compliant without it), and one live deletion of a real account during device QA — this workstation has no service-role key and signup is closed, so no throwaway user could be made. |
+| **Future trip planning** (travel dates, time-simulated routing) | Routing scores the device's current `context.local_time`; onboarding asks for no dates | Post-MVP backlog (PM, Epic 11 kickoff). The server already takes any `local_time`, so the backend gap is small; the work is the dates UI and offline bundles for a trip that is weeks away. |
+| **Precise kids' ages** scoring | One `family_kids` audience tag; no ages collected | Post-MVP backlog (PM, Epic 11 kickoff) |
+| **User-selectable bicycle / car modes** | Walking only in onboarding. `transit_mode` belongs to the tour, and `route-stops` refuses a mismatch (400 `transit_mode_mismatch`) | Post-MVP backlog (PM, Epic 11 kickoff). The engine already has biking/driving profiles, but geofence radii are authored for each tour's own mode, so this is a content change as well as a code change. |
 | **Rate limiting** of `route-stops` | Per-IP + global token buckets in Postgres (§3.4) | Live in production since 17 Sep 2026 (TASK-1001). The global 120/min is PM-approved **for now**, to be recalibrated when the Stadia budget is final. |
 | **MP3 fallback** (TASK-301) | Removed: not uploadable, not registrable, refused by the format constraint | AAC-LC `.m4a` only (PM, Epic 10). `transcript_path_for()` / `sidecar.ts` still map `.mp3`; that branch is unreachable. |
 | **"Public CDN"** audio URLs (PRD Screen 2) | Private bucket, 1-hour signed URLs | PRD is out of date. |
 | **Android background tracking** | Pauses in the background | Foreground service planned |
-| **User itineraries sync** | Schema and RPC exist; app does not use them | Unscheduled |
+| **Cloud sync of preferences and itineraries** | Nothing syncs. Preferences and downloads are per device; `user_itineraries` and `sync_pull_itineraries()` exist but no client uses them | Post-MVP backlog (PM, Epic 11 wrap-up). **This is what would give an account user-facing value** - in the MVP it deliberately grants nothing (PM, 18 Sep), which is what the Welcome copy says. |
+
+### 7.1 Post-MVP backlog
+
+Everything above marked *Post-MVP backlog*, in one place. Each is a PM decision
+already taken, not a maybe; none is scheduled.
+
+| Item | Why it is not in the MVP |
+|---|---|
+| **Future trip planning** (travel dates, time-simulated routing) | Valid use case (PM), but it complicates every time-based rule; routing scores the device's clock today. |
+| **Bicycle / car routing modes**, user-selectable | `transit_mode` belongs to the tour and its geofence radii are authored for that mode, so this is a content change too. |
+| **Precise kids' ages** scoring | The generic `family_kids` tag carries the MVP; ages would need their own vocabulary and content tagging. |
+| **Cloud sync of preferences and itineraries** | The feature that would give an account user-facing value; in the MVP an account deliberately grants nothing. |
+| **Zone-exit fade-out** (2 s) | Deferred from Epic 1; narration stops abruptly at a zone exit. |
+| **Skip to next stop** for a missed zone | Only the debug trigger exists, so a missed zone blocks the rest of the tour. |
+| **Proximity-based start** (`preferences.start`) | The server supports it; the app does not send it, so routes start at the first authored stop. |
 
 ---
 
@@ -609,7 +689,7 @@ needs a PM decision or a task; none should be assumed.
 | Area | Path |
 |---|---|
 | Migrations & seeds | `supabase/migrations/`, `supabase/seed.sql`, `prod_test_seed.sql` |
-| Edge Function | `supabase/functions/route-stops/` (`handler.ts` contract, `legCache.ts`, `routeCache.ts`, `rateLimit.ts`) |
+| Edge Functions | `supabase/functions/route-stops/` (`handler.ts` contract, `legCache.ts`, `routeCache.ts`, `rateLimit.ts`); `supabase/functions/delete-account/` (`handler.ts` contract, `appleRevoke.ts`) |
 | Shared (Deno + Node + Metro) | `shared/src/` (`smartSorter.ts`, `polyline.ts`, `routeTolerance.ts`, `routing/valhalla.ts`) |
 | CMS ingest | `backend/cms/` |
 | Media pipeline | `backend/media/` (`presets.ts` is the audio standard, per-file limit and bitrate planning) |
@@ -621,5 +701,8 @@ needs a PM decision or a task; none should be assumed.
 | Audio | `mobile/src/services/audio/AudioService.ts` |
 | Transcripts | `mobile/src/transcript/` |
 | Telemetry | `mobile/src/services/telemetry/` |
-| Personalisation | `mobile/src/personalization/` |
-| Tests & harnesses | `mobile/scripts/` (`test-ui-logic.ts`, `simulate-walk.ts`), `backend/scripts/` |
+| Personalisation | `mobile/src/personalization/` (`preferencesStore.ts` is persisted, v2; `onboardingFlow.ts`, `cityCatalogue.ts`) |
+| Onboarding screens | `mobile/src/screens/onboarding/`, `mobile/src/components/onboarding/` |
+| Auth (optional sign-in) | `mobile/src/services/auth/` (`secureSessionStorage.ts`, `authStore.ts`, `AuthService.ts`, `accountDeletion.ts`, `AccountService.ts`) |
+| Settings & account | `mobile/src/screens/SettingsScreen.tsx`, `DeleteAccountScreen.tsx`, `mobile/src/components/auth/SignInButtons.tsx` |
+| Tests & harnesses | `mobile/scripts/` (`test-ui-logic.ts`, `test-auth.ts`, `simulate-walk.ts`), `backend/scripts/` |
