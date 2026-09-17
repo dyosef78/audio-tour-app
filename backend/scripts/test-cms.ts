@@ -16,11 +16,20 @@
  * Run:  npm run test:cms
  */
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 
 import { CmsIngestError } from '../cms/errors.ts';
 import { buildAudioStoragePath, transcriptPathFor } from '../cms/storage-path.ts';
 import { MAX_TRANSCRIPT_BYTES, checkTranscript } from '../cms/transcript-ingest.ts';
+import {
+  AAC_BITRATE_RANGE_KBPS,
+  MAX_AUDIO_FILE_BYTES,
+  NARRATION_PRESET,
+  estimateEncodedBytes,
+  maxDurationSecondsAt,
+  planBitrate,
+  withOverrides,
+} from '../media/presets.ts';
 import {
   PolylineError,
   decodePolyline,
@@ -327,6 +336,76 @@ for (const [file, tourId, waypointPrefix] of [
     assert(`${name}: route passes through "${stop.name}"`, gap < 1, `${gap.toFixed(2)} m`);
   }
 }
+
+// -----------------------------------------------------------------------------
+
+heading('TASK-1002: one 5 MiB limit in Storage, the database and the pipeline');
+
+// The LATEST migration to set each property wins, so a future migration that
+// moves the limit is what gets compared, not this one.
+const migrationFiles = readdirSync(MIGRATIONS).filter((f) => f.endsWith('.sql')).sort();
+function latestMatch(re: RegExp): RegExpExecArray | null {
+  let found: RegExpExecArray | null = null;
+  for (const f of migrationFiles) found = re.exec(read(f)) ?? found;
+  return found;
+}
+
+eq('the limit is exactly 5,242,880 bytes', MAX_AUDIO_FILE_BYTES, 5_242_880);
+eq('pipeline refuses above the limit', NARRATION_PRESET.maxOutputBytes, MAX_AUDIO_FILE_BYTES);
+
+const bucketLimit = latestMatch(/SET\s+file_size_limit\s*=\s*(\d+)/);
+eq('bucket file_size_limit == pipeline limit', Number(bucketLimit?.[1]), MAX_AUDIO_FILE_BYTES);
+
+const rowLimit = latestMatch(/CHECK \(size_bytes <= (\d+)\)/);
+eq('audio_tracks size CHECK == pipeline limit', Number(rowLimit?.[1]), MAX_AUDIO_FILE_BYTES);
+
+const mimeList = latestMatch(/allowed_mime_types\s*=\s*ARRAY\[([^\]]+)\]/);
+const mimes = [...(mimeList?.[1] ?? '').matchAll(/'([^']+)'/g)].map((m) => m[1]);
+eq(
+  'MIME allowlist is AAC containers plus transcripts',
+  [...mimes].sort(),
+  ['audio/aac', 'audio/m4a', 'audio/mp4', 'audio/x-m4a', 'text/vtt'],
+);
+assert("the pipeline's upload type is allowed", mimes.includes('audio/mp4'));
+assert('the transcript upload type is allowed', mimes.includes('text/vtt'));
+assert('MP3 is no longer uploadable', !mimes.includes('audio/mpeg'));
+
+heading('TASK-1002: bitrate planning');
+
+eq(
+  'preset bitrates span the approved range',
+  [NARRATION_PRESET.fallbackBitrateKbps, NARRATION_PRESET.bitrateKbps],
+  [AAC_BITRATE_RANGE_KBPS.min, AAC_BITRATE_RANGE_KBPS.max],
+);
+eq('3-minute narration stays at 96 kbps', planBitrate(180, NARRATION_PRESET), { ok: true, bitrateKbps: 96, reduced: false });
+eq('8-minute Deep Dive steps down to 64 kbps', planBitrate(480, NARRATION_PRESET), { ok: true, bitrateKbps: 64, reduced: true });
+
+const at96 = maxDurationSecondsAt(96, MAX_AUDIO_FILE_BYTES);
+const at64 = maxDurationSecondsAt(64, MAX_AUDIO_FILE_BYTES);
+assert('96 kbps holds at least 6.5 minutes', at96 >= 390, `${at96}s`);
+assert('64 kbps holds "nearly 10 minutes" (at least 10)', at64 >= 600, `${at64}s`);
+assert('the longest 96 kbps track is estimated to fit', estimateEncodedBytes(at96, 96) <= MAX_AUDIO_FILE_BYTES);
+eq('one second longer steps down to 64 kbps', planBitrate(at96 + 1, NARRATION_PRESET), { ok: true, bitrateKbps: 64, reduced: true });
+
+const tooLong = planBitrate(at64 + 1, NARRATION_PRESET);
+assert('past the 64 kbps ceiling it is refused before encoding', !tooLong.ok && tooLong.reason === 'too_long');
+assert(
+  'with a message that names the limit and the way out',
+  !tooLong.ok && /5 MiB/.test(tooLong.message) && /Split/.test(tooLong.message),
+  JSON.stringify(tooLong),
+);
+
+// Real encodes: the estimate must not undercut observed files. Tel Aviv QA
+// narration (live, 17 Sep 2026) at 96 kbps: 12 s in 146,708 bytes.
+assert('estimate is an upper bound for a real 96 kbps track', estimateEncodedBytes(12, 96) >= 146_708, `${estimateEncodedBytes(12, 96)}`);
+
+assert(
+  'no fallback: a long track is refused, not silently degraded',
+  !planBitrate(480, withOverrides(NARRATION_PRESET, { fallbackBitrateKbps: null })).ok,
+);
+const outOfRange = planBitrate(60, withOverrides(NARRATION_PRESET, { bitrateKbps: 128 }));
+assert('128 kbps is outside the approved range', !outOfRange.ok && outOfRange.reason === 'bitrate_out_of_range');
+assert('so is a 48 kbps fallback', !planBitrate(60, withOverrides(NARRATION_PRESET, { fallbackBitrateKbps: 48 })).ok);
 
 console.log(`\n${checks - failures}/${checks} checks passed`);
 if (failures > 0) process.exit(1);

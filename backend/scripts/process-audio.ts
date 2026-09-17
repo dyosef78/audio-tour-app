@@ -165,7 +165,7 @@ async function process_(args: ParsedArgs): Promise<number> {
   console.log(`  gain      ${result.normalizationType ?? 'unknown'}`);
 
   console.log('\nArtifact');
-  console.log(`  ${mib} MiB, ${result.durationSecondsExact.toFixed(2)}s, AAC-LC in .m4a`);
+  console.log(`  ${mib} MiB, ${result.durationSecondsExact.toFixed(2)}s, AAC-LC ${result.bitrateKbps} kbps in .m4a`);
   console.log(`  sha256 ${result.sha256}`);
 
   // The point of the whole exercise: the exact values that go in the row.

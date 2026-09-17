@@ -32,8 +32,16 @@ export type { FfmpegCapabilities } from './ffmpeg.ts';
 export { isLossySource, probeAudio } from './probe.ts';
 export type { ProbedAudio } from './probe.ts';
 
-export { NARRATION_PRESET, withOverrides } from './presets.ts';
-export type { AudioPreset } from './presets.ts';
+export {
+  AAC_BITRATE_RANGE_KBPS,
+  MAX_AUDIO_FILE_BYTES,
+  NARRATION_PRESET,
+  estimateEncodedBytes,
+  maxDurationSecondsAt,
+  planBitrate,
+  withOverrides,
+} from './presets.ts';
+export type { AudioPreset, BitratePlan } from './presets.ts';
 
 export { processNarrationAudio } from './pipeline.ts';
 export type { LoudnessReport, ProcessAudioOptions, ProcessedAudio } from './pipeline.ts';

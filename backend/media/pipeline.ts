@@ -42,7 +42,7 @@ import {
   verifyEncodedLoudness,
   type LoudnessMeasurement,
 } from './loudness.ts';
-import { NARRATION_PRESET, type AudioPreset } from './presets.ts';
+import { NARRATION_PRESET, planBitrate, type AudioPreset } from './presets.ts';
 import { isLossySource, probeAudio, type ProbedAudio } from './probe.ts';
 
 export interface ProcessAudioOptions {
@@ -84,6 +84,8 @@ export interface ProcessedAudio {
   format: 'AAC';
   /** `audio_tracks.lufs_normalization`, measured rather than assumed. */
   lufsNormalization: number;
+  /** The AAC-LC bitrate actually used: the preset's, or its fallback for a long track. */
+  bitrateKbps: number;
 
   // --- upload metadata --------------------------------------------------------
   /** Content-Type for the Storage upload; on the bucket's MIME allowlist. */
@@ -198,7 +200,7 @@ export async function processNarrationAudio(
   outputPath: string,
   options: ProcessAudioOptions = {},
 ): Promise<ProcessedAudio> {
-  const preset = options.preset ?? NARRATION_PRESET;
+  const requested = options.preset ?? NARRATION_PRESET;
   const verify = options.verify ?? true;
   const timeoutMs = options.timeoutMs;
 
@@ -206,11 +208,31 @@ export async function processNarrationAudio(
 
   // --- 1. Is this audio, and is it sane? --------------------------------------
   const probed = await probeAudio(sourcePath);
-  assertWithinLimits(probed, preset);
+  assertWithinLimits(probed, requested);
+
+  // Before any decoding: a track that cannot fit the per-file limit at any
+  // approved bitrate should cost a probe, not three passes and a failed upload.
+  const plan = planBitrate(probed.durationSeconds, requested);
+  if (!plan.ok) {
+    throw new MediaPipelineError(
+      plan.reason === 'too_long' ? 'output_too_large' : 'invalid_preset',
+      plan.message,
+    );
+  }
+  const preset: AudioPreset = { ...requested, bitrateKbps: plan.bitrateKbps };
 
   // --- 2. Measure the whole programme -----------------------------------------
   const measured = await measureLoudness(sourcePath, preset, { timeoutMs });
   const warnings = collectSourceWarnings(probed, measured);
+
+  if (plan.reduced) {
+    warnings.push(
+      `Encoded at ${plan.bitrateKbps} kbps instead of ${requested.bitrateKbps} kbps: at ` +
+        `${Math.round(probed.durationSeconds)}s the track would not fit the ` +
+        `${(requested.maxOutputBytes / 1_048_576).toFixed(0)} MiB per-file limit. Listen for smeared ` +
+        'sibilants, or split the track to keep the higher bitrate.',
+    );
+  }
 
   // --- 3. Encode -------------------------------------------------------------
   // The SAME pre-filters as the measurement pass. See the header of loudness.ts
@@ -274,8 +296,9 @@ export async function processNarrationAudio(
     throw new MediaPipelineError(
       'output_too_large',
       `Encoded file is ${(sizeBytes / 1_048_576).toFixed(1)} MiB, over the ` +
-        `${(preset.maxOutputBytes / 1_048_576).toFixed(0)} MiB bucket limit.`,
-      { detail: 'Shorten the recording or lower the bitrate for this track.' },
+        `${(preset.maxOutputBytes / 1_048_576).toFixed(0)} MiB per-file limit ` +
+        `(${preset.maxOutputBytes} bytes) at ${preset.bitrateKbps} kbps.`,
+      { detail: 'The size estimate missed for this recording; split or shorten it.' },
     );
   }
 
@@ -352,6 +375,7 @@ export async function processNarrationAudio(
     durationSecondsExact: encodedProbe.durationSeconds,
     format: 'AAC',
     lufsNormalization: preset.integratedLufs,
+    bitrateKbps: preset.bitrateKbps,
     contentType: 'audio/mp4',
     sha256: await sha256File(outputPath),
     source: {

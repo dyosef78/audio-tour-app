@@ -196,9 +196,8 @@ async function uploadArtifact(
   localPath: string,
   contentType: string,
 ): Promise<void> {
-  // The pipeline has already refused anything over the bucket's 50 MiB limit,
-  // so this read is bounded. Streaming would be tidier and is the change to
-  // make if narration ever grows into hour-long walking commentaries.
+  // The pipeline has already refused anything over the bucket's 5 MiB limit,
+  // so this read is bounded.
   let body: Buffer;
   try {
     body = await readFile(localPath);
@@ -218,7 +217,8 @@ async function uploadArtifact(
     throw new CmsIngestError('upload_failed', `Storage refused ${storagePath}: ${error.message}`, {
       detail:
         'Usually the admin session is not in app_admins, so audio_tracks_admin_insert does not ' +
-        'apply. A MIME rejection means contentType is off the bucket allowlist.',
+        'apply. A MIME rejection means contentType is off the bucket allowlist; a size ' +
+        'rejection means the object is over the 5 MiB file_size_limit.',
       cause: error,
     });
   }

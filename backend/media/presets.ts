@@ -6,6 +6,12 @@
  * without reading why it is what it is.
  */
 
+/** The PM's hard per-file limit (TASK-1002): 5 MiB, exactly 5,242,880 bytes. */
+export const MAX_AUDIO_FILE_BYTES = 5 * 1024 * 1024;
+
+/** The approved AAC-LC bitrate range for this product. */
+export const AAC_BITRATE_RANGE_KBPS = { min: 64, max: 96 } as const;
+
 export interface AudioPreset {
   /** EBU R128 integrated loudness target, LUFS. */
   integratedLufs: number;
@@ -17,8 +23,13 @@ export interface AudioPreset {
   sampleRateHz: number;
   /** 1 = mono downmix. */
   channels: number;
-  /** AAC-LC bitrate. */
+  /** AAC-LC bitrate. Must lie within AAC_BITRATE_RANGE_KBPS. */
   bitrateKbps: number;
+  /**
+   * The bitrate to step down to when a track would not fit `maxOutputBytes` at
+   * `bitrateKbps` (TASK-1002). null = never step down; refuse instead.
+   */
+  fallbackBitrateKbps: number | null;
   /** High-pass corner for rumble removal, or null to leave the source alone. */
   highPassHz: number | null;
   /** How far the ENCODED file may sit from `integratedLufs` before we reject it. */
@@ -71,11 +82,17 @@ export interface AudioPreset {
  *   through one earbud while walking. If a tour ever ships stereo field
  *   recordings, override `channels` for that track rather than changing this.
  *
- * 96 kbps AAC-LC
+ * 96 kbps AAC-LC, stepping down to 64 kbps for long tracks
  *   Transparent for speech at mono/48k. 128 kbps is inaudibly better and 33%
  *   larger; 64 kbps starts to smear sibilants. At 96 kbps a 3-minute waypoint
  *   is about 2.2 MB, so a 10-stop tour lands near 22 MB - downloadable on hotel
  *   wifi before a walk, which is the actual product constraint.
+ *
+ *   The 5 MiB per-file cap (TASK-1002) holds about 6.8 minutes at 96 kbps. A
+ *   longer track, in practice a Deep Dive, is encoded at 64 kbps (about 10
+ *   minutes) with a warning, instead of failing after a full encode. Anything
+ *   longer is refused before encoding starts. The PM's approved range is 64-96
+ *   kbps; nothing outside it is encoded.
  *
  * 80 Hz high-pass
  *   Handling noise, wind rumble and HVAC live below the voice. Removing them
@@ -97,18 +114,101 @@ export const NARRATION_PRESET: AudioPreset = {
   sampleRateHz: 48_000,
   channels: 1,
   bitrateKbps: 96,
+  fallbackBitrateKbps: 64,
   highPassHz: 80,
   toleranceLu: 1.0,
   truePeakCeilingDb: -1.0,
   maxSourceDurationSeconds: 60 * 60,
   maxSourceBytes: 500 * 1024 * 1024,
-  // 50 MiB - storage.buckets.file_size_limit for audio-tracks, set by migration
-  // 20260827160000. Rejecting here gives a real error message; letting Storage
-  // reject it gives a 413 after the whole file has been uploaded.
-  maxOutputBytes: 52_428_800,
+  // 5 MiB - storage.buckets.file_size_limit for audio-tracks, set by migration
+  // 20260917180100 (TASK-1002). Rejecting here gives a real error message;
+  // letting Storage reject it gives a 413 after the whole file has been
+  // uploaded. `npm run test:cms` pins the two numbers together.
+  maxOutputBytes: MAX_AUDIO_FILE_BYTES,
 };
 
 /** A preset with selected fields overridden. Never mutate NARRATION_PRESET. */
 export function withOverrides(preset: AudioPreset, overrides: Partial<AudioPreset>): AudioPreset {
   return { ...preset, ...overrides };
+}
+
+// -----------------------------------------------------------------------------
+// Bitrate planning (TASK-1002)
+
+/** Bytes that do not scale with duration: the ftyp and moov boxes. */
+const FIXED_OVERHEAD_BYTES = 16_384;
+
+/** Bytes per second of audio at `bitrateKbps`, including the sample table. */
+function bytesPerSecond(bitrateKbps: number): number {
+  return bitrateKbps * 125 * 1.05 + 200;
+}
+
+/**
+ * Upper estimate of an encoded .m4a's size, in bytes.
+ *
+ *   payload    kbps x 125 bytes/s, plus 5%: ffmpeg's native AAC encoder is
+ *              average-bitrate and overshoots on dense speech
+ *   index      ~200 bytes/s: the mp4 sample table stores 4 bytes for each of
+ *              the 46.9 AAC frames per second at 48 kHz, plus chunk offsets
+ *   fixed      16 KiB for the moov/ftyp boxes
+ *
+ * The estimate only chooses the bitrate. The size check after encoding still
+ * decides, so a bad estimate produces a clear error, never an oversized upload.
+ */
+export function estimateEncodedBytes(durationSeconds: number, bitrateKbps: number): number {
+  return Math.ceil(durationSeconds * bytesPerSecond(bitrateKbps) + FIXED_OVERHEAD_BYTES);
+}
+
+/** The longest track estimated to fit `maxBytes` at `bitrateKbps`, in whole seconds. */
+export function maxDurationSecondsAt(bitrateKbps: number, maxBytes: number): number {
+  return Math.max(0, Math.floor((maxBytes - FIXED_OVERHEAD_BYTES) / bytesPerSecond(bitrateKbps)));
+}
+
+export type BitratePlan =
+  | { ok: true; bitrateKbps: number; reduced: boolean }
+  | { ok: false; reason: 'bitrate_out_of_range'; message: string }
+  | { ok: false; reason: 'too_long'; message: string; maxDurationSeconds: number };
+
+/** Pick the bitrate a track of `durationSeconds` is encoded at, or say why none fits. */
+export function planBitrate(durationSeconds: number, preset: AudioPreset): BitratePlan {
+  const { min, max } = AAC_BITRATE_RANGE_KBPS;
+  for (const kbps of [preset.bitrateKbps, preset.fallbackBitrateKbps]) {
+    if (kbps !== null && (kbps < min || kbps > max)) {
+      return {
+        ok: false,
+        reason: 'bitrate_out_of_range',
+        message: `${kbps} kbps is outside the approved AAC-LC range of ${min}-${max} kbps.`,
+      };
+    }
+  }
+
+  if (estimateEncodedBytes(durationSeconds, preset.bitrateKbps) <= preset.maxOutputBytes) {
+    return { ok: true, bitrateKbps: preset.bitrateKbps, reduced: false };
+  }
+
+  const fallback = preset.fallbackBitrateKbps;
+  if (
+    fallback !== null &&
+    fallback < preset.bitrateKbps &&
+    estimateEncodedBytes(durationSeconds, fallback) <= preset.maxOutputBytes
+  ) {
+    return { ok: true, bitrateKbps: fallback, reduced: true };
+  }
+
+  const lowest = fallback !== null ? Math.min(fallback, preset.bitrateKbps) : preset.bitrateKbps;
+  const maxDurationSeconds = maxDurationSecondsAt(lowest, preset.maxOutputBytes);
+  const mib = (preset.maxOutputBytes / 1_048_576).toFixed(0);
+  return {
+    ok: false,
+    reason: 'too_long',
+    maxDurationSeconds,
+    message:
+      `Recording is ${formatMinutes(durationSeconds)}; the ${mib} MiB per-file limit holds about ` +
+      `${formatMinutes(maxDurationSeconds)} at ${lowest} kbps. Split it into two tracks or shorten it.`,
+  };
+}
+
+function formatMinutes(seconds: number): string {
+  const whole = Math.round(seconds);
+  return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, '0')} min`;
 }

@@ -33,8 +33,13 @@ export type MediaErrorCode =
   | 'measurement_unparsable'
   /** The encoded file missed the LUFS target by more than the tolerance. */
   | 'loudness_out_of_tolerance'
-  /** The encoded file exceeds the bucket's file_size_limit. */
+  /**
+   * The track exceeds the bucket's file_size_limit: after encoding, or before
+   * it, when even the fallback bitrate cannot fit its duration (TASK-1002).
+   */
   | 'output_too_large'
+  /** The preset asks for something outside the standard, e.g. a bitrate off 64-96 kbps. */
+  | 'invalid_preset'
   /** ffmpeg exited 0 but produced nothing, or produced an unreadable file. */
   | 'output_invalid'
   /** The caller asked for an output path the database would reject. */
