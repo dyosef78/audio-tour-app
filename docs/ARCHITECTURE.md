@@ -1,10 +1,8 @@
 # Audio Tour Platform — System Architecture
 
 > **Single Source of Truth.** This document describes the system as it is
-> implemented on `main` after Epic 9 (17 Sep 2026), plus the Epic 10 work on
-> `feat/epic-10-content-qa` (route-stops rate limiting, 5 MiB per-file limit,
-> AAC-only format, streamed transcripts). That work is **live in production**.
-> The branch is not yet merged. Where it disagrees with an
+> implemented on `main` after Epic 10 (17 Sep 2026), which is merged and
+> **live in production**. Where it disagrees with an
 > older document (`prd_user_flows.md`, `architecture_schema.md`), this one wins.
 > Where it disagrees with the code, the code wins and this document has a bug.
 >
@@ -17,7 +15,7 @@
 | **Stack** | Supabase (PostgreSQL 15 + PostGIS, Auth, Storage, Edge Functions on Deno) · React Native 0.86 / Expo SDK 57 · TypeScript throughout |
 | **Routing** | Valhalla via Stadia Maps, behind the `route-stops` Edge Function |
 | **Audio** | AAC-LC `.m4a`, mono 48 kHz, 96 kbps (64 kbps for long tracks), EBU R128 −16 LUFS, **≤ 5 MiB per file** |
-| **Status** | Epics 1–9 closed. In progress: Epic 10, Content Pipeline & Production Readiness |
+| **Status** | Epics 1–10 closed (backend, media and infrastructure). Next: the mobile client UI, starting with the Onboarding Wizard |
 
 ## Contents
 
