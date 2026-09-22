@@ -4,7 +4,13 @@ import { Platform } from 'react-native';
 
 import { raceTimeout } from '../../lib/timeout';
 import { isSupabaseConfigured, supabase, supabaseEndpoint } from '../supabase/client';
-import { runAccountDeletion, type AppleReauthentication, type DeleteAccountOutcome, type InvokeResult } from './accountDeletion';
+import {
+  runAccountDeletion,
+  type AppleReauthentication,
+  type DeleteAccountOutcome,
+  type DeletionOptions,
+  type InvokeResult,
+} from './accountDeletion';
 import { configureGoogle, isGoogleSignInConfigured } from './AuthService';
 import { lastKnownAccessToken, markSignedOutLocally, useAuth } from './authStore';
 import { secureSessionStorage } from './secureSessionStorage';
@@ -32,17 +38,35 @@ const DELETE_FUNCTION = 'delete-account';
 /** How long getSession() gets before the last known token is used instead. */
 const SESSION_LOOKUP_MS = 2_500;
 
+/**
+ * One Apple sheet, one answer. Only "this device has no Apple sheet" is
+ * 'unavailable' (the flow then proceeds without a code, as on Android). Every
+ * failure of a sheet that WAS shown is reported as a failure with its native
+ * code - b89da6c mapped ERR_REQUEST_CANCELED to a silent cancel and every other
+ * error to 'unavailable', so a failed sheet either did nothing visible or was
+ * quietly skipped.
+ */
 async function reauthenticateWithApple(): Promise<AppleReauthentication> {
   if (Platform.OS !== 'ios') return 'unavailable';
+  let available: boolean;
   try {
-    if (!(await AppleAuthentication.isAvailableAsync())) return 'unavailable';
+    available = await AppleAuthentication.isAvailableAsync();
+  } catch {
+    available = false;
+  }
+  if (!available) return 'unavailable';
+
+  try {
     // No scopes: this is a confirmation, and Apple would not resend the name anyway.
     const credential = await AppleAuthentication.signInAsync({ requestedScopes: [] });
-    return credential.authorizationCode ? { authorizationCode: credential.authorizationCode } : 'unavailable';
+    return credential.authorizationCode
+      ? { authorizationCode: credential.authorizationCode }
+      : { failure: 'error', code: 'NO_AUTHORIZATION_CODE' };
   } catch (err) {
-    const code = typeof err === 'object' && err !== null && 'code' in err ? String((err as { code: unknown }).code) : '';
-    // Backing out of the Apple sheet backs out of deleting.
-    return code === 'ERR_REQUEST_CANCELED' ? 'cancelled' : 'unavailable';
+    const code = typeof err === 'object' && err !== null && 'code' in err ? String((err as { code: unknown }).code) : 'UNKNOWN';
+    // iOS reports some system failures as .canceled too, so this is NOT treated
+    // as the user's final word - the screen explains and offers a way forward.
+    return { failure: code === 'ERR_REQUEST_CANCELED' ? 'cancelled' : 'error', code };
   }
 }
 
@@ -102,9 +126,10 @@ async function forceLocalSignOut(): Promise<void> {
   }
 }
 
-export function deleteAccount(): Promise<DeleteAccountOutcome> {
+export function deleteAccount(options: DeletionOptions = {}): Promise<DeleteAccountOutcome> {
   return runAccountDeletion({
     provider: useAuth.getState().account?.provider ?? null,
+    options,
     reauthenticateWithApple,
     invokeDelete,
     // `local`: the server session died with the user. supabase-js removes the

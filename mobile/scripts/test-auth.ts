@@ -19,6 +19,7 @@ import {
   type AccountDeletionDeps,
   type AppleReauthentication,
   type DeleteAccountOutcome,
+  type DeletionOptions,
   type InvokeResult,
 } from '../src/services/auth/accountDeletion.ts';
 import { accountFromSession, lastKnownAccessToken, startAuth, useAuth } from '../src/services/auth/authStore.ts';
@@ -291,6 +292,7 @@ function deletionHarness(opts: {
   invoke?: Behaviour<InvokeResult>;
   signOut?: 'ok' | 'hang' | 'throw';
   google?: 'ok' | 'hang' | 'throw';
+  options?: DeletionOptions;
 }) {
   const calls: string[] = [];
   const bodies: Record<string, unknown>[] = [];
@@ -312,6 +314,7 @@ function deletionHarness(opts: {
     signOutLocally: () => act('signOut', opts.signOut === 'ok' ? undefined : opts.signOut, undefined),
     forceLocalSignOut: () => act('forceSignOut', undefined, undefined),
     revokeGoogleAccess: () => act('google', opts.google === 'ok' ? undefined : opts.google, undefined),
+    options: opts.options,
     timeouts: FAST,
     log: () => {},
   };
@@ -339,15 +342,53 @@ async function settle(deps: AccountDeletionDeps): Promise<{ outcome: DeleteAccou
   eq('...confirms with Apple before anything is sent', h.calls, ['apple', 'invoke', 'signOut']);
   eq('...and sends the fresh authorization code', h.bodies, [{ apple_authorization_code: 'apple-code' }]);
 }
-{
-  const h = deletionHarness({ provider: 'apple', apple: 'cancelled' });
-  eq('Apple: backing out of the Apple sheet cancels', (await settle(h.deps)).outcome, { kind: 'cancelled' });
-  eq('...with nothing sent and nothing signed out', h.calls, ['apple']);
-}
-for (const apple of ['unavailable', 'throw'] as const) {
+// --- SECOND DEVICE-QA PASS: a failed Apple sheet must never be silent -------------
+// b89da6c returned { kind: 'cancelled' } for ERR_REQUEST_CANCELED, which the
+// screen rendered as nothing: no request, no message, still signed in - and the
+// next tap showed the Apple sheet again. iOS reports some of its own failures as
+// .canceled, so "the user cancelled" cannot be assumed.
+const APPLE_FAILURES: [string, AppleReauthentication, string][] = [
+  ['canceled (user OR iOS)', { failure: 'cancelled', code: 'ERR_REQUEST_CANCELED' }, 'ERR_REQUEST_CANCELED'],
+  ['failed', { failure: 'error', code: 'ERR_REQUEST_FAILED' }, 'ERR_REQUEST_FAILED'],
+  ['unknown', { failure: 'error', code: 'ERR_REQUEST_UNKNOWN' }, 'ERR_REQUEST_UNKNOWN'],
+  ['no authorization code', { failure: 'error', code: 'NO_AUTHORIZATION_CODE' }, 'NO_AUTHORIZATION_CODE'],
+];
+for (const [label, apple, code] of APPLE_FAILURES) {
   const h = deletionHarness({ provider: 'apple', apple });
-  eq(`Apple sheet ${apple}: still deletable (our own dialog was the confirmation)`, (await settle(h.deps)).outcome.kind, 'deleted');
-  eq('...without a code', h.bodies, [{}]);
+  const { outcome } = await settle(h.deps);
+  eq(`Apple sheet ${label}: an explicit failure, never silent`, outcome, { kind: 'failed', reason: 'apple_confirmation', detail: code });
+  eq('...stopped BEFORE any request, and still signed in', h.calls, ['apple']);
+}
+{
+  const h = deletionHarness({ provider: 'apple', apple: 'throw' });
+  const { outcome } = await settle(h.deps);
+  assert(
+    'the Apple step throwing: apple_confirmation, not a silent skip past it',
+    outcome.kind === 'failed' && outcome.reason === 'apple_confirmation' && (outcome.detail ?? '').startsWith('EXCEPTION'),
+    JSON.stringify(outcome),
+  );
+  eq('...nothing sent', h.calls, ['apple']);
+}
+{
+  // The way out of a sheet that keeps failing: one tap, no sheet.
+  const h = deletionHarness({ provider: 'apple', apple: 'throw', options: { skipAppleConfirmation: true } });
+  eq('"Delete without Apple": deleted', (await settle(h.deps)).outcome, { kind: 'deleted' });
+  eq('...WITHOUT presenting the Apple sheet at all', h.calls.includes('apple'), false);
+  eq('...and without a code (revocation is the only cost)', h.bodies, [{}]);
+}
+{
+  const h = deletionHarness({ provider: 'apple', apple: 'unavailable' });
+  eq('no Apple sheet on this device (Android): proceeds without a code', (await settle(h.deps)).outcome.kind, 'deleted');
+  eq('...body', h.bodies, [{}]);
+}
+{
+  // Exhaustive: whatever the Apple step does, the outcome is one the screen
+  // renders - there is no outcome kind left that shows nothing.
+  const kinds = new Set<string>();
+  for (const apple of [...APPLE_FAILURES.map(([, a]) => a), 'unavailable', 'throw', { authorizationCode: 'c' }] as Behaviour<AppleReauthentication>[]) {
+    kinds.add((await settle(deletionHarness({ provider: 'apple', apple }).deps)).outcome.kind);
+  }
+  eq('every Apple outcome is "deleted" or an explained "failed"', [...kinds].sort(), ['deleted', 'failed']);
 }
 
 // --- THE DEVICE-QA FAILURE: nothing may leave the screen waiting forever -------

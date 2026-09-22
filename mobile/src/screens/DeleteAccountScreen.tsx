@@ -4,7 +4,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import type { DeleteAccountScreenProps } from '../navigation/types';
 import { deleteAccount } from '../services/auth/AccountService';
-import type { DeleteAccountOutcome, DeletionFailureReason } from '../services/auth/accountDeletion';
+import type { DeleteAccountOutcome, DeletionFailureReason, DeletionOptions } from '../services/auth/accountDeletion';
 import { useAuth } from '../services/auth/authStore';
 import { colors } from '../ui/theme';
 
@@ -31,6 +31,11 @@ const FAILURE: Record<DeletionFailureReason, { title: string; message: string }>
     message:
       "We couldn't confirm your account was deleted - the connection may be slow. It's safe to try again; if it was already deleted, you'll simply be signed out.",
   },
+  apple_confirmation: {
+    title: "Apple confirmation didn't finish",
+    message:
+      "Your account has NOT been deleted and you're still signed in. You can try Apple again, or delete without it - your account is deleted either way, but Apple may keep listing Audio Tour under your Apple ID until you remove it in iOS Settings.",
+  },
 };
 
 /** Lets our confirmation dialog finish dismissing before iOS is asked to present the Apple sheet. */
@@ -47,16 +52,22 @@ const ALERT_DISMISS_MS = 300;
  * NEVER STUCK (Epic 11 device-QA fix). deleteAccount() settles in bounded time
  * and never rejects; `finally` unlocks the screen regardless, and a ref stops a
  * second tap from starting a second deletion while the first is in flight.
+ *
+ * NEVER SILENT (second device-QA pass). Every outcome shows something. A failed
+ * Apple sheet - including iOS's own failures reported as "canceled" - says the
+ * account was NOT deleted and offers "Delete without Apple", so a sheet that
+ * keeps failing cannot trap anyone. The Apple sheet is only ever presented by a
+ * tap, never by a re-render or a retry loop.
  */
 export default function DeleteAccountScreen({ navigation }: DeleteAccountScreenProps) {
   const insets = useSafeAreaInsets();
   const provider = useAuth((s) => s.account?.provider ?? null);
   const signedIn = useAuth((s) => s.status === 'signed_in');
   const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
+  const [message, setMessage] = useState<{ text: string; reference: string | null } | null>(null);
   const inFlight = useRef(false);
 
-  const run = async () => {
+  const run = async (options: DeletionOptions = {}) => {
     if (inFlight.current) return;
     inFlight.current = true;
     setMessage(null);
@@ -64,21 +75,33 @@ export default function DeleteAccountScreen({ navigation }: DeleteAccountScreenP
 
     let outcome: DeleteAccountOutcome;
     try {
-      await new Promise((resolve) => setTimeout(resolve, ALERT_DISMISS_MS));
-      outcome = await deleteAccount();
+      // Only needed when an Apple sheet is about to be presented over our dialog.
+      if (provider === 'apple' && !options.skipAppleConfirmation) {
+        await new Promise((resolve) => setTimeout(resolve, ALERT_DISMISS_MS));
+      }
+      outcome = await deleteAccount(options);
     } catch (err) {
       console.warn('[Account] unexpected deletion error:', err);
-      outcome = { kind: 'failed', reason: 'server' };
+      outcome = { kind: 'failed', reason: 'server', detail: 'SCREEN_EXCEPTION' };
     } finally {
       inFlight.current = false;
       setBusy(false);
     }
 
-    if (outcome.kind === 'cancelled') return;
     if (outcome.kind === 'failed') {
       const { title, message: text } = FAILURE[outcome.reason];
-      setMessage(text);
-      Alert.alert(title, text);
+      // A short reference ("apple_confirmation / ERR_REQUEST_CANCELED") so a
+      // tester can report WHICH branch ran - client failures leave no server log.
+      setMessage({ text, reference: outcome.detail ? `${outcome.reason} / ${outcome.detail}` : outcome.reason });
+      if (outcome.reason === 'apple_confirmation') {
+        Alert.alert(title, text, [
+          { text: 'Keep my account', style: 'cancel' },
+          { text: 'Try Apple again', onPress: () => void run() },
+          { text: 'Delete without Apple', style: 'destructive', onPress: () => void run({ skipAppleConfirmation: true }) },
+        ]);
+      } else {
+        Alert.alert(title, text);
+      }
       return;
     }
     Alert.alert('Account deleted', 'Your account and its data have been deleted. You can keep using Audio Tour without an account.', [
@@ -121,9 +144,10 @@ export default function DeleteAccountScreen({ navigation }: DeleteAccountScreenP
         </Text>
 
         {message !== null && (
-          <Text style={styles.message} accessibilityRole="alert">
-            {message}
-          </Text>
+          <View style={styles.messageBox} accessibilityRole="alert">
+            <Text style={styles.message}>{message.text}</Text>
+            {message.reference !== null && <Text style={styles.reference}>Reference: {message.reference}</Text>}
+          </View>
         )}
       </ScrollView>
 
@@ -166,7 +190,9 @@ const styles = StyleSheet.create({
   dot: { fontSize: 16, lineHeight: 22, color: colors.inkSecondary },
   bulletText: { flex: 1, fontSize: 15, lineHeight: 22, color: colors.ink },
   note: { fontSize: 13, lineHeight: 18, color: colors.inkSecondary, marginTop: 20 },
-  message: { fontSize: 15, lineHeight: 21, color: colors.dangerInk, marginTop: 20 },
+  messageBox: { marginTop: 20, gap: 6 },
+  message: { fontSize: 15, lineHeight: 21, color: colors.dangerInk },
+  reference: { fontSize: 12, color: colors.inkSecondary },
   footer: {
     paddingHorizontal: 20, paddingTop: 12, gap: 4,
     borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: colors.hairline,

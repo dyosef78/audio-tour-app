@@ -10,7 +10,10 @@ import { raceTimeout } from '../../lib/timeout';
  *
  *   1. Apple users confirm with Apple once more. That is the "are you sure" of a
  *      destructive action and the source of the authorization code the server
- *      uses to revoke their Apple tokens. Backing out cancels. Deliberately NOT
+ *      uses to revoke their Apple tokens. If the sheet produces no code - backed
+ *      out or failed, which iOS does not always distinguish - the flow stops
+ *      BEFORE any request with `apple_confirmation`, and the screen offers
+ *      "delete without Apple" (options.skipAppleConfirmation). Deliberately NOT
  *      time-limited: it is the user reading a system sheet.
  *   2. The server deletes the account the SESSION belongs to - within
  *      `requestMs`, or the request is aborted and reported as `timeout`.
@@ -45,18 +48,50 @@ export type DeletionFailureReason =
   /** The server failed before deleting; nothing changed. Safe to retry. */
   | 'server'
   /**
+   * The Apple confirmation did not produce an authorization code - the user
+   * backed out, or iOS failed the request. Nothing was sent; the account is
+   * intact and the device still signed in. The screen must say so and offer
+   * "delete without Apple" (skipAppleConfirmation), never silently return.
+   */
+  | 'apple_confirmation'
+  /**
    * No answer in time, or the server could not confirm the delete. The account
    * may or may not be gone. A retry is safe: the server is idempotent, and a
    * deleted account's session is refused (-> session_expired).
    */
   | 'timeout';
 
+/**
+ * There is deliberately NO silent outcome (Epic 11 device QA, second pass).
+ * b89da6c had `{ kind: 'cancelled' }`, which the screen rendered as nothing:
+ * iOS reports some of its own failures as ASAuthorizationError.canceled, so a
+ * failed Apple sheet looked like a tap that did nothing, the user tapped again,
+ * and got the sheet again. Every outcome now carries something to show.
+ */
 export type DeleteAccountOutcome =
   | { kind: 'deleted' }
-  | { kind: 'cancelled' }
-  | { kind: 'failed'; reason: DeletionFailureReason };
+  | { kind: 'failed'; reason: DeletionFailureReason; detail?: string };
 
-export type AppleReauthentication = { authorizationCode: string } | 'cancelled' | 'unavailable';
+export type AppleReauthentication =
+  | { authorizationCode: string }
+  /**
+   * `cancelled`: iOS said ASAuthorizationError.canceled - the user backing out
+   * OR a system failure iOS reports the same way; they cannot be told apart.
+   * `error`: any other failure, or a credential without an authorization code.
+   * `code` is the native code, kept for the screen's reference line.
+   */
+  | { failure: 'cancelled' | 'error'; code: string }
+  /** No Apple sheet on this device (e.g. an Apple account opened on Android). */
+  | 'unavailable';
+
+export interface DeletionOptions {
+  /**
+   * Skip the Apple sheet entirely. Offered only AFTER an Apple confirmation
+   * failed, so a person can always delete in one more tap instead of being sent
+   * back to a sheet that keeps failing. Costs the Apple token revocation only.
+   */
+  skipAppleConfirmation?: boolean;
+}
 
 export type InvokeResult = { status: number; data: unknown } | { networkError: string };
 
@@ -70,6 +105,7 @@ export interface AccountDeletionDeps {
   /** Drops the stored session without the network or the auth lock. The fallback when signOutLocally stalls. */
   forceLocalSignOut: () => Promise<void>;
   revokeGoogleAccess: () => Promise<void>;
+  options?: DeletionOptions;
   timeouts?: Partial<typeof DELETION_TIMEOUTS>;
   log?: (message: string) => void;
 }
@@ -95,19 +131,24 @@ async function deletionFlow(
 ): Promise<DeleteAccountOutcome> {
   const body: Record<string, unknown> = {};
 
-  // 1. Apple confirmation.
-  if (deps.provider === 'apple') {
+  // 1. Apple confirmation - unless the person already chose to skip it.
+  if (deps.provider === 'apple' && !deps.options?.skipAppleConfirmation) {
     let reauth: AppleReauthentication;
     try {
       reauth = await deps.reauthenticateWithApple();
     } catch (err) {
-      // The user already confirmed in our own dialog; a broken Apple sheet
-      // costs the token revocation, not the deletion.
-      log(`Apple re-authentication failed: ${describe(err)}`);
-      reauth = 'unavailable';
+      reauth = { failure: 'error', code: `EXCEPTION: ${describe(err)}` };
     }
-    if (reauth === 'cancelled') return { kind: 'cancelled' };
-    if (reauth !== 'unavailable') body.apple_authorization_code = reauth.authorizationCode;
+    if (reauth !== 'unavailable') {
+      if ('failure' in reauth) {
+        // Stop BEFORE the request, and say so. Never proceed silently without
+        // the code (that hid the failure and skipped revocation), and never
+        // return nothing (that looked like a dead button and invited the loop).
+        log(`Apple confirmation did not complete (${reauth.failure}: ${reauth.code}); nothing sent`);
+        return { kind: 'failed', reason: 'apple_confirmation', detail: reauth.code };
+      }
+      body.apple_authorization_code = reauth.authorizationCode;
+    }
   }
 
   // 2. The request, bounded and abortable.
