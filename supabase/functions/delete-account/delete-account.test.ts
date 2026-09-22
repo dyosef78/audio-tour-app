@@ -104,7 +104,7 @@ Deno.test('a signed-in user deletes their own account', async () => {
   const h = harness();
   const res = await handleDeleteAccount(post(), h.deps);
   assertEquals(res.status, 200);
-  assertEquals(await res.json(), { deleted: true, apple_revocation: 'not_attempted' });
+  assertEquals(await res.json(), { deleted: true, apple_revocation: 'not_attempted', apple_revocation_reason: 'no_code_in_request' });
   assertEquals(h.deleted, [USER]);
   assertEquals(res.headers.get('Cache-Control'), 'no-store');
 });
@@ -195,7 +195,8 @@ Deno.test('Apple: the account is deleted FIRST, and revocation runs after with t
   const h = harness({ revoker: 'revoked', user: APPLE_USER, background: true });
   const res = await handleDeleteAccount(post({ apple_authorization_code: 'fresh-code' }), h.deps);
   assertEquals(res.status, 200);
-  assertEquals(await res.json(), { deleted: true, apple_revocation: 'scheduled' });
+  assertEquals(await res.json(), { deleted: true, apple_revocation: 'scheduled', apple_revocation_reason: 'scheduled' });
+  assertEquals(h.logs.find((l) => l.event === 'apple_revocation_scheduled')?.background, true);
   assertEquals(h.calls, ['authenticate', 'isCmsAdmin', 'deleteUser', 'revoke']);
   assertEquals(h.revokes, [{ code: 'fresh-code', subjects: ['apple-sub'] }]);
   assertEquals(h.background.length, 1, 'handed to the runtime to finish after the response');
@@ -217,18 +218,35 @@ Deno.test('Apple: a revocation that hangs or throws cannot delay or fail the del
   }
 });
 
-Deno.test('Apple: not attempted without a code, a revoker, or an Apple identity', async () => {
-  const cases: [string, Harness, unknown][] = [
-    ['no code', harness({ revoker: 'revoked', user: APPLE_USER }), {}],
-    ['not configured', harness({ revoker: null, user: APPLE_USER }), { apple_authorization_code: 'c' }],
-    ['google user', harness({ revoker: 'revoked', user: { id: USER, appleSubjects: [] } }), { apple_authorization_code: 'c' }],
+Deno.test('Apple: every skip names its reason - in the response AND the log (device QA, 23 Sep)', async () => {
+  // "No apple_revocation_finished line" used to mean any of these three.
+  const cases: [string, Harness, unknown, string][] = [
+    ['Apple account, phone sent no code', harness({ revoker: 'revoked', user: APPLE_USER }), {}, 'no_code_in_request'],
+    ['secrets not loaded', harness({ revoker: null, user: APPLE_USER }), { apple_authorization_code: 'c' }, 'revocation_not_configured'],
+    ['code sent, no Apple identity on the account', harness({ revoker: 'revoked', user: { id: USER, appleSubjects: [] } }), { apple_authorization_code: 'c' }, 'no_apple_identity_on_account'],
   ];
-  for (const [label, h, body] of cases) {
+  for (const [label, h, body, reason] of cases) {
     const res = await handleDeleteAccount(post(body), h.deps);
     assertEquals(res.status, 200, label);
-    assertEquals((await res.json()).apple_revocation, 'not_attempted', label);
+    const json = await res.json();
+    assertEquals([json.apple_revocation, json.apple_revocation_reason], ['not_attempted', reason], label);
     assertEquals(h.revokes, [], label);
+    assertEquals(h.logs.find((l) => l.event === 'apple_revocation_skipped')?.reason, reason, `${label}: logged`);
   }
+});
+
+Deno.test('Apple: the authenticated log line carries both halves of the decision, never the code', async () => {
+  const h = harness({ revoker: 'revoked', user: APPLE_USER, background: true });
+  await handleDeleteAccount(post({ apple_authorization_code: 'secret-code' }), h.deps);
+  const line = h.logs.find((l) => l.event === 'delete_account_authenticated');
+  assertEquals([line?.apple_identities, line?.apple_code_present], [1, true]);
+  assert(!JSON.stringify(h.logs).includes('secret-code'));
+});
+
+Deno.test('a plain Google account deletes with no Apple noise in the log', async () => {
+  const h = harness({ revoker: 'revoked', user: { id: USER, appleSubjects: [] } });
+  await handleDeleteAccount(post({}), h.deps);
+  assertEquals(h.logs.some((l) => String(l.event).startsWith('apple_revocation')), false);
 });
 
 Deno.test('malformed bodies -> 400 without deleting; method and CORS', async () => {

@@ -26,9 +26,24 @@ export type AuthStatus = 'restoring' | 'signed_out' | 'signed_in';
 export interface Account {
   id: string;
   email: string | null;
-  /** 'apple' | 'google' as Supabase records it; kept a string so a new provider cannot break parsing. */
+  /**
+   * app_metadata.provider: the provider the account was FIRST created with.
+   * For display only - see `providers` for what the account can sign in with.
+   */
   provider: string | null;
+  /**
+   * app_metadata.providers: every provider linked to the account. Supabase
+   * links identities that share an email, so an account created with Google
+   * and later used with Apple has provider 'google' but providers
+   * ['google', 'apple']. Decisions about Apple/Google (deletion) use this.
+   */
+  providers: readonly string[];
   displayName: string | null;
+}
+
+/** Whether the account has an identity with this provider (primary or linked). */
+export function hasProvider(account: Account | null, provider: string): boolean {
+  return account !== null && (account.provider === provider || account.providers.includes(provider));
 }
 
 export interface AuthState {
@@ -51,6 +66,9 @@ export function accountFromSession(session: Session | null): Account | null {
     id: user.id,
     email: nonEmptyString(user.email),
     provider: nonEmptyString(user.app_metadata?.provider),
+    providers: Array.isArray(user.app_metadata?.providers)
+      ? (user.app_metadata.providers as unknown[]).filter((p): p is string => typeof p === 'string' && p !== '')
+      : [],
     displayName: nonEmptyString(meta['full_name']) ?? nonEmptyString(meta['name']),
   };
 }

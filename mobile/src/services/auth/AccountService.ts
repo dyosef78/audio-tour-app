@@ -12,7 +12,7 @@ import {
   type InvokeResult,
 } from './accountDeletion';
 import { configureGoogle, isGoogleSignInConfigured } from './AuthService';
-import { lastKnownAccessToken, markSignedOutLocally, useAuth } from './authStore';
+import { hasProvider, lastKnownAccessToken, markSignedOutLocally, useAuth } from './authStore';
 import { secureSessionStorage } from './secureSessionStorage';
 
 /**
@@ -127,15 +127,22 @@ async function forceLocalSignOut(): Promise<void> {
 }
 
 export function deleteAccount(options: DeletionOptions = {}): Promise<DeleteAccountOutcome> {
+  const account = useAuth.getState().account;
   return runAccountDeletion({
-    provider: useAuth.getState().account?.provider ?? null,
+    // Linked identities count: see AccountDeletionDeps.appleIdentity.
+    appleIdentity: hasProvider(account, 'apple'),
+    googleIdentity: hasProvider(account, 'google'),
     options,
     reauthenticateWithApple,
     invokeDelete,
     // `local`: the server session died with the user. supabase-js removes the
     // stored session even though the revoke call is now refused.
     signOutLocally: async () => {
-      await supabase.auth.signOut({ scope: 'local' });
+      // supabase-js RETURNS its error rather than throwing. Ignoring it is what
+      // let a failed sign-out look successful (device QA, 23 Sep); the flow now
+      // drops the session directly afterwards regardless.
+      const { error } = await supabase.auth.signOut({ scope: 'local' });
+      if (error) throw error;
     },
     forceLocalSignOut,
     revokeGoogleAccess: async () => {

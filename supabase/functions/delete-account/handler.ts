@@ -10,7 +10,9 @@
  *   POST   Authorization: Bearer <the user's access token>
  *          { "apple_authorization_code"?: string }   optional; see appleRevoke.ts
  *
- *   200  { "deleted": true, "apple_revocation": "scheduled" | "not_attempted" }
+ *   200  { "deleted": true, "apple_revocation": "scheduled" | "not_attempted",
+ *          "apple_revocation_reason": "scheduled" | "no_code_in_request"
+ *                                     | "revocation_not_configured" | "no_apple_identity_on_account" }
  *   400  malformed body
  *   401  not_signed_in          no valid user session (the anon key is not one)
  *   403  admin_account          CMS administrators are removed by the team, not from the app
@@ -161,10 +163,16 @@ export async function handleDeleteAccount(request: Request, deps: DeleteAccountD
     user = null;
   }
   if (!user) return fail(401, 'not_signed_in', 'Sign in to delete your account.');
-  log({ event: 'delete_account_authenticated', user_id: user.id, apple_identities: user.appleSubjects.length });
-
   const parsed = await parseBody(request);
   if (!parsed.ok) return fail(400, 'invalid_request', parsed.message);
+  // Both halves of the revocation decision on one line: whether the account has
+  // an Apple identity, and whether the phone sent a code. Never the code itself.
+  log({
+    event: 'delete_account_authenticated',
+    user_id: user.id,
+    apple_identities: user.appleSubjects.length,
+    apple_code_present: parsed.appleAuthorizationCode !== null,
+  });
 
   // 2. Admins are removed by the team. Fails CLOSED: no answer, no delete.
   let admin: boolean;
@@ -197,10 +205,26 @@ export async function handleDeleteAccount(request: Request, deps: DeleteAccountD
     return fail(500, 'delete_failed', 'Your account could not be deleted. Nothing was removed; please try again.');
   }
 
-  // 4. Best-effort Apple revocation, off the critical path.
+  // 4. Best-effort Apple revocation, off the critical path. Every outcome is
+  // logged with its reason: "no apple_revocation_finished line" used to mean
+  // any of three different things (device QA, 23 Sep).
+  const skipReason =
+    parsed.appleAuthorizationCode === null
+      ? 'no_code_in_request'
+      : !deps.appleRevoker
+        ? 'revocation_not_configured'
+        : user.appleSubjects.length === 0
+          ? 'no_apple_identity_on_account'
+          : null;
   let appleRevocation: 'scheduled' | 'not_attempted' = 'not_attempted';
-  if (parsed.appleAuthorizationCode !== null && deps.appleRevoker && user.appleSubjects.length > 0) {
+  if (skipReason !== null) {
+    // Silent for plain Google accounts; logged whenever Apple is involved at all.
+    if (user.appleSubjects.length > 0 || parsed.appleAuthorizationCode !== null) {
+      log({ event: 'apple_revocation_skipped', user_id: user.id, reason: skipReason });
+    }
+  } else if (parsed.appleAuthorizationCode !== null && deps.appleRevoker) {
     appleRevocation = 'scheduled';
+    log({ event: 'apple_revocation_scheduled', user_id: user.id, background: Boolean(deps.runInBackground) });
     const task = deps.appleRevoker
       .revoke(parsed.appleAuthorizationCode, user.appleSubjects)
       .then((result) => log({ event: 'apple_revocation_finished', user_id: user.id, result }))
@@ -214,7 +238,11 @@ export async function handleDeleteAccount(request: Request, deps: DeleteAccountD
     }
   }
 
-  return json(200, { deleted: true, apple_revocation: appleRevocation }, idHeader);
+  return json(
+    200,
+    { deleted: true, apple_revocation: appleRevocation, apple_revocation_reason: skipReason ?? 'scheduled' },
+    idHeader,
+  );
 }
 
 type ParsedBody = { ok: true; appleAuthorizationCode: string | null } | { ok: false; message: string };

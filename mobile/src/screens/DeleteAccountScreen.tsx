@@ -5,7 +5,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { DeleteAccountScreenProps } from '../navigation/types';
 import { deleteAccount } from '../services/auth/AccountService';
 import type { DeleteAccountOutcome, DeletionFailureReason, DeletionOptions } from '../services/auth/accountDeletion';
-import { useAuth } from '../services/auth/authStore';
+import { hasProvider, useAuth } from '../services/auth/authStore';
 import { colors } from '../ui/theme';
 
 const FAILURE: Record<DeletionFailureReason, { title: string; message: string }> = {
@@ -40,6 +40,8 @@ const FAILURE: Record<DeletionFailureReason, { title: string; message: string }>
 
 /** Lets our confirmation dialog finish dismissing before iOS is asked to present the Apple sheet. */
 const ALERT_DISMISS_MS = 300;
+/** Lets the navigation reset settle before the "deleted" alert is presented over the new screen. */
+const CONFIRMATION_DELAY_MS = 450;
 
 /**
  * Delete account (TASK-1104, App Store Review Guideline 5.1.1(v)).
@@ -61,7 +63,9 @@ const ALERT_DISMISS_MS = 300;
  */
 export default function DeleteAccountScreen({ navigation }: DeleteAccountScreenProps) {
   const insets = useSafeAreaInsets();
-  const provider = useAuth((s) => s.account?.provider ?? null);
+  // Primary OR linked identity - the same test the deletion flow uses.
+  const appleIdentity = useAuth((s) => hasProvider(s.account, 'apple'));
+  const googleIdentity = useAuth((s) => hasProvider(s.account, 'google'));
   const signedIn = useAuth((s) => s.status === 'signed_in');
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<{ text: string; reference: string | null } | null>(null);
@@ -76,7 +80,7 @@ export default function DeleteAccountScreen({ navigation }: DeleteAccountScreenP
     let outcome: DeleteAccountOutcome;
     try {
       // Only needed when an Apple sheet is about to be presented over our dialog.
-      if (provider === 'apple' && !options.skipAppleConfirmation) {
+      if (appleIdentity && !options.skipAppleConfirmation) {
         await new Promise((resolve) => setTimeout(resolve, ALERT_DISMISS_MS));
       }
       outcome = await deleteAccount(options);
@@ -104,15 +108,31 @@ export default function DeleteAccountScreen({ navigation }: DeleteAccountScreenP
       }
       return;
     }
-    Alert.alert('Account deleted', 'Your account and its data have been deleted. You can keep using Audio Tour without an account.', [
-      { text: 'OK', onPress: () => navigation.reset({ index: 0, routes: [{ name: 'Discovery' }] }) },
-    ]);
+    // LEAVE FIRST (device QA, 23 Sep). The account is gone server-side and the
+    // flow has already dropped the local session, so this screen is meaningless.
+    // Navigation used to live in the confirmation's OK button: if iOS did not
+    // present that alert, the user stayed here, apparently still signed in.
+    navigation.reset({ index: 0, routes: [{ name: 'Discovery' }] });
+
+    // Then confirm, on the guest Discovery screen. If this alert is dropped, the
+    // user is already where they should be.
+    // For Apple accounts, the evidence QA needs: did this request carry a code,
+    // and what did the server decide? Matches the function's log line.
+    const reference = appleIdentity
+      ? `\n\nReference: Apple code sent: ${outcome.appleCodeSent ? 'yes' : 'no'} / revocation: ${outcome.appleRevocation ?? 'unknown'}`
+      : '';
+    setTimeout(() => {
+      Alert.alert(
+        'Account deleted',
+        `Your account and its data have been deleted. You can keep using Audio Tour without an account.${reference}`,
+      );
+    }, CONFIRMATION_DELAY_MS);
   };
 
   const confirm = () => {
     Alert.alert(
       'Delete your account?',
-      provider === 'apple'
+      appleIdentity
         ? "This can't be undone. You'll confirm with Apple one last time."
         : "This can't be undone.",
       [
@@ -132,7 +152,9 @@ export default function DeleteAccountScreen({ navigation }: DeleteAccountScreenP
 
         <Text style={styles.section}>WHAT'S DELETED</Text>
         <Bullet>Your account, and the name and email address it holds</Bullet>
-        <Bullet>Its connection to your {provider === 'google' ? 'Google' : provider === 'apple' ? 'Apple' : 'sign-in'} account</Bullet>
+        <Bullet>
+          Its connection to your {appleIdentity && googleIdentity ? 'Apple and Google' : appleIdentity ? 'Apple' : googleIdentity ? 'Google' : 'sign-in'} account
+        </Bullet>
         <Bullet>Anything saved to your account</Bullet>
 
         <Text style={styles.section}>WHAT STAYS ON THIS PHONE</Text>

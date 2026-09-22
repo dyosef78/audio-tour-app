@@ -22,7 +22,7 @@ import {
   type DeletionOptions,
   type InvokeResult,
 } from '../src/services/auth/accountDeletion.ts';
-import { accountFromSession, lastKnownAccessToken, startAuth, useAuth } from '../src/services/auth/authStore.ts';
+import { accountFromSession, hasProvider, lastKnownAccessToken, startAuth, useAuth } from '../src/services/auth/authStore.ts';
 import {
   ciphertextKeyFor,
   keychainKeyFor,
@@ -205,9 +205,20 @@ eq('no session -> no account', accountFromSession(null), null);
 eq(
   'Apple user with a saved name',
   accountFromSession(session({ email: 'x@privaterelay.appleid.com', meta: { full_name: 'דוד יוסף' } })),
-  { id: 'user-1', email: 'x@privaterelay.appleid.com', provider: 'apple', displayName: 'דוד יוסף' },
+  { id: 'user-1', email: 'x@privaterelay.appleid.com', provider: 'apple', providers: [], displayName: 'דוד יוסף' },
 );
 eq('Google puts the name in `name`', accountFromSession(session({ provider: 'google', meta: { name: 'Dana' } }))?.displayName, 'Dana');
+{
+  // Created with Google, later linked to Apple (same email): provider stays 'google'.
+  const base = session({ provider: 'google' });
+  const linked = accountFromSession({
+    ...base,
+    user: { ...base.user, app_metadata: { provider: 'google', providers: ['google', 'apple', 42] } },
+  } as Session);
+  eq('linked providers are read, junk dropped', linked?.providers, ['google', 'apple']);
+  eq('hasProvider sees a LINKED Apple identity', [hasProvider(linked ?? null, 'apple'), hasProvider(linked ?? null, 'google')], [true, true]);
+  eq('...and no identity for a guest', hasProvider(null, 'apple'), false);
+}
 eq('a blank or non-string name is no name', accountFromSession(session({ meta: { full_name: '  ', name: 42 } }))?.displayName, null);
 
 // -----------------------------------------------------------------------------
@@ -288,6 +299,8 @@ const FAST = { requestMs: 60, signOutMs: 40, googleRevokeMs: 40 };
 
 function deletionHarness(opts: {
   provider: string | null;
+  /** An extra LINKED identity (Supabase links identities that share an email). */
+  linked?: string;
   apple?: Behaviour<AppleReauthentication>;
   invoke?: Behaviour<InvokeResult>;
   signOut?: 'ok' | 'hang' | 'throw';
@@ -304,12 +317,17 @@ function deletionHarness(opts: {
     return Promise.resolve(behaviour ?? fallback);
   };
   const deps: AccountDeletionDeps = {
-    provider: opts.provider,
+    appleIdentity: opts.provider === 'apple' || opts.linked === 'apple',
+    googleIdentity: opts.provider === 'google' || opts.linked === 'google',
     reauthenticateWithApple: () => act('apple', opts.apple, { authorizationCode: 'apple-code' }),
     invokeDelete: (body, signal) => {
       bodies.push(body);
       signals.push(signal);
-      return act('invoke', opts.invoke, { status: 200, data: { deleted: true, apple_revocation: 'not_attempted' } });
+      const reason = typeof body.apple_authorization_code === 'string' ? 'scheduled' : 'no_code_in_request';
+      return act('invoke', opts.invoke, {
+        status: 200,
+        data: { deleted: true, apple_revocation: reason === 'scheduled' ? 'scheduled' : 'not_attempted', apple_revocation_reason: reason },
+      });
     },
     signOutLocally: () => act('signOut', opts.signOut === 'ok' ? undefined : opts.signOut, undefined),
     forceLocalSignOut: () => act('forceSignOut', undefined, undefined),
@@ -330,7 +348,7 @@ async function settle(deps: AccountDeletionDeps): Promise<{ outcome: DeleteAccou
 
 {
   const h = deletionHarness({ provider: 'google' });
-  eq('Google: deleted', (await settle(h.deps)).outcome, { kind: 'deleted' });
+  eq('Google: deleted', (await settle(h.deps)).outcome, { kind: 'deleted', appleCodeSent: false, appleRevocation: 'no_code_in_request' });
   eq('...server FIRST, then local sign-out; never Apple', h.calls.slice(0, 2), ['invoke', 'signOut']);
   eq('...and the body names no user', h.bodies, [{}]);
   await new Promise((r) => setTimeout(r, 5));
@@ -338,8 +356,8 @@ async function settle(deps: AccountDeletionDeps): Promise<{ outcome: DeleteAccou
 }
 {
   const h = deletionHarness({ provider: 'apple' });
-  eq('Apple: deleted', (await settle(h.deps)).outcome, { kind: 'deleted' });
-  eq('...confirms with Apple before anything is sent', h.calls, ['apple', 'invoke', 'signOut']);
+  eq('Apple: deleted, and says the code was sent', (await settle(h.deps)).outcome, { kind: 'deleted', appleCodeSent: true, appleRevocation: 'scheduled' });
+  eq('...confirms with Apple before anything is sent', h.calls.slice(0, 2), ['apple', 'invoke']);
   eq('...and sends the fresh authorization code', h.bodies, [{ apple_authorization_code: 'apple-code' }]);
 }
 // --- SECOND DEVICE-QA PASS: a failed Apple sheet must never be silent -------------
@@ -372,7 +390,7 @@ for (const [label, apple, code] of APPLE_FAILURES) {
 {
   // The way out of a sheet that keeps failing: one tap, no sheet.
   const h = deletionHarness({ provider: 'apple', apple: 'throw', options: { skipAppleConfirmation: true } });
-  eq('"Delete without Apple": deleted', (await settle(h.deps)).outcome, { kind: 'deleted' });
+  eq('"Delete without Apple": deleted, and says NO code was sent', (await settle(h.deps)).outcome, { kind: 'deleted', appleCodeSent: false, appleRevocation: 'no_code_in_request' });
   eq('...WITHOUT presenting the Apple sheet at all', h.calls.includes('apple'), false);
   eq('...and without a code (revocation is the only cost)', h.bodies, [{}]);
 }
@@ -391,6 +409,39 @@ for (const [label, apple, code] of APPLE_FAILURES) {
   eq('every Apple outcome is "deleted" or an explained "failed"', [...kinds].sort(), ['deleted', 'failed']);
 }
 
+// --- THIRD DEVICE-QA PASS (23 Sep): no Apple code, and a ghost session after 200 -----
+{
+  // An account created with Google and later linked to Apple: provider 'google',
+  // providers ['google', 'apple']. dfa1dc9 looked only at provider -> no sheet, no code.
+  const h = deletionHarness({ provider: 'google', linked: 'apple' });
+  const { outcome } = await settle(h.deps);
+  eq('LINKED Apple identity: the Apple sheet IS shown', h.calls[0], 'apple');
+  eq('...and the code IS sent', h.bodies, [{ apple_authorization_code: 'apple-code' }]);
+  eq('...and the outcome says so', outcome, { kind: 'deleted', appleCodeSent: true, appleRevocation: 'scheduled' });
+}
+{
+  // After a 200 the session is a ghost: BOTH teardown steps must run, always.
+  const h = deletionHarness({ provider: 'apple' });
+  await settle(h.deps);
+  eq('200: supabase-js sign-out AND the direct session drop both run, in that order', h.calls.slice(2), ['signOut', 'forceSignOut']);
+}
+{
+  // supabase-js signOut RETURNS {error} instead of throwing; the wrapper now
+  // throws it. Either way the session must still be dropped.
+  const h = deletionHarness({ provider: 'google', signOut: 'throw' });
+  eq('sign-out reports an error after a real deletion -> still "deleted"', (await settle(h.deps)).outcome.kind, 'deleted');
+  assert('...and the session is dropped directly', h.calls.includes('forceSignOut'));
+}
+{
+  const h = deletionHarness({ provider: 'google', invoke: { status: 401, data: null } });
+  await settle(h.deps);
+  eq('401 (session already dead): the same full teardown', h.calls.slice(1), ['signOut', 'forceSignOut']);
+}
+{
+  const h = deletionHarness({ provider: 'apple', invoke: { status: 200, data: { deleted: true } } });
+  eq('an older server without apple_revocation_reason -> null, not a crash', (await settle(h.deps)).outcome, { kind: 'deleted', appleCodeSent: true, appleRevocation: null });
+}
+
 // --- THE DEVICE-QA FAILURE: nothing may leave the screen waiting forever -------
 {
   const h = deletionHarness({ provider: 'apple', invoke: 'hang' });
@@ -403,7 +454,7 @@ for (const [label, apple, code] of APPLE_FAILURES) {
 {
   const h = deletionHarness({ provider: 'google', signOut: 'hang' });
   const { outcome, ms } = await settle(h.deps);
-  eq('HANG: sign-out stalls after a real deletion -> still "deleted"', outcome, { kind: 'deleted' });
+  eq('HANG: sign-out stalls after a real deletion -> still "deleted"', outcome.kind, 'deleted');
   assert('...within the sign-out budget', ms < FAST.signOutMs + 150, `${ms} ms`);
   assert('...and the session is dropped directly instead', h.calls.includes('forceSignOut'));
 }

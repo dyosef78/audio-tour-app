@@ -21,8 +21,8 @@ import { raceTimeout } from '../../lib/timeout';
  *      session is dropped directly - and Google access revoked in the background.
  *
  * INVARIANT: runAccountDeletion always settles, in bounded time, and never
- * rejects. Worst case after the Apple sheet: requestMs + 2 x signOutMs (13 s
- * of which the last 3 s is a local-storage fallback that is normally instant).
+ * rejects. Worst case after the Apple sheet: requestMs + 2 x signOutMs (16 s;
+ * the last 3 s is a local-storage drop that is normally instant).
  * The screen that awaits it can therefore always unlock.
  *
  * Nothing on the device is wiped beyond the session: downloaded tours,
@@ -69,7 +69,13 @@ export type DeletionFailureReason =
  * and got the sheet again. Every outcome now carries something to show.
  */
 export type DeleteAccountOutcome =
-  | { kind: 'deleted' }
+  | {
+      kind: 'deleted';
+      /** Whether this request carried an Apple authorization code - QA evidence. */
+      appleCodeSent: boolean;
+      /** The server's apple_revocation_reason ('scheduled', 'no_code_in_request', ...), or null if absent. */
+      appleRevocation: string | null;
+    }
   | { kind: 'failed'; reason: DeletionFailureReason; detail?: string };
 
 export type AppleReauthentication =
@@ -96,13 +102,20 @@ export interface DeletionOptions {
 export type InvokeResult = { status: number; data: unknown } | { networkError: string };
 
 export interface AccountDeletionDeps {
-  /** app_metadata.provider of the signed-in account. */
-  provider: string | null;
+  /**
+   * Whether the account has an Apple / Google identity - PRIMARY OR LINKED
+   * (authStore.hasProvider). b89da6c/dfa1dc9 looked only at app_metadata.provider,
+   * the first provider, so an account created with Google and later linked to
+   * Apple skipped the Apple sheet and sent no code (device QA, 23 Sep).
+   */
+  appleIdentity: boolean;
+  googleIdentity: boolean;
   reauthenticateWithApple: () => Promise<AppleReauthentication>;
   /** Must honour `signal`: it is aborted when the request runs out of time. */
   invokeDelete: (body: Record<string, unknown>, signal: AbortSignal) => Promise<InvokeResult>;
+  /** supabase-js sign-out. Must REJECT on failure - supabase-js returns its error instead of throwing. */
   signOutLocally: () => Promise<void>;
-  /** Drops the stored session without the network or the auth lock. The fallback when signOutLocally stalls. */
+  /** Drops the stored session and the auth mirror without the network or the auth lock. Idempotent. */
   forceLocalSignOut: () => Promise<void>;
   revokeGoogleAccess: () => Promise<void>;
   options?: DeletionOptions;
@@ -132,7 +145,7 @@ async function deletionFlow(
   const body: Record<string, unknown> = {};
 
   // 1. Apple confirmation - unless the person already chose to skip it.
-  if (deps.provider === 'apple' && !deps.options?.skipAppleConfirmation) {
+  if (deps.appleIdentity && !deps.options?.skipAppleConfirmation) {
     let reauth: AppleReauthentication;
     try {
       reauth = await deps.reauthenticateWithApple();
@@ -175,7 +188,7 @@ async function deletionFlow(
   switch (result.status) {
     case 401:
       // Most often: the account is already gone (a retry after a lost answer).
-      await signOutBounded(deps, timeouts, log);
+      await tearDownLocalSession(deps, timeouts, log);
       return { kind: 'failed', reason: 'session_expired' };
     case 403:
       return { kind: 'failed', reason: 'admin_account' };
@@ -188,15 +201,20 @@ async function deletionFlow(
   }
 
   // 3. The account is gone. Local clean-up must not be able to hide that.
-  await signOutBounded(deps, timeouts, log);
-  if (deps.provider === 'google') {
+  await tearDownLocalSession(deps, timeouts, log);
+  if (deps.googleIdentity) {
     // Not awaited: the answer to the user does not depend on Google.
     void raceTimeout(
       deps.revokeGoogleAccess().catch((err) => log(`Google access could not be revoked: ${describe(err)}`)),
       timeouts.googleRevokeMs,
     );
   }
-  return { kind: 'deleted' };
+  const reason = (result.data as { apple_revocation_reason?: unknown }).apple_revocation_reason;
+  return {
+    kind: 'deleted',
+    appleCodeSent: typeof body.apple_authorization_code === 'string',
+    appleRevocation: typeof reason === 'string' ? reason : null,
+  };
 }
 
 function isDeleted(data: unknown): boolean {
@@ -204,27 +222,34 @@ function isDeleted(data: unknown): boolean {
 }
 
 /**
- * Sign out through supabase-js, and if that does not finish in time - it waits
- * on the auth lock and then on a network call with no timeout - drop the stored
- * session directly. Either way the device ends up signed out.
+ * After the server has deleted the account (or refused its session), every
+ * local trace of the session is a ghost. Two steps, BOTH always run:
+ *
+ *   1. supabase-js signOut, bounded - so its in-memory state and listeners
+ *      learn about it (SIGNED_OUT).
+ *   2. forceLocalSignOut, unconditionally - drops the stored session and sets
+ *      the auth mirror to signed_out without the network or the auth lock.
+ *
+ * Step 2 used to run only if step 1 timed out or threw. But supabase-js signOut
+ * RETURNS an error instead of throwing, and when loading the session fails it
+ * returns without removing it - so a "successful" sign-out could leave the
+ * session in place: the ghost state seen in device QA (23 Sep).
  */
-async function signOutBounded(
+async function tearDownLocalSession(
   deps: AccountDeletionDeps,
   timeouts: typeof DELETION_TIMEOUTS,
   log: (message: string) => void,
 ): Promise<void> {
-  let clean = false;
   try {
     const raced = await raceTimeout(deps.signOutLocally(), timeouts.signOutMs);
-    clean = !raced.timedOut;
-    if (raced.timedOut) log(`sign-out did not finish within ${timeouts.signOutMs} ms; dropping the session directly`);
+    if (raced.timedOut) log(`sign-out did not finish within ${timeouts.signOutMs} ms`);
   } catch (err) {
-    log(`sign-out failed: ${describe(err)}; dropping the session directly`);
+    log(`sign-out failed: ${describe(err)}`);
   }
-  if (clean) return;
   try {
-    await raceTimeout(deps.forceLocalSignOut(), timeouts.signOutMs);
+    const raced = await raceTimeout(deps.forceLocalSignOut(), timeouts.signOutMs);
+    if (raced.timedOut) log(`local session drop did not finish within ${timeouts.signOutMs} ms`);
   } catch (err) {
-    log(`forced sign-out failed: ${describe(err)}`);
+    log(`local session drop failed: ${describe(err)}`);
   }
 }
