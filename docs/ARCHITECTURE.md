@@ -175,12 +175,25 @@ CMS admins.
   Delete account calls the `delete-account` Edge Function. The function takes
   the user ONLY from the verified token, refuses CMS administrators (403; the
   team removes those), and hard-deletes with `auth.admin.deleteUser`. That
-  cascades to identities, sessions and `user_itineraries`. Apple users confirm
-  with Apple first; the fresh authorization code lets the function revoke their
-  Apple tokens when the `APPLE_*` secrets are set (recommended by Apple, not
-  required; deletion never depends on it). Telemetry is not deleted because it
-  is not linked to accounts: events carry a random device id and no user id.
+  cascades to identities, sessions and `user_itineraries`. **The delete is the
+  critical path**: each step has a deadline (authenticate 3 s, admin check
+  2.5 s, delete 4 s) and the app gives the whole request 10 s. Apple users
+  confirm with Apple first; the fresh authorization code lets the function
+  revoke their Apple tokens **after** the delete, in the background
+  (`EdgeRuntime.waitUntil`), so Apple can never hold an account hostage.
+  Revocation is recommended by Apple, not required, and a failed one is logged
+  (`apple_revocation_finished`) but not yet retried (§7.1). Every response and
+  log line carries `X-Request-Id`. Telemetry is not deleted because it is not
+  linked to accounts: events carry a random device id and no user id.
   Downloads and preferences stay on the phone.
+- **The app never sends this request through `supabase.functions.invoke`**
+  (Epic 11 device-QA fix). `invoke()` awaits `getSession()` before sending,
+  which queues behind supabase-js's auth lock; a token refresh holds that lock
+  across up to 30 s of retries with no request timeout, and `invoke()`'s own
+  `timeout` only covers the fetch that has not started. The deletion screen
+  froze on a device that way. The rule for any flow the UI blocks on: plain
+  `fetch` with an `AbortSignal`, and a token from `getSession()` only if it
+  answers quickly.
 - **Authorisation lives in the database, not in roles.** Because the anon key
   is public and OAuth sign-in is open to anyone with a Google or Apple account,
   `TO authenticated` grants nothing on its own. Every protected policy and RPC
@@ -657,7 +670,8 @@ needs a PM decision or a task; none should be assumed.
 | **Max 1.5 MB per file** (PRD) | 5 MiB hard limit, 64–96 kbps | Superseded by PM decision (Epic 10, TASK-1002). Live in production since 17 Sep 2026 (migration `20260917180100`). |
 | **Skip to next stop** for a missed zone | Only the debug manual trigger; a missed zone blocks the remaining stops | Post-MVP backlog |
 | **Proximity-based start** (`preferences.start`) | Not sent; scored routes start at the first authored stop | Post-MVP backlog |
-| **In-app account deletion** (App Store guideline 5.1.1(v)) | Built (TASK-1104); the `delete-account` Edge Function is **live in production** since 18 Sep 2026 | Two things outstanding before submission: the `APPLE_TEAM_ID` / `APPLE_KEY_ID` / `APPLE_CLIENT_ID` / `APPLE_PRIVATE_KEY` secrets, without which Apple token revocation is skipped (recommended by Apple; deletion is compliant without it), and one live deletion of a real account during device QA — this workstation has no service-role key and signup is closed, so no throwaway user could be made. |
+| **Retry of failed Apple revocations** ("zombie grant") | A revocation that fails after the delete is logged, not retried: the user is gone from Supabase but Apple may still list the app as connected | Post-MVP backlog (PM, 22 Sep 2026). Accepted MVP risk; design in §7.1. |
+| **In-app account deletion** (App Store guideline 5.1.1(v)) | Built (TASK-1104); the `delete-account` Edge Function is **live in production** since 18 Sep 2026, hardened version since 22 Sep | The four `APPLE_*` secrets are set (22 Sep 2026; `APPLE_CLIENT_ID` verified to be exactly the bundle id). Outstanding before submission: one live deletion of a real Apple and a real Google account during device QA, confirming `apple_revocation_finished` → `revoked` in the logs. |
 | **Future trip planning** (travel dates, time-simulated routing) | Routing scores the device's current `context.local_time`; onboarding asks for no dates | Post-MVP backlog (PM, Epic 11 kickoff). The server already takes any `local_time`, so the backend gap is small; the work is the dates UI and offline bundles for a trip that is weeks away. |
 | **Precise kids' ages** scoring | One `family_kids` audience tag; no ages collected | Post-MVP backlog (PM, Epic 11 kickoff) |
 | **User-selectable bicycle / car modes** | Walking only in onboarding. `transit_mode` belongs to the tour, and `route-stops` refuses a mismatch (400 `transit_mode_mismatch`) | Post-MVP backlog (PM, Epic 11 kickoff). The engine already has biking/driving profiles, but geofence radii are authored for each tour's own mode, so this is a content change as well as a code change. |
@@ -681,6 +695,26 @@ already taken, not a maybe; none is scheduled.
 | **Zone-exit fade-out** (2 s) | Deferred from Epic 1; narration stops abruptly at a zone exit. |
 | **Skip to next stop** for a missed zone | Only the debug trigger exists, so a missed zone blocks the rest of the tour. |
 | **Proximity-based start** (`preferences.start`) | The server supports it; the app does not send it, so routes start at the first authored stop. |
+| **Retry of failed Apple revocations** | Accepted MVP risk (PM, 22 Sep 2026). See the design notes below. |
+
+**Design notes: retrying Apple revocations.** A naive retry does not work.
+Revocation is two calls to Apple, and only the second is retryable:
+
+1. `POST /auth/token` exchanges the authorization code for a refresh token. The
+   code is **single-use and expires in about 5 minutes**, so if this call fails
+   nothing can be retried without the user signing in with Apple again.
+2. `POST /auth/revoke` revokes that refresh token. The refresh token is
+   long-lived, so this call **can** be retried - if the token was kept.
+
+So the design is: after a successful exchange, **persist Apple's refresh token
+until revoke succeeds** - in a table reachable only by the service role (RLS
+on, no policies, as for `route_legs_cache`), **encrypted at rest**, with an
+attempt counter and cap, and the row deleted on success. A scheduled job
+(`pg_cron`, or a cron-invoked Edge Function) drains it with backoff. Measure
+first: the `apple_revocation_finished` log event records `revoked` / `failed`
+/ `subject_mismatch` for every deletion, so the real failure rate is known
+before building this. Apple's guidance says apps *should* revoke, so this is
+good practice rather than an App Store rejection risk on its own.
 
 ---
 
