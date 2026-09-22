@@ -40,7 +40,7 @@ const FAILURE: Record<DeletionFailureReason, { title: string; message: string }>
 
 /** Lets our confirmation dialog finish dismissing before iOS is asked to present the Apple sheet. */
 const ALERT_DISMISS_MS = 300;
-/** Lets the navigation reset settle before the "deleted" alert is presented over the new screen. */
+/** Lets the guard's navigation reset settle before the "deleted" alert is presented over Discovery. */
 const CONFIRMATION_DELAY_MS = 450;
 
 /**
@@ -108,19 +108,26 @@ export default function DeleteAccountScreen({ navigation }: DeleteAccountScreenP
       }
       return;
     }
-    // LEAVE FIRST (device QA, 23 Sep). The account is gone server-side and the
-    // flow has already dropped the local session, so this screen is meaningless.
-    // Navigation used to live in the confirmation's OK button: if iOS did not
-    // present that alert, the user stayed here, apparently still signed in.
-    navigation.reset({ index: 0, routes: [{ name: 'Discovery' }] });
+    // NAVIGATION IS NOT THIS SCREEN'S JOB (device QA, 23 Sep). The deletion flow
+    // purged the auth state synchronously before its first await, and the
+    // account-route guard in RootNavigator reset to Discovery inside that same
+    // setState - so by the time this line runs, this screen is normally already
+    // gone. This is only a fallback, and a loud one: reaching it means the guard
+    // did not fire (e.g. the state was already signed_out).
+    if (navigation.isFocused()) {
+      console.warn('[Account] deleted, but the auth guard did not leave DeleteAccount; resetting directly');
+      navigation.reset({ index: 0, routes: [{ name: 'Discovery' }] });
+    }
 
-    // Then confirm, on the guest Discovery screen. If this alert is dropped, the
-    // user is already where they should be.
-    // For Apple accounts, the evidence QA needs: did this request carry a code,
-    // and what did the server decide? Matches the function's log line.
-    const reference = appleIdentity
-      ? `\n\nReference: Apple code sent: ${outcome.appleCodeSent ? 'yes' : 'no'} / revocation: ${outcome.appleRevocation ?? 'unknown'}`
-      : '';
+    // Confirm on the guest Discovery screen. For Apple accounts, and whenever
+    // the local teardown was not clean, show the evidence QA needs.
+    const lines = [
+      appleIdentity
+        ? `Apple code sent: ${outcome.appleCodeSent ? 'yes' : 'no'} / revocation: ${outcome.appleRevocation ?? 'unknown'}`
+        : null,
+      outcome.localTeardown !== 'clean' ? `Local sign-out: ${outcome.localTeardown}` : null,
+    ].filter((line): line is string => line !== null);
+    const reference = lines.length > 0 ? `\n\nReference: ${lines.join(' / ')}` : '';
     setTimeout(() => {
       Alert.alert(
         'Account deleted',

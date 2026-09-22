@@ -89,15 +89,43 @@ export function lastKnownAccessToken(): string | null {
   return lastAccessToken;
 }
 
-/** For a sign-out that bypassed supabase-js (see AccountService.forceLocalSignOut). */
-export function markSignedOutLocally(): void {
+/**
+ * Accounts deleted in this process. A session for one of them is never applied
+ * again - see markSignedOutLocally. User ids are uuids and never reused, so a
+ * person who signs in again after deleting gets a new id and is unaffected.
+ */
+const tombstonedUserIds = new Set<string>();
+
+/**
+ * Purge everything the UI reads about the session - SYNCHRONOUSLY, with no I/O.
+ *
+ * Why synchronous (Epic 11 device QA, 23 Sep): the UI reads this store, and
+ * the account-route guard in RootNavigator subscribes to it. zustand notifies
+ * subscribers inside setState, so when this returns, every screen and the guard
+ * have already seen `signed_out`. Nothing can be rendered, or navigated to, in
+ * between. The session on disk and inside supabase-js is dropped afterwards by
+ * the caller; that part is async and may lag, but nothing the UI reads does.
+ *
+ * `tombstoneUserId` (account deletion): a token refresh that already held the
+ * auth-js lock when the account was deleted still completes, saves a session
+ * and emits TOKEN_REFRESHED before signOut() can run. Without the tombstone
+ * that event would put the deleted account back on screen.
+ */
+export function markSignedOutLocally(options: { tombstoneUserId?: string } = {}): void {
+  if (options.tombstoneUserId) tombstonedUserIds.add(options.tombstoneUserId);
   lastAccessToken = null;
   useAuth.setState({ status: 'signed_out', account: null });
 }
 
 function apply(session: Session | null): void {
-  lastAccessToken = session?.access_token ?? null;
-  const account = accountFromSession(session);
+  let live = session;
+  if (session !== null && tombstonedUserIds.has(session.user.id)) {
+    // Loud, not silent: this is supabase-js still holding a deleted account.
+    console.warn('[Auth] ignored a session for an account deleted on this device');
+    live = null;
+  }
+  lastAccessToken = live?.access_token ?? null;
+  const account = accountFromSession(live);
   useAuth.setState({ status: account ? 'signed_in' : 'signed_out', account });
 }
 

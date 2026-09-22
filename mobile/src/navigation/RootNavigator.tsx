@@ -1,6 +1,6 @@
 import { NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 
 import AudioPlayerSheet from '../components/AudioPlayerSheet';
 import { usePreferences, usePreferencesBoot } from '../personalization/preferencesStore';
@@ -14,6 +14,8 @@ import OnboardingTimeScreen from '../screens/onboarding/OnboardingTimeScreen';
 import WelcomeScreen from '../screens/onboarding/WelcomeScreen';
 import SettingsScreen from '../screens/SettingsScreen';
 import TourDetailScreen from '../screens/TourDetailScreen';
+import { useAuth } from '../services/auth/authStore';
+import { routeAfterAuthChange } from './accountGuard';
 import { navigationRef } from './navigationRef';
 import type { RootStackParamList } from './types';
 
@@ -59,6 +61,20 @@ export default function RootNavigator() {
   const syncRoute = useCallback(() => {
     setRouteName(navigationRef.getCurrentRoute()?.name);
   }, []);
+
+  // Account-only screens follow the auth state (accountGuard.ts). A zustand
+  // subscription, not a render-time hook: it runs synchronously INSIDE the
+  // setState that signed the user out, before React renders anything, so the
+  // screen is left in the same turn as the purge.
+  useEffect(
+    () =>
+      useAuth.subscribe((state, previous) => {
+        if (!navigationRef.isReady()) return;
+        const target = routeAfterAuthChange(previous.status, state.status, navigationRef.getCurrentRoute()?.name);
+        if (target !== null) navigationRef.reset({ index: 0, routes: [{ name: target }] });
+      }),
+    [],
+  );
 
   if (!preferencesReady) return null;
 

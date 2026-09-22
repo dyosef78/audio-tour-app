@@ -113,17 +113,17 @@ async function invokeDelete(body: Record<string, unknown>, signal: AbortSignal):
   }
 }
 
-/** Drops the stored session without supabase-js - no auth lock, no network. */
-async function forceLocalSignOut(): Promise<void> {
+/**
+ * Removes the stored session without supabase-js - no auth lock, no network.
+ * Storage only: the UI state is purged separately and synchronously first
+ * (purgeAuthState), so a slow Keychain can never keep a deleted account on screen.
+ */
+async function dropStoredSession(): Promise<void> {
   // storageKey is a public property at runtime; supabase-js only types it protected.
   const storageKey = (supabase.auth as unknown as { storageKey: string }).storageKey;
-  try {
-    await secureSessionStorage.removeItem(storageKey);
-  } finally {
-    // supabase-js re-reads storage on every getSession(), so with the item gone
-    // it sees no session; the mirror is updated here because no event will fire.
-    markSignedOutLocally();
-  }
+  // supabase-js re-reads storage on every getSession(), so with the item gone
+  // it sees no session.
+  await secureSessionStorage.removeItem(storageKey);
 }
 
 export function deleteAccount(options: DeletionOptions = {}): Promise<DeleteAccountOutcome> {
@@ -137,6 +137,8 @@ export function deleteAccount(options: DeletionOptions = {}): Promise<DeleteAcco
     invokeDelete,
     // `local`: the server session died with the user. supabase-js removes the
     // stored session even though the revoke call is now refused.
+    // Captured NOW: by the time the purge runs, the store no longer holds the account.
+    purgeAuthState: () => markSignedOutLocally({ tombstoneUserId: account?.id }),
     signOutLocally: async () => {
       // supabase-js RETURNS its error rather than throwing. Ignoring it is what
       // let a failed sign-out look successful (device QA, 23 Sep); the flow now
@@ -144,7 +146,7 @@ export function deleteAccount(options: DeletionOptions = {}): Promise<DeleteAcco
       const { error } = await supabase.auth.signOut({ scope: 'local' });
       if (error) throw error;
     },
-    forceLocalSignOut,
+    dropStoredSession,
     revokeGoogleAccess: async () => {
       if (!isGoogleSignInConfigured()) return;
       configureGoogle();

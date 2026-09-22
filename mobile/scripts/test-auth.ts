@@ -22,7 +22,15 @@ import {
   type DeletionOptions,
   type InvokeResult,
 } from '../src/services/auth/accountDeletion.ts';
-import { accountFromSession, hasProvider, lastKnownAccessToken, startAuth, useAuth } from '../src/services/auth/authStore.ts';
+import {
+  accountFromSession,
+  hasProvider,
+  lastKnownAccessToken,
+  markSignedOutLocally,
+  startAuth,
+  useAuth,
+} from '../src/services/auth/authStore.ts';
+import { routeAfterAuthChange } from '../src/navigation/accountGuard.ts';
 import {
   ciphertextKeyFor,
   keychainKeyFor,
@@ -267,6 +275,24 @@ await flush();
 eq('an erroring recheck leaves a signed-in user signed in', useAuth.getState().status, 'signed_in');
 getSession.mock.restore();
 
+// The purge is synchronous: the state (and every subscriber, i.e. the route
+// guard) sees signed_out by the time the call returns - no await in between.
+const seen: string[] = [];
+const unsubscribe = useAuth.subscribe((state) => seen.push(state.status));
+markSignedOutLocally({ tombstoneUserId: 'user-1' });
+eq('markSignedOutLocally is synchronous: signed_out on the very next line', useAuth.getState().status, 'signed_out');
+eq('...and subscribers were notified inside the call', seen, ['signed_out']);
+unsubscribe();
+eq('...and the fallback token is gone at once', lastKnownAccessToken(), null);
+
+// Resurrection: supabase-js still holds user-1's session in storage. A
+// foreground recheck (or a late TOKEN_REFRESHED) re-applies it - the tombstone
+// must keep the deleted account off screen.
+__emitAppState('active');
+for (let i = 0; i < 20; i++) await flush();
+eq('TOMBSTONE: a later session event for the deleted account is ignored', useAuth.getState().status, 'signed_out');
+eq('...and its token is not exposed as the fallback', lastKnownAccessToken(), null);
+
 // Sign-out with no reachable server: supabase-js must still drop the session.
 const { error: signOutError } = await supabase.auth.signOut({ scope: 'local' });
 assert('sign-out could not reach the (placeholder) server', signOutError !== null);
@@ -305,6 +331,8 @@ function deletionHarness(opts: {
   invoke?: Behaviour<InvokeResult>;
   signOut?: 'ok' | 'hang' | 'throw';
   google?: 'ok' | 'hang' | 'throw';
+  purge?: 'ok' | 'throw';
+  drop?: 'ok' | 'hang' | 'throw';
   options?: DeletionOptions;
 }) {
   const calls: string[] = [];
@@ -330,7 +358,11 @@ function deletionHarness(opts: {
       });
     },
     signOutLocally: () => act('signOut', opts.signOut === 'ok' ? undefined : opts.signOut, undefined),
-    forceLocalSignOut: () => act('forceSignOut', undefined, undefined),
+    purgeAuthState: () => {
+      calls.push('purge');
+      if (opts.purge === 'throw') throw new Error('guard exploded');
+    },
+    dropStoredSession: () => act('drop', opts.drop === 'ok' ? undefined : opts.drop, undefined),
     revokeGoogleAccess: () => act('google', opts.google === 'ok' ? undefined : opts.google, undefined),
     options: opts.options,
     timeouts: FAST,
@@ -348,15 +380,15 @@ async function settle(deps: AccountDeletionDeps): Promise<{ outcome: DeleteAccou
 
 {
   const h = deletionHarness({ provider: 'google' });
-  eq('Google: deleted', (await settle(h.deps)).outcome, { kind: 'deleted', appleCodeSent: false, appleRevocation: 'no_code_in_request' });
-  eq('...server FIRST, then local sign-out; never Apple', h.calls.slice(0, 2), ['invoke', 'signOut']);
+  eq('Google: deleted', (await settle(h.deps)).outcome, { kind: 'deleted', appleCodeSent: false, appleRevocation: 'no_code_in_request', localTeardown: 'clean' });
+  eq('...server FIRST, then the UI purge and local sign-out; never Apple', h.calls.slice(0, 3), ['invoke', 'purge', 'signOut']);
   eq('...and the body names no user', h.bodies, [{}]);
   await new Promise((r) => setTimeout(r, 5));
   assert('...Google access revoked afterwards, off the critical path', h.calls.includes('google'));
 }
 {
   const h = deletionHarness({ provider: 'apple' });
-  eq('Apple: deleted, and says the code was sent', (await settle(h.deps)).outcome, { kind: 'deleted', appleCodeSent: true, appleRevocation: 'scheduled' });
+  eq('Apple: deleted, and says the code was sent', (await settle(h.deps)).outcome, { kind: 'deleted', appleCodeSent: true, appleRevocation: 'scheduled', localTeardown: 'clean' });
   eq('...confirms with Apple before anything is sent', h.calls.slice(0, 2), ['apple', 'invoke']);
   eq('...and sends the fresh authorization code', h.bodies, [{ apple_authorization_code: 'apple-code' }]);
 }
@@ -390,7 +422,7 @@ for (const [label, apple, code] of APPLE_FAILURES) {
 {
   // The way out of a sheet that keeps failing: one tap, no sheet.
   const h = deletionHarness({ provider: 'apple', apple: 'throw', options: { skipAppleConfirmation: true } });
-  eq('"Delete without Apple": deleted, and says NO code was sent', (await settle(h.deps)).outcome, { kind: 'deleted', appleCodeSent: false, appleRevocation: 'no_code_in_request' });
+  eq('"Delete without Apple": deleted, and says NO code was sent', (await settle(h.deps)).outcome, { kind: 'deleted', appleCodeSent: false, appleRevocation: 'no_code_in_request', localTeardown: 'clean' });
   eq('...WITHOUT presenting the Apple sheet at all', h.calls.includes('apple'), false);
   eq('...and without a code (revocation is the only cost)', h.bodies, [{}]);
 }
@@ -417,30 +449,76 @@ for (const [label, apple, code] of APPLE_FAILURES) {
   const { outcome } = await settle(h.deps);
   eq('LINKED Apple identity: the Apple sheet IS shown', h.calls[0], 'apple');
   eq('...and the code IS sent', h.bodies, [{ apple_authorization_code: 'apple-code' }]);
-  eq('...and the outcome says so', outcome, { kind: 'deleted', appleCodeSent: true, appleRevocation: 'scheduled' });
+  eq('...and the outcome says so', outcome, { kind: 'deleted', appleCodeSent: true, appleRevocation: 'scheduled', localTeardown: 'clean' });
 }
 {
   // After a 200 the session is a ghost: BOTH teardown steps must run, always.
   const h = deletionHarness({ provider: 'apple' });
   await settle(h.deps);
-  eq('200: supabase-js sign-out AND the direct session drop both run, in that order', h.calls.slice(2), ['signOut', 'forceSignOut']);
+  eq('200: UI purge FIRST, then supabase-js sign-out, then the stored-session drop', h.calls.slice(2), ['purge', 'signOut', 'drop']);
 }
 {
   // supabase-js signOut RETURNS {error} instead of throwing; the wrapper now
   // throws it. Either way the session must still be dropped.
   const h = deletionHarness({ provider: 'google', signOut: 'throw' });
   eq('sign-out reports an error after a real deletion -> still "deleted"', (await settle(h.deps)).outcome.kind, 'deleted');
-  assert('...and the session is dropped directly', h.calls.includes('forceSignOut'));
+  assert('...and the session is dropped directly', h.calls.includes('drop'));
 }
 {
   const h = deletionHarness({ provider: 'google', invoke: { status: 401, data: null } });
   await settle(h.deps);
-  eq('401 (session already dead): the same full teardown', h.calls.slice(1), ['signOut', 'forceSignOut']);
+  eq('401 (session already dead): the same full teardown', h.calls.slice(1), ['purge', 'signOut', 'drop']);
 }
 {
   const h = deletionHarness({ provider: 'apple', invoke: { status: 200, data: { deleted: true } } });
-  eq('an older server without apple_revocation_reason -> null, not a crash', (await settle(h.deps)).outcome, { kind: 'deleted', appleCodeSent: true, appleRevocation: null });
+  eq('an older server without apple_revocation_reason -> null, not a crash', (await settle(h.deps)).outcome, { kind: 'deleted', appleCodeSent: true, appleRevocation: null, localTeardown: 'clean' });
 }
+
+// --- RACE ANALYSIS (23 Sep): the UI purge is synchronous, first, and reported ---
+{
+  // Stall supabase-js AND storage: the UI purge must already have happened,
+  // before either was even started - i.e. before the teardown's first await.
+  let purgedBeforeSignOut = false;
+  const h = deletionHarness({ provider: 'apple', signOut: 'hang', drop: 'hang' });
+  const signOut = h.deps.signOutLocally;
+  h.deps.signOutLocally = () => {
+    purgedBeforeSignOut = h.calls.includes('purge');
+    return signOut();
+  };
+  const { outcome } = await settle(h.deps);
+  assert('the UI purge runs BEFORE supabase-js sign-out is even called', purgedBeforeSignOut);
+  eq('...both stalls are reported, not hidden: storage unconfirmed -> incomplete', outcome.kind === 'deleted' ? outcome.localTeardown : outcome, 'incomplete');
+}
+{
+  const h = deletionHarness({ provider: 'google', signOut: 'throw' });
+  const { outcome } = await settle(h.deps);
+  eq('supabase-js sign-out failed but storage cleared -> forced', outcome.kind === 'deleted' ? outcome.localTeardown : outcome, 'forced');
+}
+{
+  // A throwing purge (e.g. a subscriber - the route guard - throwing inside
+  // setState) must not stop the rest of the teardown, and must be reported.
+  const h = deletionHarness({ provider: 'google', purge: 'throw' });
+  const { outcome } = await settle(h.deps);
+  eq('the UI purge throws -> teardown continues', h.calls.slice(1, 4), ['purge', 'signOut', 'drop']);
+  eq('...and says so: incomplete', outcome.kind === 'deleted' ? outcome.localTeardown : outcome, 'incomplete');
+}
+{
+  const h = deletionHarness({ provider: 'google', invoke: { status: 401, data: null }, drop: 'throw' });
+  eq(
+    '401 with a failed storage drop -> session_expired, carrying the teardown result',
+    (await settle(h.deps)).outcome,
+    { kind: 'failed', reason: 'session_expired', detail: 'local teardown incomplete' },
+  );
+}
+
+heading('Account-route guard (auth-driven navigation)');
+eq('signed_in -> signed_out on DeleteAccount: leave for Discovery', routeAfterAuthChange('signed_in', 'signed_out', 'DeleteAccount'), 'Discovery');
+eq('...but not from Settings: it renders the guest view itself', routeAfterAuthChange('signed_in', 'signed_out', 'Settings'), null);
+eq('...nor from Discovery or an active tour', [routeAfterAuthChange('signed_in', 'signed_out', 'Discovery'), routeAfterAuthChange('signed_in', 'signed_out', 'ActiveTour')], [null, null]);
+eq('boot restore (restoring -> signed_out) never moves anyone', routeAfterAuthChange('restoring', 'signed_out', 'DeleteAccount'), null);
+eq('signing IN never moves anyone', routeAfterAuthChange('signed_out', 'signed_in', 'DeleteAccount'), null);
+eq('a repeated signed_out (e.g. SIGNED_OUT after the purge) is not a transition', routeAfterAuthChange('signed_out', 'signed_out', 'DeleteAccount'), null);
+eq('no current route yet (navigator not ready) -> stay', routeAfterAuthChange('signed_in', 'signed_out', undefined), null);
 
 // --- THE DEVICE-QA FAILURE: nothing may leave the screen waiting forever -------
 {
@@ -449,19 +527,19 @@ for (const [label, apple, code] of APPLE_FAILURES) {
   eq('HANG: a request that never answers -> timeout', outcome, { kind: 'failed', reason: 'timeout' });
   assert('...within the request budget', ms < FAST.requestMs + 150, `${ms} ms`);
   assert('...and the request is actually aborted, not just abandoned', h.signals[0]?.aborted === true);
-  assert('...and the user stays signed in (the account may still exist)', !h.calls.includes('signOut') && !h.calls.includes('forceSignOut'));
+  assert('...and the user stays signed in (the account may still exist)', !h.calls.includes('purge') && !h.calls.includes('signOut'));
 }
 {
   const h = deletionHarness({ provider: 'google', signOut: 'hang' });
   const { outcome, ms } = await settle(h.deps);
   eq('HANG: sign-out stalls after a real deletion -> still "deleted"', outcome.kind, 'deleted');
   assert('...within the sign-out budget', ms < FAST.signOutMs + 150, `${ms} ms`);
-  assert('...and the session is dropped directly instead', h.calls.includes('forceSignOut'));
+  assert('...and the session is dropped directly instead', h.calls.includes('drop'));
 }
 {
   const h = deletionHarness({ provider: 'google', signOut: 'throw' });
   eq('sign-out throws after a real deletion -> still "deleted"', (await settle(h.deps)).outcome.kind, 'deleted');
-  assert('...session dropped directly', h.calls.includes('forceSignOut'));
+  assert('...session dropped directly', h.calls.includes('drop'));
 }
 {
   const h = deletionHarness({ provider: 'google', google: 'hang' });
@@ -472,7 +550,7 @@ for (const [label, apple, code] of APPLE_FAILURES) {
 {
   const h = deletionHarness({ provider: 'google', invoke: { status: 401, data: null }, signOut: 'hang' });
   const { outcome, ms } = await settle(h.deps);
-  eq('HANG: 401 then a stalled sign-out -> session_expired, promptly', outcome, { kind: 'failed', reason: 'session_expired' });
+  eq('HANG: 401 then a stalled sign-out -> session_expired, promptly, and the stall is REPORTED', outcome, { kind: 'failed', reason: 'session_expired', detail: 'local teardown forced' });
   assert('...bounded', ms < FAST.signOutMs * 2 + 150, `${ms} ms`);
 }
 

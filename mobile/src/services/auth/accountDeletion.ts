@@ -75,6 +75,8 @@ export type DeleteAccountOutcome =
       appleCodeSent: boolean;
       /** The server's apple_revocation_reason ('scheduled', 'no_code_in_request', ...), or null if absent. */
       appleRevocation: string | null;
+      /** How cleanly the local session was removed. Anything but 'clean' is shown to QA. */
+      localTeardown: LocalTeardown;
     }
   | { kind: 'failed'; reason: DeletionFailureReason; detail?: string };
 
@@ -113,10 +115,15 @@ export interface AccountDeletionDeps {
   reauthenticateWithApple: () => Promise<AppleReauthentication>;
   /** Must honour `signal`: it is aborted when the request runs out of time. */
   invokeDelete: (body: Record<string, unknown>, signal: AbortSignal) => Promise<InvokeResult>;
+  /**
+   * SYNCHRONOUS: purge the in-memory auth state the UI reads (and tombstone the
+   * account). Runs before any await in the teardown. See tearDownLocalSession.
+   */
+  purgeAuthState: () => void;
   /** supabase-js sign-out. Must REJECT on failure - supabase-js returns its error instead of throwing. */
   signOutLocally: () => Promise<void>;
-  /** Drops the stored session and the auth mirror without the network or the auth lock. Idempotent. */
-  forceLocalSignOut: () => Promise<void>;
+  /** Removes the stored session without the network or the auth lock. Idempotent. */
+  dropStoredSession: () => Promise<void>;
   revokeGoogleAccess: () => Promise<void>;
   options?: DeletionOptions;
   timeouts?: Partial<typeof DELETION_TIMEOUTS>;
@@ -188,8 +195,12 @@ async function deletionFlow(
   switch (result.status) {
     case 401:
       // Most often: the account is already gone (a retry after a lost answer).
-      await tearDownLocalSession(deps, timeouts, log);
-      return { kind: 'failed', reason: 'session_expired' };
+      {
+        const teardown = await tearDownLocalSession(deps, timeouts, log);
+        return teardown === 'clean'
+          ? { kind: 'failed', reason: 'session_expired' }
+          : { kind: 'failed', reason: 'session_expired', detail: `local teardown ${teardown}` };
+      }
     case 403:
       return { kind: 'failed', reason: 'admin_account' };
     case 504:
@@ -201,7 +212,7 @@ async function deletionFlow(
   }
 
   // 3. The account is gone. Local clean-up must not be able to hide that.
-  await tearDownLocalSession(deps, timeouts, log);
+  const localTeardown = await tearDownLocalSession(deps, timeouts, log);
   if (deps.googleIdentity) {
     // Not awaited: the answer to the user does not depend on Google.
     void raceTimeout(
@@ -214,6 +225,7 @@ async function deletionFlow(
     kind: 'deleted',
     appleCodeSent: typeof body.apple_authorization_code === 'string',
     appleRevocation: typeof reason === 'string' ? reason : null,
+    localTeardown,
   };
 }
 
@@ -222,34 +234,59 @@ function isDeleted(data: unknown): boolean {
 }
 
 /**
- * After the server has deleted the account (or refused its session), every
- * local trace of the session is a ghost. Two steps, BOTH always run:
+ * What happened to the local session after the server deleted the account (or
+ * refused its session). Reported, not swallowed (CLAUDE.md: fail loud):
+ *   clean       UI purged, supabase-js signed out, stored session removed
+ *   forced      supabase-js sign-out failed or timed out; stored session removed directly
+ *   incomplete  the stored session could not be confirmed removed, or the UI
+ *               purge itself threw. The UI still shows signed out; supabase-js
+ *               may hold the dead session until it next reads and discards it.
+ */
+export type LocalTeardown = 'clean' | 'forced' | 'incomplete';
+
+/**
+ * Three steps, ALL always run, in this order:
  *
- *   1. supabase-js signOut, bounded - so its in-memory state and listeners
- *      learn about it (SIGNED_OUT).
- *   2. forceLocalSignOut, unconditionally - drops the stored session and sets
- *      the auth mirror to signed_out without the network or the auth lock.
- *
- * Step 2 used to run only if step 1 timed out or threw. But supabase-js signOut
- * RETURNS an error instead of throwing, and when loading the session fails it
- * returns without removing it - so a "successful" sign-out could leave the
- * session in place: the ghost state seen in device QA (23 Sep).
+ *   1. purgeAuthState - SYNCHRONOUS, no I/O, before the first await. When it
+ *      returns, the UI and the account-route guard already see signed_out, so
+ *      no screen can render the deleted account from here on (device QA,
+ *      23 Sep: the purge used to come LAST, after storage I/O inside a race).
+ *   2. supabase-js signOut, bounded - so its in-memory state learns about it.
+ *   3. dropStoredSession, bounded - removes the session from disk regardless of
+ *      step 2, because supabase-js signOut RETURNS an error instead of throwing
+ *      and can leave the session behind.
  */
 async function tearDownLocalSession(
   deps: AccountDeletionDeps,
   timeouts: typeof DELETION_TIMEOUTS,
   log: (message: string) => void,
-): Promise<void> {
+): Promise<LocalTeardown> {
+  let uiPurged = true;
+  try {
+    deps.purgeAuthState();
+  } catch (err) {
+    uiPurged = false;
+    log(`UI auth purge threw: ${describe(err)}`);
+  }
+
+  let signedOut = false;
   try {
     const raced = await raceTimeout(deps.signOutLocally(), timeouts.signOutMs);
-    if (raced.timedOut) log(`sign-out did not finish within ${timeouts.signOutMs} ms`);
+    signedOut = !raced.timedOut;
+    if (raced.timedOut) log(`supabase-js sign-out did not finish within ${timeouts.signOutMs} ms`);
   } catch (err) {
-    log(`sign-out failed: ${describe(err)}`);
+    log(`supabase-js sign-out failed: ${describe(err)}`);
   }
+
+  let dropped = false;
   try {
-    const raced = await raceTimeout(deps.forceLocalSignOut(), timeouts.signOutMs);
-    if (raced.timedOut) log(`local session drop did not finish within ${timeouts.signOutMs} ms`);
+    const raced = await raceTimeout(deps.dropStoredSession(), timeouts.signOutMs);
+    dropped = !raced.timedOut;
+    if (raced.timedOut) log(`stored session drop did not finish within ${timeouts.signOutMs} ms`);
   } catch (err) {
-    log(`local session drop failed: ${describe(err)}`);
+    log(`stored session drop failed: ${describe(err)}`);
   }
+
+  if (!uiPurged || !dropped) return 'incomplete';
+  return signedOut ? 'clean' : 'forced';
 }
