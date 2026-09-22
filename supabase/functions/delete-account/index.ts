@@ -20,7 +20,7 @@
 import { createClient } from '@supabase/supabase-js';
 
 import { appleRevokeConfigFromEnv, createAppleRevoker } from './appleRevoke.ts';
-import { handleDeleteAccount, type DeleteAccountDeps } from './handler.ts';
+import { DEFAULT_DEADLINES, handleDeleteAccount, type DeleteAccountDeps } from './handler.ts';
 
 const env = Deno.env.toObject();
 const supabaseUrl = env.SUPABASE_URL;
@@ -54,7 +54,9 @@ const isCmsAdmin: DeleteAccountDeps['isCmsAdmin'] = admin
       const { count, error } = await admin
         .from('app_admins')
         .select('user_id', { count: 'exact', head: true })
-        .eq('user_id', userId);
+        .eq('user_id', userId)
+        // Cancels the query itself at the handler's deadline, not just the wait.
+        .abortSignal(AbortSignal.timeout(DEFAULT_DEADLINES.adminCheckMs));
       if (error) throw new Error(`app_admins lookup: ${error.message}`);
       return (count ?? 0) > 0;
     }
@@ -76,4 +78,13 @@ const appleRevoker = appleConfig ? createAppleRevoker(appleConfig) : null;
 if (!appleRevoker) console.log(JSON.stringify({ event: 'apple_revoke_disabled', reason: 'APPLE_* secrets not set' }));
 if (!admin) console.log(JSON.stringify({ event: 'delete_account_disabled', reason: 'SUPABASE_SERVICE_ROLE_KEY missing' }));
 
-Deno.serve((request) => handleDeleteAccount(request, { authenticate, isCmsAdmin, deleteUser, appleRevoker }));
+// Supabase's Edge Runtime keeps a promise alive after the response with
+// EdgeRuntime.waitUntil, so Apple revocation never delays the answer. Read off
+// globalThis: under `deno test` or a plain Deno the global does not exist.
+const edgeRuntime = (globalThis as { EdgeRuntime?: { waitUntil?: (task: Promise<unknown>) => void } }).EdgeRuntime;
+const runInBackground =
+  typeof edgeRuntime?.waitUntil === 'function' ? (task: Promise<unknown>) => edgeRuntime.waitUntil!(task) : null;
+
+Deno.serve((request) =>
+  handleDeleteAccount(request, { authenticate, isCmsAdmin, deleteUser, appleRevoker, runInBackground }),
+);

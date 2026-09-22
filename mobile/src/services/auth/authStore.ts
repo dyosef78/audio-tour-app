@@ -55,7 +55,30 @@ export function accountFromSession(session: Session | null): Account | null {
   };
 }
 
+/**
+ * The access token from the last auth event, kept OUT of the zustand state so
+ * it never reaches a render or a devtools dump.
+ *
+ * Why it exists (Epic 11 device-QA fix): supabase-js hands out tokens through
+ * getSession(), which queues behind its auth lock - and a token refresh holds
+ * that lock across network retries with no timeout. AccountService uses this
+ * as the fallback when getSession() does not answer in time, so a stuck refresh
+ * cannot stop an account from being deleted. The server re-verifies it anyway.
+ */
+let lastAccessToken: string | null = null;
+
+export function lastKnownAccessToken(): string | null {
+  return lastAccessToken;
+}
+
+/** For a sign-out that bypassed supabase-js (see AccountService.forceLocalSignOut). */
+export function markSignedOutLocally(): void {
+  lastAccessToken = null;
+  useAuth.setState({ status: 'signed_out', account: null });
+}
+
 function apply(session: Session | null): void {
+  lastAccessToken = session?.access_token ?? null;
   const account = accountFromSession(session);
   useAuth.setState({ status: account ? 'signed_in' : 'signed_out', account });
 }

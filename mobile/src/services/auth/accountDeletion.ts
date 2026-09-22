@@ -1,34 +1,60 @@
+import { raceTimeout } from '../../lib/timeout';
+
 /**
- * Account deletion, as a sequence of decisions (TASK-1104).
+ * Account deletion, as a sequence of decisions (TASK-1104; hardened after the
+ * Epic 11 device-QA failure, where the screen froze and nothing was deleted).
  *
  * Pure: every platform call is injected, so `npm run test:auth` walks each
- * branch. AccountService.ts supplies the real ones. The server half is
- * supabase/functions/delete-account.
+ * branch, including every dependency hanging forever. AccountService.ts
+ * supplies the real ones. The server half is supabase/functions/delete-account.
  *
- *   1. Apple users confirm with Apple once more. That is both the "are you
- *      sure" of a destructive action and the source of the authorization code
- *      the server needs to revoke their Apple tokens. Backing out cancels.
- *   2. The server deletes the account the SESSION belongs to.
- *   3. Only then is this device signed out, and Google access revoked.
+ *   1. Apple users confirm with Apple once more. That is the "are you sure" of a
+ *      destructive action and the source of the authorization code the server
+ *      uses to revoke their Apple tokens. Backing out cancels. Deliberately NOT
+ *      time-limited: it is the user reading a system sheet.
+ *   2. The server deletes the account the SESSION belongs to - within
+ *      `requestMs`, or the request is aborted and reported as `timeout`.
+ *   3. Only then is this device signed out - within `signOutMs`, or the stored
+ *      session is dropped directly - and Google access revoked in the background.
+ *
+ * INVARIANT: runAccountDeletion always settles, in bounded time, and never
+ * rejects. Worst case after the Apple sheet: requestMs + 2 x signOutMs (13 s
+ * of which the last 3 s is a local-storage fallback that is normally instant).
+ * The screen that awaits it can therefore always unlock.
  *
  * Nothing on the device is wiped beyond the session: downloaded tours,
- * preferences and the city belong to the phone, not the account, and a guest
- * keeps all of them.
+ * preferences and the city belong to the phone, not the account.
  */
 
+export const DELETION_TIMEOUTS = {
+  /** Getting the token AND the round trip. The server answers inside ~9.5 s at worst. */
+  requestMs: 10_000,
+  /** supabase-js signOut holds the auth lock around a network call with no timeout. */
+  signOutMs: 3_000,
+  /** Google's revoke is cosmetic for us; it must never hold the screen. */
+  googleRevokeMs: 3_000,
+};
+
+export type DeletionFailureReason =
+  /** Never reached the server; nothing changed. */
+  | 'offline'
+  /** The server did not accept the session; the device is now signed out. */
+  | 'session_expired'
+  /** A CMS administrator; removed by the team instead. */
+  | 'admin_account'
+  /** The server failed before deleting; nothing changed. Safe to retry. */
+  | 'server'
+  /**
+   * No answer in time, or the server could not confirm the delete. The account
+   * may or may not be gone. A retry is safe: the server is idempotent, and a
+   * deleted account's session is refused (-> session_expired).
+   */
+  | 'timeout';
+
 export type DeleteAccountOutcome =
-  | { kind: 'deleted'; appleTokenRevoked: boolean | null }
+  | { kind: 'deleted' }
   | { kind: 'cancelled' }
-  | {
-      kind: 'failed';
-      /**
-       * offline          - never reached the server; nothing changed
-       * session_expired  - the server did not accept the session; the device is now signed out
-       * admin_account    - a CMS administrator; removed by the team instead
-       * server           - the server failed; nothing was deleted, safe to retry
-       */
-      reason: 'offline' | 'session_expired' | 'admin_account' | 'server';
-    };
+  | { kind: 'failed'; reason: DeletionFailureReason };
 
 export type AppleReauthentication = { authorizationCode: string } | 'cancelled' | 'unavailable';
 
@@ -38,65 +64,126 @@ export interface AccountDeletionDeps {
   /** app_metadata.provider of the signed-in account. */
   provider: string | null;
   reauthenticateWithApple: () => Promise<AppleReauthentication>;
-  invokeDelete: (body: Record<string, unknown>) => Promise<InvokeResult>;
+  /** Must honour `signal`: it is aborted when the request runs out of time. */
+  invokeDelete: (body: Record<string, unknown>, signal: AbortSignal) => Promise<InvokeResult>;
   signOutLocally: () => Promise<void>;
+  /** Drops the stored session without the network or the auth lock. The fallback when signOutLocally stalls. */
+  forceLocalSignOut: () => Promise<void>;
   revokeGoogleAccess: () => Promise<void>;
+  timeouts?: Partial<typeof DELETION_TIMEOUTS>;
   log?: (message: string) => void;
 }
 
+const describe = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+
 export async function runAccountDeletion(deps: AccountDeletionDeps): Promise<DeleteAccountOutcome> {
   const log = deps.log ?? ((message) => console.warn(`[Account] ${message}`));
+  try {
+    return await deletionFlow(deps, { ...DELETION_TIMEOUTS, ...deps.timeouts }, log);
+  } catch (err) {
+    // Unreachable by design - every step below catches - but the invariant is
+    // that this function never rejects, so it is enforced rather than assumed.
+    log(`deletion flow threw: ${describe(err)}`);
+    return { kind: 'failed', reason: 'server' };
+  }
+}
+
+async function deletionFlow(
+  deps: AccountDeletionDeps,
+  timeouts: typeof DELETION_TIMEOUTS,
+  log: (message: string) => void,
+): Promise<DeleteAccountOutcome> {
   const body: Record<string, unknown> = {};
 
+  // 1. Apple confirmation.
   if (deps.provider === 'apple') {
-    const reauth = await deps.reauthenticateWithApple();
+    let reauth: AppleReauthentication;
+    try {
+      reauth = await deps.reauthenticateWithApple();
+    } catch (err) {
+      // The user already confirmed in our own dialog; a broken Apple sheet
+      // costs the token revocation, not the deletion.
+      log(`Apple re-authentication failed: ${describe(err)}`);
+      reauth = 'unavailable';
+    }
     if (reauth === 'cancelled') return { kind: 'cancelled' };
-    // 'unavailable': an Apple account opened on Android. Deletion does not
-    // depend on revocation, so it proceeds without a code.
     if (reauth !== 'unavailable') body.apple_authorization_code = reauth.authorizationCode;
   }
 
-  const result = await deps.invokeDelete(body);
+  // 2. The request, bounded and abortable.
+  const controller = new AbortController();
+  let raced;
+  try {
+    raced = await raceTimeout(deps.invokeDelete(body, controller.signal), timeouts.requestMs);
+  } catch (err) {
+    log(`delete-account request threw: ${describe(err)}`);
+    return { kind: 'failed', reason: 'server' };
+  }
+  if (raced.timedOut) {
+    controller.abort();
+    log(`delete-account gave no answer within ${timeouts.requestMs} ms`);
+    return { kind: 'failed', reason: 'timeout' };
+  }
+  const result = raced.value;
+
   if ('networkError' in result) {
     log(`delete-account unreachable: ${result.networkError}`);
     return { kind: 'failed', reason: 'offline' };
   }
 
-  if (result.status === 401) {
-    // The server does not recognise this session - most often because the
-    // account is already gone (a retry after a lost response). Either way the
-    // local session is useless, so it goes.
-    await signOutQuietly(deps, log);
-    return { kind: 'failed', reason: 'session_expired' };
+  switch (result.status) {
+    case 401:
+      // Most often: the account is already gone (a retry after a lost answer).
+      await signOutBounded(deps, timeouts, log);
+      return { kind: 'failed', reason: 'session_expired' };
+    case 403:
+      return { kind: 'failed', reason: 'admin_account' };
+    case 504:
+      return { kind: 'failed', reason: 'timeout' };
   }
-  if (result.status === 403) return { kind: 'failed', reason: 'admin_account' };
   if (result.status !== 200 || !isDeleted(result.data)) {
     log(`delete-account answered HTTP ${result.status}`);
     return { kind: 'failed', reason: 'server' };
   }
 
-  await signOutQuietly(deps, log);
+  // 3. The account is gone. Local clean-up must not be able to hide that.
+  await signOutBounded(deps, timeouts, log);
   if (deps.provider === 'google') {
-    try {
-      await deps.revokeGoogleAccess();
-    } catch (err) {
-      log(`Google access could not be revoked: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    // Not awaited: the answer to the user does not depend on Google.
+    void raceTimeout(
+      deps.revokeGoogleAccess().catch((err) => log(`Google access could not be revoked: ${describe(err)}`)),
+      timeouts.googleRevokeMs,
+    );
   }
-
-  const revoked = (result.data as { apple_token_revoked?: unknown }).apple_token_revoked;
-  return { kind: 'deleted', appleTokenRevoked: typeof revoked === 'boolean' ? revoked : null };
+  return { kind: 'deleted' };
 }
 
 function isDeleted(data: unknown): boolean {
   return typeof data === 'object' && data !== null && (data as { deleted?: unknown }).deleted === true;
 }
 
-/** The account is already gone server-side; a sign-out error must not turn that into a failure. */
-async function signOutQuietly(deps: AccountDeletionDeps, log: (message: string) => void): Promise<void> {
+/**
+ * Sign out through supabase-js, and if that does not finish in time - it waits
+ * on the auth lock and then on a network call with no timeout - drop the stored
+ * session directly. Either way the device ends up signed out.
+ */
+async function signOutBounded(
+  deps: AccountDeletionDeps,
+  timeouts: typeof DELETION_TIMEOUTS,
+  log: (message: string) => void,
+): Promise<void> {
+  let clean = false;
   try {
-    await deps.signOutLocally();
+    const raced = await raceTimeout(deps.signOutLocally(), timeouts.signOutMs);
+    clean = !raced.timedOut;
+    if (raced.timedOut) log(`sign-out did not finish within ${timeouts.signOutMs} ms; dropping the session directly`);
   } catch (err) {
-    log(`local sign-out failed: ${err instanceof Error ? err.message : String(err)}`);
+    log(`sign-out failed: ${describe(err)}; dropping the session directly`);
+  }
+  if (clean) return;
+  try {
+    await raceTimeout(deps.forceLocalSignOut(), timeouts.signOutMs);
+  } catch (err) {
+    log(`forced sign-out failed: ${describe(err)}`);
   }
 }

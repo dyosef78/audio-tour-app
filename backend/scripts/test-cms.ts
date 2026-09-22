@@ -413,5 +413,30 @@ const outOfRange = planBitrate(60, withOverrides(NARRATION_PRESET, { bitrateKbps
 assert('128 kbps is outside the approved range', !outOfRange.ok && outOfRange.reason === 'bitrate_out_of_range');
 assert('so is a 48 kbps fallback', !planBitrate(60, withOverrides(NARRATION_PRESET, { fallbackBitrateKbps: 48 })).ok);
 
+// -----------------------------------------------------------------------------
+heading('TASK-1104: nothing in the schema can block deleting a user');
+// -----------------------------------------------------------------------------
+// auth.admin.deleteUser fails with "Database error deleting user" if any row
+// still points at the user through a NO ACTION / RESTRICT foreign key - and on
+// a phone that is an account the person can never delete. Every FK to
+// auth.users must say what happens to its rows. Read from the migration files,
+// like everything else here, so a new migration is checked at PR time.
+{
+  const references = migrationFiles.flatMap((file) =>
+    [...read(file).matchAll(/REFERENCES\s+auth\.users\s*\(\s*id\s*\)([^,;\n]*)/gi)].map((m) => ({
+      file,
+      clause: (m[1] ?? '').trim(),
+    })),
+  );
+  assert('the check is not vacuous: FKs to auth.users were found', references.length >= 3, `${references.length} found`);
+  for (const { file, clause } of references) {
+    assert(
+      `${file}: FK to auth.users is ON DELETE CASCADE or SET NULL`,
+      /ON\s+DELETE\s+(CASCADE|SET\s+NULL)/i.test(clause),
+      clause === '' ? 'no ON DELETE clause (defaults to NO ACTION, which blocks the delete)' : clause,
+    );
+  }
+}
+
 console.log(`\n${checks - failures}/${checks} checks passed`);
 if (failures > 0) process.exit(1);

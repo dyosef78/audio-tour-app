@@ -1,20 +1,40 @@
-import { useState, type ReactNode } from 'react';
+import { useRef, useState, type ReactNode } from 'react';
 import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import type { DeleteAccountScreenProps } from '../navigation/types';
 import { deleteAccount } from '../services/auth/AccountService';
-import type { DeleteAccountOutcome } from '../services/auth/accountDeletion';
+import type { DeleteAccountOutcome, DeletionFailureReason } from '../services/auth/accountDeletion';
 import { useAuth } from '../services/auth/authStore';
 import { colors } from '../ui/theme';
 
-const FAILURE_MESSAGE: Record<Extract<DeleteAccountOutcome, { kind: 'failed' }>['reason'], string> = {
-  offline: "You're offline. Connect to the internet and try again - nothing has been deleted.",
-  session_expired:
-    "Your sign-in had expired, so you've been signed out. If you'd already deleted your account, it's gone. Otherwise, sign in again from Settings and retry.",
-  admin_account: 'This is a content administrator account and cannot be deleted from the app. Please ask the Audio Tour team to remove it.',
-  server: "Something went wrong on our side and nothing was deleted. Please try again in a moment.",
+const FAILURE: Record<DeletionFailureReason, { title: string; message: string }> = {
+  offline: {
+    title: "You're offline",
+    message: 'Connect to the internet and try again. Nothing has been deleted.',
+  },
+  session_expired: {
+    title: 'Signed out',
+    message:
+      "Your sign-in had expired, so you've been signed out. If you'd already deleted your account, it's gone. Otherwise, sign in again from Settings and retry.",
+  },
+  admin_account: {
+    title: "Can't delete this account",
+    message: 'This is a content administrator account and cannot be deleted from the app. Please ask the Audio Tour team to remove it.',
+  },
+  server: {
+    title: 'Account not deleted',
+    message: 'Something went wrong on our side and nothing was deleted. Please try again in a moment.',
+  },
+  timeout: {
+    title: "Couldn't confirm",
+    message:
+      "We couldn't confirm your account was deleted - the connection may be slow. It's safe to try again; if it was already deleted, you'll simply be signed out.",
+  },
 };
+
+/** Lets our confirmation dialog finish dismissing before iOS is asked to present the Apple sheet. */
+const ALERT_DISMISS_MS = 300;
 
 /**
  * Delete account (TASK-1104, App Store Review Guideline 5.1.1(v)).
@@ -23,6 +43,10 @@ const FAILURE_MESSAGE: Record<Extract<DeleteAccountOutcome, { kind: 'failed' }>[
  * immediately - no email, no waiting period, no support contact. Apple users
  * confirm with Apple as the final step (see accountDeletion.ts). The outcome is
  * shown before leaving, so a person is never left guessing whether it worked.
+ *
+ * NEVER STUCK (Epic 11 device-QA fix). deleteAccount() settles in bounded time
+ * and never rejects; `finally` unlocks the screen regardless, and a ref stops a
+ * second tap from starting a second deletion while the first is in flight.
  */
 export default function DeleteAccountScreen({ navigation }: DeleteAccountScreenProps) {
   const insets = useSafeAreaInsets();
@@ -30,16 +54,31 @@ export default function DeleteAccountScreen({ navigation }: DeleteAccountScreenP
   const signedIn = useAuth((s) => s.status === 'signed_in');
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const inFlight = useRef(false);
 
   const run = async () => {
+    if (inFlight.current) return;
+    inFlight.current = true;
     setMessage(null);
     setBusy(true);
-    const outcome = await deleteAccount();
-    setBusy(false);
+
+    let outcome: DeleteAccountOutcome;
+    try {
+      await new Promise((resolve) => setTimeout(resolve, ALERT_DISMISS_MS));
+      outcome = await deleteAccount();
+    } catch (err) {
+      console.warn('[Account] unexpected deletion error:', err);
+      outcome = { kind: 'failed', reason: 'server' };
+    } finally {
+      inFlight.current = false;
+      setBusy(false);
+    }
 
     if (outcome.kind === 'cancelled') return;
     if (outcome.kind === 'failed') {
-      setMessage(FAILURE_MESSAGE[outcome.reason]);
+      const { title, message: text } = FAILURE[outcome.reason];
+      setMessage(text);
+      Alert.alert(title, text);
       return;
     }
     Alert.alert('Account deleted', 'Your account and its data have been deleted. You can keep using Audio Tour without an account.', [

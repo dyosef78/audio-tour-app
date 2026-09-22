@@ -13,13 +13,15 @@ import { mock } from 'node:test';
 
 import type { Session } from '@supabase/supabase-js';
 
+import { raceTimeout } from '../src/lib/timeout.ts';
 import {
   runAccountDeletion,
   type AccountDeletionDeps,
   type AppleReauthentication,
+  type DeleteAccountOutcome,
   type InvokeResult,
 } from '../src/services/auth/accountDeletion.ts';
-import { accountFromSession, startAuth, useAuth } from '../src/services/auth/authStore.ts';
+import { accountFromSession, lastKnownAccessToken, startAuth, useAuth } from '../src/services/auth/authStore.ts';
 import {
   ciphertextKeyFor,
   keychainKeyFor,
@@ -236,6 +238,11 @@ __emitAppState('active');
 eq('foreground resumes the token ticker', startRefresh.mock.callCount(), 1);
 for (let i = 0; i < 50 && useAuth.getState().status !== 'signed_in'; i++) await flush();
 eq('...and adopts the stored session', useAuth.getState().account?.displayName, 'Walker');
+assert(
+  '...and remembers its access token as the lock-free fallback (device-QA fix)',
+  (lastKnownAccessToken() ?? '').split('.').length === 3,
+);
+assert('...which is NOT in the rendered state', !JSON.stringify(useAuth.getState()).includes(lastKnownAccessToken() ?? '~'));
 assert('the session in storage is encrypted', !JSON.stringify(dumpAsync()).includes('walker@example.com'));
 
 // A recheck that errors (offline, expired token) must not sign anyone out.
@@ -253,93 +260,161 @@ const { error: signOutError } = await supabase.auth.signOut({ scope: 'local' });
 assert('sign-out could not reach the (placeholder) server', signOutError !== null);
 for (let i = 0; i < 50 && useAuth.getState().status !== 'signed_out'; i++) await flush();
 eq('...yet the device is signed out', useAuth.getState(), { status: 'signed_out', account: null });
+eq('...and the fallback token is forgotten with it', lastKnownAccessToken(), null);
 eq('...and nothing is left in either store', [Object.keys(dumpAsync()), Object.keys(dumpKeychain())], [[], []]);
 
+heading('raceTimeout');
+{
+  eq('a fast promise wins', await raceTimeout(Promise.resolve(7), 50), { timedOut: false, value: 7 });
+  eq('a promise that never settles loses', await raceTimeout(new Promise(() => {}), 20), { timedOut: true });
+  let rejected = false;
+  try {
+    await raceTimeout(Promise.reject(new Error('x')), 50);
+  } catch {
+    rejected = true;
+  }
+  assert('a rejection is passed through, not turned into a timeout', rejected);
+}
+
 // -----------------------------------------------------------------------------
-heading('Account deletion flow (TASK-1104)');
+heading('Account deletion flow (TASK-1104, hardened after device QA)');
 // -----------------------------------------------------------------------------
+
+type Behaviour<T> = T | 'hang' | 'throw';
+const never = <T>(): Promise<T> => new Promise<T>(() => {});
+/** Short budgets so the hang tests take milliseconds. Production: DELETION_TIMEOUTS. */
+const FAST = { requestMs: 60, signOutMs: 40, googleRevokeMs: 40 };
 
 function deletionHarness(opts: {
   provider: string | null;
-  apple?: AppleReauthentication;
-  invoke?: InvokeResult;
-  signOutThrows?: boolean;
+  apple?: Behaviour<AppleReauthentication>;
+  invoke?: Behaviour<InvokeResult>;
+  signOut?: 'ok' | 'hang' | 'throw';
+  google?: 'ok' | 'hang' | 'throw';
 }) {
   const calls: string[] = [];
   const bodies: Record<string, unknown>[] = [];
+  const signals: AbortSignal[] = [];
+  const act = <T>(name: string, behaviour: Behaviour<T> | undefined, fallback: T): Promise<T> => {
+    calls.push(name);
+    if (behaviour === 'hang') return never<T>();
+    if (behaviour === 'throw') return Promise.reject(new Error(`${name} exploded`));
+    return Promise.resolve(behaviour ?? fallback);
+  };
   const deps: AccountDeletionDeps = {
     provider: opts.provider,
-    reauthenticateWithApple: async () => {
-      calls.push('apple');
-      return opts.apple ?? { authorizationCode: 'apple-code' };
-    },
-    invokeDelete: async (body) => {
-      calls.push('invoke');
+    reauthenticateWithApple: () => act('apple', opts.apple, { authorizationCode: 'apple-code' }),
+    invokeDelete: (body, signal) => {
       bodies.push(body);
-      return opts.invoke ?? { status: 200, data: { deleted: true, apple_token_revoked: null } };
+      signals.push(signal);
+      return act('invoke', opts.invoke, { status: 200, data: { deleted: true, apple_revocation: 'not_attempted' } });
     },
-    signOutLocally: async () => {
-      calls.push('signOut');
-      if (opts.signOutThrows) throw new Error('storage gone');
-    },
-    revokeGoogleAccess: async () => {
-      calls.push('google');
-    },
+    signOutLocally: () => act('signOut', opts.signOut === 'ok' ? undefined : opts.signOut, undefined),
+    forceLocalSignOut: () => act('forceSignOut', undefined, undefined),
+    revokeGoogleAccess: () => act('google', opts.google === 'ok' ? undefined : opts.google, undefined),
+    timeouts: FAST,
     log: () => {},
   };
-  return { deps, calls, bodies };
+  return { deps, calls, bodies, signals };
+}
+
+/** Runs the flow and measures it: the core property is that it always settles, fast. */
+async function settle(deps: AccountDeletionDeps): Promise<{ outcome: DeleteAccountOutcome; ms: number }> {
+  const started = Date.now();
+  const outcome = await runAccountDeletion(deps);
+  return { outcome, ms: Date.now() - started };
 }
 
 {
   const h = deletionHarness({ provider: 'google' });
-  eq('Google: deleted', await runAccountDeletion(h.deps), { kind: 'deleted', appleTokenRevoked: null });
-  eq('...server FIRST, then local sign-out, then Google revoke; never Apple', h.calls, ['invoke', 'signOut', 'google']);
+  eq('Google: deleted', (await settle(h.deps)).outcome, { kind: 'deleted' });
+  eq('...server FIRST, then local sign-out; never Apple', h.calls.slice(0, 2), ['invoke', 'signOut']);
   eq('...and the body names no user', h.bodies, [{}]);
+  await new Promise((r) => setTimeout(r, 5));
+  assert('...Google access revoked afterwards, off the critical path', h.calls.includes('google'));
 }
 {
-  const h = deletionHarness({ provider: 'apple', invoke: { status: 200, data: { deleted: true, apple_token_revoked: true } } });
-  eq('Apple: deleted, revocation reported', await runAccountDeletion(h.deps), { kind: 'deleted', appleTokenRevoked: true });
+  const h = deletionHarness({ provider: 'apple' });
+  eq('Apple: deleted', (await settle(h.deps)).outcome, { kind: 'deleted' });
   eq('...confirms with Apple before anything is sent', h.calls, ['apple', 'invoke', 'signOut']);
   eq('...and sends the fresh authorization code', h.bodies, [{ apple_authorization_code: 'apple-code' }]);
 }
 {
   const h = deletionHarness({ provider: 'apple', apple: 'cancelled' });
-  eq('Apple: backing out of the Apple sheet cancels', await runAccountDeletion(h.deps), { kind: 'cancelled' });
+  eq('Apple: backing out of the Apple sheet cancels', (await settle(h.deps)).outcome, { kind: 'cancelled' });
   eq('...with nothing sent and nothing signed out', h.calls, ['apple']);
 }
-{
-  const h = deletionHarness({ provider: 'apple', apple: 'unavailable' });
-  eq('Apple account on Android: still deletable', (await runAccountDeletion(h.deps)).kind, 'deleted');
+for (const apple of ['unavailable', 'throw'] as const) {
+  const h = deletionHarness({ provider: 'apple', apple });
+  eq(`Apple sheet ${apple}: still deletable (our own dialog was the confirmation)`, (await settle(h.deps)).outcome.kind, 'deleted');
   eq('...without a code', h.bodies, [{}]);
 }
+
+// --- THE DEVICE-QA FAILURE: nothing may leave the screen waiting forever -------
 {
-  const h = deletionHarness({ provider: 'google', invoke: { networkError: 'Failed to fetch' } });
-  eq('offline: failed, reason offline', await runAccountDeletion(h.deps), { kind: 'failed', reason: 'offline' });
-  eq('...and still signed in - nothing changed', h.calls, ['invoke']);
+  const h = deletionHarness({ provider: 'apple', invoke: 'hang' });
+  const { outcome, ms } = await settle(h.deps);
+  eq('HANG: a request that never answers -> timeout', outcome, { kind: 'failed', reason: 'timeout' });
+  assert('...within the request budget', ms < FAST.requestMs + 150, `${ms} ms`);
+  assert('...and the request is actually aborted, not just abandoned', h.signals[0]?.aborted === true);
+  assert('...and the user stays signed in (the account may still exist)', !h.calls.includes('signOut') && !h.calls.includes('forceSignOut'));
 }
 {
-  const h = deletionHarness({ provider: 'google', invoke: { status: 403, data: null } });
-  eq('CMS admin: refused', await runAccountDeletion(h.deps), { kind: 'failed', reason: 'admin_account' });
-  eq('...and left signed in', h.calls, ['invoke']);
+  const h = deletionHarness({ provider: 'google', signOut: 'hang' });
+  const { outcome, ms } = await settle(h.deps);
+  eq('HANG: sign-out stalls after a real deletion -> still "deleted"', outcome, { kind: 'deleted' });
+  assert('...within the sign-out budget', ms < FAST.signOutMs + 150, `${ms} ms`);
+  assert('...and the session is dropped directly instead', h.calls.includes('forceSignOut'));
 }
 {
-  const h = deletionHarness({ provider: 'google', invoke: { status: 401, data: null } });
-  eq('dead session (e.g. already deleted): session_expired', await runAccountDeletion(h.deps), { kind: 'failed', reason: 'session_expired' });
-  eq('...and the useless local session is dropped, but Google is not revoked', h.calls, ['invoke', 'signOut']);
+  const h = deletionHarness({ provider: 'google', signOut: 'throw' });
+  eq('sign-out throws after a real deletion -> still "deleted"', (await settle(h.deps)).outcome.kind, 'deleted');
+  assert('...session dropped directly', h.calls.includes('forceSignOut'));
 }
-for (const invoke of [
-  { status: 500, data: null },
-  { status: 502, data: null },
-  { status: 200, data: { deleted: false } },
-  { status: 200, data: 'ok' },
-] as InvokeResult[]) {
+{
+  const h = deletionHarness({ provider: 'google', google: 'hang' });
+  const { outcome, ms } = await settle(h.deps);
+  eq('HANG: Google revoke never answers -> still "deleted"', outcome.kind, 'deleted');
+  assert('...without waiting for Google at all', ms < FAST.googleRevokeMs, `${ms} ms`);
+}
+{
+  const h = deletionHarness({ provider: 'google', invoke: { status: 401, data: null }, signOut: 'hang' });
+  const { outcome, ms } = await settle(h.deps);
+  eq('HANG: 401 then a stalled sign-out -> session_expired, promptly', outcome, { kind: 'failed', reason: 'session_expired' });
+  assert('...bounded', ms < FAST.signOutMs * 2 + 150, `${ms} ms`);
+}
+
+// --- Every server answer maps to an outcome ------------------------------------
+const cases: [string, InvokeResult | 'throw', DeleteAccountOutcome][] = [
+  ['offline', { networkError: 'Network request failed' }, { kind: 'failed', reason: 'offline' }],
+  ['403 admin', { status: 403, data: null }, { kind: 'failed', reason: 'admin_account' }],
+  ['401 dead session', { status: 401, data: null }, { kind: 'failed', reason: 'session_expired' }],
+  ['503 try_again (nothing deleted)', { status: 503, data: null }, { kind: 'failed', reason: 'server' }],
+  ['504 deletion_unconfirmed', { status: 504, data: null }, { kind: 'failed', reason: 'timeout' }],
+  ['500', { status: 500, data: null }, { kind: 'failed', reason: 'server' }],
+  ['502 gateway', { status: 502, data: null }, { kind: 'failed', reason: 'server' }],
+  ['200 but not deleted', { status: 200, data: { deleted: false } }, { kind: 'failed', reason: 'server' }],
+  ['200 with a non-JSON body', { status: 200, data: null }, { kind: 'failed', reason: 'server' }],
+  ['the request function throws', 'throw', { kind: 'failed', reason: 'server' }],
+];
+for (const [label, invoke, expected] of cases) {
   const h = deletionHarness({ provider: 'google', invoke });
-  eq(`server answer ${JSON.stringify(invoke)} is a failure, never "deleted"`, await runAccountDeletion(h.deps), { kind: 'failed', reason: 'server' });
-  eq('...and nothing local is touched', h.calls, ['invoke']);
+  eq(`${label} -> ${expected.kind === 'failed' ? expected.reason : expected.kind}`, (await settle(h.deps)).outcome, expected);
+  if (expected.kind === 'failed' && expected.reason !== 'session_expired') {
+    assert('...and the device stays signed in', !h.calls.includes('signOut'));
+  }
+}
+
+{
+  // The invariant, bluntly: a dependency set where EVERYTHING misbehaves.
+  const h = deletionHarness({ provider: 'apple', apple: 'throw', invoke: 'hang', signOut: 'throw', google: 'hang' });
+  const { outcome, ms } = await settle(h.deps);
+  assert('chaos: still settles, never rejects', outcome.kind === 'failed', JSON.stringify(outcome));
+  assert('...inside the total budget', ms < FAST.requestMs + FAST.signOutMs * 2 + 200, `${ms} ms`);
 }
 {
-  const h = deletionHarness({ provider: 'google', signOutThrows: true });
-  eq('a local sign-out error after a real deletion is still "deleted"', (await runAccountDeletion(h.deps)).kind, 'deleted');
+  const throwsSync = { ...deletionHarness({ provider: 'google' }).deps, invokeDelete: () => { throw new Error('sync boom'); } };
+  eq('a dependency that throws synchronously -> server, not a crash', (await settle(throwsSync as AccountDeletionDeps)).outcome, { kind: 'failed', reason: 'server' });
 }
 
 stop();
