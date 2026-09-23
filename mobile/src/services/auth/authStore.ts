@@ -3,6 +3,7 @@ import { AppState, type AppStateStatus } from 'react-native';
 import { create } from 'zustand';
 
 import { supabase } from '../supabase/client';
+import { utf8Decode } from './utf8';
 
 /**
  * Who is signed in, if anyone (TASK-1102).
@@ -97,6 +98,39 @@ export function lastKnownAccessToken(): string | null {
 const tombstonedUserIds = new Set<string>();
 
 /**
+ * Sessions signed out in this process (Epic 12). Keyed by SESSION, not user:
+ * the same person signing in again keeps their user id, and a user tombstone
+ * would silently ignore that new sign-in for the rest of the process. GoTrue's
+ * `session_id` claim survives token refreshes of one session and is new for
+ * every sign-in, which is exactly the line between "late event for the session
+ * we just ended" and "the user signed in again".
+ */
+const tombstonedSessionIds = new Set<string>();
+
+/**
+ * Pure. The `session_id` claim of a Supabase access token, or null. Decoded,
+ * NOT verified - it only decides whether to IGNORE a session locally, which
+ * grants nothing.
+ */
+export function sessionIdOf(accessToken: string | null | undefined): string | null {
+  const payload = accessToken?.split('.')[1];
+  if (!payload) return null;
+  try {
+    const binary = atob(payload.replaceAll('-', '+').replaceAll('_', '/'));
+    const claims: unknown = JSON.parse(utf8Decode(Uint8Array.from(binary, (c) => c.charCodeAt(0))));
+    const id = (claims as { session_id?: unknown } | null)?.session_id;
+    return typeof id === 'string' && id !== '' ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The session_id of the session the UI currently shows, if any. */
+export function currentSessionId(): string | null {
+  return sessionIdOf(lastAccessToken);
+}
+
+/**
  * Purge everything the UI reads about the session - SYNCHRONOUSLY, with no I/O.
  *
  * Why synchronous (Epic 11 device QA, 23 Sep): the UI reads this store, and
@@ -110,9 +144,13 @@ const tombstonedUserIds = new Set<string>();
  * auth-js lock when the account was deleted still completes, saves a session
  * and emits TOKEN_REFRESHED before signOut() can run. Without the tombstone
  * that event would put the deleted account back on screen.
+ *
+ * `tombstoneSessionId` (sign-out, Epic 12): the same race, for a user who
+ * still exists - so only that one session is refused, never a new sign-in.
  */
-export function markSignedOutLocally(options: { tombstoneUserId?: string } = {}): void {
+export function markSignedOutLocally(options: { tombstoneUserId?: string; tombstoneSessionId?: string } = {}): void {
   if (options.tombstoneUserId) tombstonedUserIds.add(options.tombstoneUserId);
+  if (options.tombstoneSessionId) tombstonedSessionIds.add(options.tombstoneSessionId);
   lastAccessToken = null;
   useAuth.setState({ status: 'signed_out', account: null });
 }
@@ -122,6 +160,10 @@ function apply(session: Session | null): void {
   if (session !== null && tombstonedUserIds.has(session.user.id)) {
     // Loud, not silent: this is supabase-js still holding a deleted account.
     console.warn('[Auth] ignored a session for an account deleted on this device');
+    live = null;
+  } else if (session !== null && tombstonedSessionIds.has(sessionIdOf(session.access_token) ?? '')) {
+    // Loud, not silent: a late event (e.g. TOKEN_REFRESHED) for a session signed out here.
+    console.warn('[Auth] ignored a session that was signed out on this device');
     live = null;
   }
   lastAccessToken = live?.access_token ?? null;

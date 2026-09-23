@@ -10,11 +10,12 @@ import {
   type AppleReauthentication,
   type DeleteAccountOutcome,
   type DeletionOptions,
+  type GoogleTokenResult,
   type InvokeResult,
 } from './accountDeletion';
 import { configureGoogle, isGoogleSignInConfigured } from './AuthService';
-import { hasProvider, lastKnownAccessToken, markSignedOutLocally, useAuth } from './authStore';
-import { secureSessionStorage } from './secureSessionStorage';
+import { hasProvider, lastKnownAccessToken, useAuth } from './authStore';
+import { teardownSteps } from './sessionTeardown';
 
 /**
  * Account deletion with the real platform calls (TASK-1104). The decisions,
@@ -121,6 +122,28 @@ async function reauthenticateWithApple(): Promise<AppleReauthentication> {
   }
 }
 
+/**
+ * A Google access token for the server to revoke (Epic 12, option B).
+ *
+ * The Google SDK and the Supabase session are independent: after a cold start
+ * the SDK holds no current user until it restores one from its own store, so
+ * the restore comes first. Nothing here is bounded - runAccountDeletion caps the
+ * whole call at googleTokenMs and treats a hang, a throw or an empty token as a
+ * reason to delete WITHOUT it, never as a reason to stop.
+ */
+async function googleAccessToken(): Promise<GoogleTokenResult> {
+  if (!isGoogleSignInConfigured()) return { unavailable: 'not_configured' };
+  configureGoogle();
+  if (GoogleSignin.getCurrentUser() === null) {
+    // Linked-only Google identity, or the SDK's own sign-in was cleared.
+    if (!GoogleSignin.hasPreviousSignIn()) return { unavailable: 'no_google_session' };
+    const restored = await GoogleSignin.signInSilently();
+    if (restored.type !== 'success') return { unavailable: 'no_google_session', detail: restored.type };
+  }
+  const { accessToken } = await GoogleSignin.getTokens();
+  return accessToken ? { accessToken } : { unavailable: 'error', detail: 'getTokens returned no access token' };
+}
+
 /** A token for the request, without ever waiting indefinitely on the auth lock. */
 async function accessTokenForRequest(): Promise<string | null> {
   const raced = await raceTimeout(supabase.auth.getSession(), SESSION_LOOKUP_MS);
@@ -164,19 +187,6 @@ async function invokeDelete(body: Record<string, unknown>, signal: AbortSignal):
   }
 }
 
-/**
- * Removes the stored session without supabase-js - no auth lock, no network.
- * Storage only: the UI state is purged separately and synchronously first
- * (purgeAuthState), so a slow Keychain can never keep a deleted account on screen.
- */
-async function dropStoredSession(): Promise<void> {
-  // storageKey is a public property at runtime; supabase-js only types it protected.
-  const storageKey = (supabase.auth as unknown as { storageKey: string }).storageKey;
-  // supabase-js re-reads storage on every getSession(), so with the item gone
-  // it sees no session.
-  await secureSessionStorage.removeItem(storageKey);
-}
-
 export function deleteAccount(options: DeletionOptions = {}): Promise<DeleteAccountOutcome> {
   const account = useAuth.getState().account;
   return runAccountDeletion({
@@ -185,24 +195,10 @@ export function deleteAccount(options: DeletionOptions = {}): Promise<DeleteAcco
     googleIdentity: hasProvider(account, 'google'),
     options,
     reauthenticateWithApple,
+    getGoogleAccessToken: googleAccessToken,
     invokeDelete,
-    // `local`: the server session died with the user. supabase-js removes the
-    // stored session even though the revoke call is now refused.
-    // Captured NOW: by the time the purge runs, the store no longer holds the account.
-    purgeAuthState: () => markSignedOutLocally({ tombstoneUserId: account?.id }),
-    signOutLocally: async () => {
-      // supabase-js RETURNS its error rather than throwing. Ignoring it is what
-      // let a failed sign-out look successful (device QA, 23 Sep); the flow now
-      // drops the session directly afterwards regardless.
-      const { error } = await supabase.auth.signOut({ scope: 'local' });
-      if (error) throw error;
-    },
-    dropStoredSession,
-    revokeGoogleAccess: async () => {
-      if (!isGoogleSignInConfigured()) return;
-      configureGoogle();
-      // Ends this app's grant with Google, not just the local Google session.
-      await GoogleSignin.revokeAccess();
-    },
+    // A USER tombstone: the account is gone for good. Captured NOW - by the
+    // time the purge runs, the store no longer holds the account.
+    ...teardownSteps({ userId: account?.id }),
   });
 }

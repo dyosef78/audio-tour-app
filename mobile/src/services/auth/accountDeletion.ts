@@ -1,5 +1,8 @@
 import { describeError } from '../../lib/describeError';
 import { raceTimeout } from '../../lib/timeout';
+import { TEARDOWN_TIMEOUTS, tearDownLocalSession, type LocalTeardown, type TeardownSteps } from './localTeardown';
+
+export type { LocalTeardown } from './localTeardown';
 
 /**
  * Account deletion, as a sequence of decisions (TASK-1104; hardened after the
@@ -16,14 +19,21 @@ import { raceTimeout } from '../../lib/timeout';
  *      BEFORE any request with `apple_confirmation`, and the screen offers
  *      "delete without Apple" (options.skipAppleConfirmation). Deliberately NOT
  *      time-limited: it is the user reading a system sheet.
- *   2. The server deletes the account the SESSION belongs to - within
+ *   2. Google users' grant is revoked by the SERVER (Epic 12, option B), so the
+ *      app fetches a Google access token for it - within `googleTokenMs` (2 s,
+ *      PM constraint), or not at all. No token (timeout, cold start with no
+ *      Google session, any error) is never a reason to stop: the request goes
+ *      out with `google_token_unavailable: <reason>` instead, and the server
+ *      logs google_revocation_skipped with that reason.
+ *   3. The server deletes the account the SESSION belongs to - within
  *      `requestMs`, or the request is aborted and reported as `timeout`.
- *   3. Only then is this device signed out - within `signOutMs`, or the stored
- *      session is dropped directly - and Google access revoked in the background.
+ *   4. Only then is this device signed out (localTeardown.ts): UI purged
+ *      synchronously first, supabase-js and storage each within `signOutMs`.
  *
  * INVARIANT: runAccountDeletion always settles, in bounded time, and never
- * rejects. Worst case after the Apple sheet: requestMs + 2 x signOutMs (16 s;
- * the last 3 s is a local-storage drop that is normally instant).
+ * rejects. Worst case after the Apple sheet: googleTokenMs + requestMs +
+ * 2 x signOutMs (18 s; the last 3 s is a local-storage drop that is normally
+ * instant).
  * The screen that awaits it can therefore always unlock.
  *
  * Nothing on the device is wiped beyond the session: downloaded tours,
@@ -31,12 +41,15 @@ import { raceTimeout } from '../../lib/timeout';
  */
 
 export const DELETION_TIMEOUTS = {
-  /** Getting the token AND the round trip. The server answers inside ~9.5 s at worst. */
+  /**
+   * The WHOLE Google token step - silent session restore plus getTokens() -
+   * not just getTokens(): on a cold start the restore is where it would stall.
+   * PM constraint, Epic 12: strict and short; on expiry deletion proceeds.
+   */
+  googleTokenMs: 2_000,
+  /** Getting the Supabase token AND the round trip. The server answers inside ~9.5 s at worst. */
   requestMs: 10_000,
-  /** supabase-js signOut holds the auth lock around a network call with no timeout. */
-  signOutMs: 3_000,
-  /** Google's revoke is cosmetic for us; it must never hold the screen. */
-  googleRevokeMs: 3_000,
+  ...TEARDOWN_TIMEOUTS,
 };
 
 export type DeletionFailureReason =
@@ -76,6 +89,13 @@ export type DeleteAccountOutcome =
       appleCodeSent: boolean;
       /** The server's apple_revocation_reason ('scheduled', 'no_code_in_request', ...), or null if absent. */
       appleRevocation: string | null;
+      /**
+       * Google accounts only (null otherwise): 'sent', or why no token went
+       * with the request - QA evidence, like appleCodeSent.
+       */
+      googleToken: 'sent' | GoogleTokenUnavailable | null;
+      /** The server's google_revocation_reason, or null if absent. */
+      googleRevocation: string | null;
       /** How cleanly the local session was removed. Anything but 'clean' is shown to QA. */
       localTeardown: LocalTeardown;
     }
@@ -95,6 +115,22 @@ export type AppleReauthentication =
   /** No Apple sheet on this device (e.g. an Apple account opened on Android). */
   | 'unavailable';
 
+/**
+ * Why no Google access token went with the request. Sent to the server as
+ * `google_token_unavailable`, which logs it; it never stops the deletion.
+ *   timeout            the token step did not finish within googleTokenMs
+ *   no_google_session  this device holds no Google sign-in to restore (e.g. the
+ *                      account's Google identity is linked, but this phone
+ *                      signed in with Apple)
+ *   not_configured     this build has no Google client IDs
+ *   error              the Google SDK failed, or returned no token
+ */
+export type GoogleTokenUnavailable = 'timeout' | 'no_google_session' | 'not_configured' | 'error';
+
+export type GoogleTokenResult =
+  | { accessToken: string }
+  | { unavailable: Exclude<GoogleTokenUnavailable, 'timeout'>; detail?: string };
+
 export interface DeletionOptions {
   /**
    * Skip the Apple sheet entirely. Offered only AFTER an Apple confirmation
@@ -106,7 +142,7 @@ export interface DeletionOptions {
 
 export type InvokeResult = { status: number; data: unknown } | { networkError: string };
 
-export interface AccountDeletionDeps {
+export interface AccountDeletionDeps extends TeardownSteps {
   /**
    * Whether the account has an Apple / Google identity - PRIMARY OR LINKED
    * (authStore.hasProvider). b89da6c/dfa1dc9 looked only at app_metadata.provider,
@@ -116,18 +152,10 @@ export interface AccountDeletionDeps {
   appleIdentity: boolean;
   googleIdentity: boolean;
   reauthenticateWithApple: () => Promise<AppleReauthentication>;
+  /** A Google access token for the server to revoke. May hang or throw: the flow bounds it. */
+  getGoogleAccessToken: () => Promise<GoogleTokenResult>;
   /** Must honour `signal`: it is aborted when the request runs out of time. */
   invokeDelete: (body: Record<string, unknown>, signal: AbortSignal) => Promise<InvokeResult>;
-  /**
-   * SYNCHRONOUS: purge the in-memory auth state the UI reads (and tombstone the
-   * account). Runs before any await in the teardown. See tearDownLocalSession.
-   */
-  purgeAuthState: () => void;
-  /** supabase-js sign-out. Must REJECT on failure - supabase-js returns its error instead of throwing. */
-  signOutLocally: () => Promise<void>;
-  /** Removes the stored session without the network or the auth lock. Idempotent. */
-  dropStoredSession: () => Promise<void>;
-  revokeGoogleAccess: () => Promise<void>;
   options?: DeletionOptions;
   timeouts?: Partial<typeof DELETION_TIMEOUTS>;
   log?: (message: string) => void;
@@ -186,7 +214,13 @@ async function deletionFlow(
     }
   }
 
-  // 2. The request, bounded and abortable.
+  // 2. A Google token for the server's revocation - bounded, and never a reason to stop.
+  let googleToken: 'sent' | GoogleTokenUnavailable | null = null;
+  if (deps.googleIdentity) {
+    googleToken = await googleTokenStep(deps, timeouts.googleTokenMs, log, body);
+  }
+
+  // 3. The request, bounded and abortable.
   const controller = new AbortController();
   let raced;
   try {
@@ -226,82 +260,56 @@ async function deletionFlow(
     return { kind: 'failed', reason: 'server' };
   }
 
-  // 3. The account is gone. Local clean-up must not be able to hide that.
+  // 4. The account is gone. Local clean-up must not be able to hide that.
   const localTeardown = await tearDownLocalSession(deps, timeouts, log);
-  if (deps.googleIdentity) {
-    // Not awaited: the answer to the user does not depend on Google.
-    void raceTimeout(
-      deps.revokeGoogleAccess().catch((err) => log(`Google access could not be revoked: ${describe(err)}`)),
-      timeouts.googleRevokeMs,
-    );
-  }
-  const reason = (result.data as { apple_revocation_reason?: unknown }).apple_revocation_reason;
+  const data = result.data as { apple_revocation_reason?: unknown; google_revocation_reason?: unknown };
   return {
     kind: 'deleted',
     appleCodeSent: typeof body.apple_authorization_code === 'string',
-    appleRevocation: typeof reason === 'string' ? reason : null,
+    appleRevocation: typeof data.apple_revocation_reason === 'string' ? data.apple_revocation_reason : null,
+    googleToken,
+    googleRevocation: typeof data.google_revocation_reason === 'string' ? data.google_revocation_reason : null,
     localTeardown,
   };
 }
 
-function isDeleted(data: unknown): boolean {
-  return typeof data === 'object' && data !== null && (data as { deleted?: unknown }).deleted === true;
+/**
+ * Puts `google_access_token` or `google_token_unavailable` in the body, and
+ * says which. Never throws, never exceeds `ms`: a hang, a throw and an empty
+ * answer all become a reason, and the deletion carries on (PM, Epic 12).
+ * The native call is not cancelled on timeout - it has no signal - but nothing
+ * waits for it and its late answer is discarded.
+ */
+async function googleTokenStep(
+  deps: AccountDeletionDeps,
+  ms: number,
+  log: (message: string) => void,
+  body: Record<string, unknown>,
+): Promise<'sent' | GoogleTokenUnavailable> {
+  let reason: GoogleTokenUnavailable;
+  const started = Date.now();
+  try {
+    // Invoked inside the try: a synchronous throw from a native module is caught too.
+    const raced = await raceTimeout(Promise.resolve().then(deps.getGoogleAccessToken), ms);
+    if (raced.timedOut) {
+      reason = 'timeout';
+      log(`Google token step did not finish within ${ms} ms; deleting without it`);
+    } else if ('accessToken' in raced.value && raced.value.accessToken !== '') {
+      body.google_access_token = raced.value.accessToken;
+      return 'sent';
+    } else {
+      reason = 'unavailable' in raced.value ? raced.value.unavailable : 'error';
+      const detail = 'unavailable' in raced.value && raced.value.detail ? `: ${raced.value.detail}` : '';
+      log(`no Google token (${reason}${detail}) after ${Date.now() - started} ms; deleting without it`);
+    }
+  } catch (err) {
+    reason = 'error';
+    log(`Google token step threw: ${describe(err)}; deleting without it`);
+  }
+  body.google_token_unavailable = reason;
+  return reason;
 }
 
-/**
- * What happened to the local session after the server deleted the account (or
- * refused its session). Reported, not swallowed (CLAUDE.md: fail loud):
- *   clean       UI purged, supabase-js signed out, stored session removed
- *   forced      supabase-js sign-out failed or timed out; stored session removed directly
- *   incomplete  the stored session could not be confirmed removed, or the UI
- *               purge itself threw. The UI still shows signed out; supabase-js
- *               may hold the dead session until it next reads and discards it.
- */
-export type LocalTeardown = 'clean' | 'forced' | 'incomplete';
-
-/**
- * Three steps, ALL always run, in this order:
- *
- *   1. purgeAuthState - SYNCHRONOUS, no I/O, before the first await. When it
- *      returns, the UI and the account-route guard already see signed_out, so
- *      no screen can render the deleted account from here on (device QA,
- *      23 Sep: the purge used to come LAST, after storage I/O inside a race).
- *   2. supabase-js signOut, bounded - so its in-memory state learns about it.
- *   3. dropStoredSession, bounded - removes the session from disk regardless of
- *      step 2, because supabase-js signOut RETURNS an error instead of throwing
- *      and can leave the session behind.
- */
-async function tearDownLocalSession(
-  deps: AccountDeletionDeps,
-  timeouts: typeof DELETION_TIMEOUTS,
-  log: (message: string) => void,
-): Promise<LocalTeardown> {
-  let uiPurged = true;
-  try {
-    deps.purgeAuthState();
-  } catch (err) {
-    uiPurged = false;
-    log(`UI auth purge threw: ${describe(err)}`);
-  }
-
-  let signedOut = false;
-  try {
-    const raced = await raceTimeout(deps.signOutLocally(), timeouts.signOutMs);
-    signedOut = !raced.timedOut;
-    if (raced.timedOut) log(`supabase-js sign-out did not finish within ${timeouts.signOutMs} ms`);
-  } catch (err) {
-    log(`supabase-js sign-out failed: ${describe(err)}`);
-  }
-
-  let dropped = false;
-  try {
-    const raced = await raceTimeout(deps.dropStoredSession(), timeouts.signOutMs);
-    dropped = !raced.timedOut;
-    if (raced.timedOut) log(`stored session drop did not finish within ${timeouts.signOutMs} ms`);
-  } catch (err) {
-    log(`stored session drop failed: ${describe(err)}`);
-  }
-
-  if (!uiPurged || !dropped) return 'incomplete';
-  return signedOut ? 'clean' : 'forced';
+function isDeleted(data: unknown): boolean {
+  return typeof data === 'object' && data !== null && (data as { deleted?: unknown }).deleted === true;
 }

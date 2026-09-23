@@ -1,6 +1,7 @@
 /**
- * TASK-1104 - delete-account handler and Apple token revocation, with GoTrue,
- * the database and Apple faked. No network, no Supabase, no Apple key.
+ * TASK-1104 / Epic 12 - delete-account handler, Apple token revocation and
+ * Google grant revocation, with GoTrue, the database, Apple and Google faked.
+ * No network, no Supabase, no Apple key, no Google client.
  *
  * Run:  npm run test:edge
  */
@@ -14,6 +15,7 @@ import {
   type AppleRevokeConfig,
   type AppleRevoker,
 } from './appleRevoke.ts';
+import { createGoogleRevoker, googleRevokeConfigFromEnv, type GoogleRevoker } from './googleRevoke.ts';
 import { handleDeleteAccount, type AuthenticatedUser, type DeleteAccountDeps } from './handler.ts';
 
 const USER = '11111111-2222-4333-8444-555555555555';
@@ -25,11 +27,13 @@ interface Harness {
   calls: string[];
   deleted: string[];
   revokes: { code: string; subjects: readonly string[] }[];
+  googleRevokes: { token: string; subjects: readonly string[] }[];
   background: Promise<unknown>[];
   logs: Record<string, unknown>[];
 }
 
 type RevokeBehaviour = 'revoked' | 'failed' | 'subject_mismatch' | 'hang' | 'throw';
+type GoogleRevokeBehaviour = 'revoked' | 'failed' | 'subject_mismatch' | 'client_mismatch' | 'hang' | 'throw';
 const never = <T>(): Promise<T> => new Promise<T>(() => {});
 
 function harness(
@@ -38,6 +42,7 @@ function harness(
     admins?: string[];
     deleteResult?: 'deleted' | 'not_found' | Error | 'hang';
     revoker?: RevokeBehaviour | null;
+    googleRevoker?: GoogleRevokeBehaviour | null;
     authenticate?: 'hang';
     adminCheck?: 'hang';
     background?: boolean;
@@ -46,9 +51,10 @@ function harness(
   const calls: string[] = [];
   const deleted: string[] = [];
   const revokes: Harness['revokes'] = [];
+  const googleRevokes: Harness['googleRevokes'] = [];
   const background: Promise<unknown>[] = [];
   const logs: Record<string, unknown>[] = [];
-  const user = options.user === undefined ? { id: USER, appleSubjects: [] } : options.user;
+  const user = options.user === undefined ? { id: USER, appleSubjects: [], googleSubjects: [] } : options.user;
   const revoker: AppleRevoker | null =
     options.revoker === null || options.revoker === undefined
       ? null
@@ -59,6 +65,18 @@ function harness(
             if (options.revoker === 'hang') return never();
             if (options.revoker === 'throw') return Promise.reject(new Error('apple down'));
             return Promise.resolve(options.revoker as 'revoked' | 'failed' | 'subject_mismatch');
+          },
+        };
+  const googleRevoker: GoogleRevoker | null =
+    options.googleRevoker === null || options.googleRevoker === undefined
+      ? null
+      : {
+          revoke: (token, subjects) => {
+            calls.push('googleRevoke');
+            googleRevokes.push({ token, subjects });
+            if (options.googleRevoker === 'hang') return never();
+            if (options.googleRevoker === 'throw') return Promise.reject(new Error('google down'));
+            return Promise.resolve(options.googleRevoker as 'revoked' | 'failed' | 'subject_mismatch' | 'client_mismatch');
           },
         };
   const deps: DeleteAccountDeps = {
@@ -80,12 +98,13 @@ function harness(
       return Promise.resolve(options.deleteResult ?? 'deleted');
     },
     appleRevoker: revoker,
+    googleRevoker,
     runInBackground: options.background ? (task) => void background.push(task) : null,
     // Short, so the hang tests run in milliseconds. Production values: DEFAULT_DEADLINES.
     deadlines: { authenticateMs: 40, adminCheckMs: 40, deleteMs: 40, revocationFallbackMs: 40 },
     log: (e) => logs.push(e),
   };
-  return { deps, calls, deleted, revokes, background, logs };
+  return { deps, calls, deleted, revokes, googleRevokes, background, logs };
 }
 
 const post = (body?: unknown, token = 'user-token'): Request =>
@@ -95,7 +114,9 @@ const post = (body?: unknown, token = 'user-token'): Request =>
     body: body === undefined ? undefined : typeof body === 'string' ? body : JSON.stringify(body),
   });
 
-const APPLE_USER: AuthenticatedUser = { id: USER, appleSubjects: ['apple-sub'] };
+const APPLE_USER: AuthenticatedUser = { id: USER, appleSubjects: ['apple-sub'], googleSubjects: [] };
+const GOOGLE_USER: AuthenticatedUser = { id: USER, appleSubjects: [], googleSubjects: ['google-sub'] };
+const NO_GOOGLE = { google_revocation: 'not_attempted', google_revocation_reason: 'no_token_in_request' };
 
 // -----------------------------------------------------------------------------
 // Handler
@@ -104,7 +125,7 @@ Deno.test('a signed-in user deletes their own account', async () => {
   const h = harness();
   const res = await handleDeleteAccount(post(), h.deps);
   assertEquals(res.status, 200);
-  assertEquals(await res.json(), { deleted: true, apple_revocation: 'not_attempted', apple_revocation_reason: 'no_code_in_request' });
+  assertEquals(await res.json(), { deleted: true, apple_revocation: 'not_attempted', apple_revocation_reason: 'no_code_in_request', ...NO_GOOGLE });
   assertEquals(h.deleted, [USER]);
   assertEquals(res.headers.get('Cache-Control'), 'no-store');
 });
@@ -195,7 +216,7 @@ Deno.test('Apple: the account is deleted FIRST, and revocation runs after with t
   const h = harness({ revoker: 'revoked', user: APPLE_USER, background: true });
   const res = await handleDeleteAccount(post({ apple_authorization_code: 'fresh-code' }), h.deps);
   assertEquals(res.status, 200);
-  assertEquals(await res.json(), { deleted: true, apple_revocation: 'scheduled', apple_revocation_reason: 'scheduled' });
+  assertEquals(await res.json(), { deleted: true, apple_revocation: 'scheduled', apple_revocation_reason: 'scheduled', ...NO_GOOGLE });
   assertEquals(h.logs.find((l) => l.event === 'apple_revocation_scheduled')?.background, true);
   assertEquals(h.calls, ['authenticate', 'isCmsAdmin', 'deleteUser', 'revoke']);
   assertEquals(h.revokes, [{ code: 'fresh-code', subjects: ['apple-sub'] }]);
@@ -223,7 +244,7 @@ Deno.test('Apple: every skip names its reason - in the response AND the log (dev
   const cases: [string, Harness, unknown, string][] = [
     ['Apple account, phone sent no code', harness({ revoker: 'revoked', user: APPLE_USER }), {}, 'no_code_in_request'],
     ['secrets not loaded', harness({ revoker: null, user: APPLE_USER }), { apple_authorization_code: 'c' }, 'revocation_not_configured'],
-    ['code sent, no Apple identity on the account', harness({ revoker: 'revoked', user: { id: USER, appleSubjects: [] } }), { apple_authorization_code: 'c' }, 'no_apple_identity_on_account'],
+    ['code sent, no Apple identity on the account', harness({ revoker: 'revoked', user: { id: USER, appleSubjects: [], googleSubjects: [] } }), { apple_authorization_code: 'c' }, 'no_apple_identity_on_account'],
   ];
   for (const [label, h, body, reason] of cases) {
     const res = await handleDeleteAccount(post(body), h.deps);
@@ -244,13 +265,17 @@ Deno.test('Apple: the authenticated log line carries both halves of the decision
 });
 
 Deno.test('a plain Google account deletes with no Apple noise in the log', async () => {
-  const h = harness({ revoker: 'revoked', user: { id: USER, appleSubjects: [] } });
+  const h = harness({ revoker: 'revoked', user: GOOGLE_USER });
   await handleDeleteAccount(post({}), h.deps);
   assertEquals(h.logs.some((l) => String(l.event).startsWith('apple_revocation')), false);
 });
 
 Deno.test('malformed bodies -> 400 without deleting; method and CORS', async () => {
-  for (const body of ['{', '[]', '"x"', { apple_authorization_code: 42 }, { apple_authorization_code: '' }, 'x'.repeat(9000)]) {
+  const malformed = [
+    '{', '[]', '"x"', { apple_authorization_code: 42 }, { apple_authorization_code: '' }, 'x'.repeat(9000),
+    { google_access_token: 42 }, { google_access_token: '' }, { google_access_token: 'x'.repeat(4097) },
+  ];
+  for (const body of malformed) {
     const h = harness();
     const res = await handleDeleteAccount(post(body), h.deps);
     assertEquals(res.status, 400, JSON.stringify(body).slice(0, 40));
@@ -282,6 +307,166 @@ Deno.test('the log never carries an email, name or token', async () => {
   await Promise.all(h.background);
   const text = JSON.stringify(h.logs);
   assert(!text.includes('secret-code') && !text.includes('user-token') && !text.includes('apple-sub'), text);
+});
+
+// --- Google revocation (Epic 12): the same rules as Apple ----------------------
+
+Deno.test('Google: deleted FIRST, then the grant is revoked in the background with the captured identities', async () => {
+  const h = harness({ googleRevoker: 'revoked', user: GOOGLE_USER, background: true });
+  const res = await handleDeleteAccount(post({ google_access_token: 'ya29.token' }), h.deps);
+  assertEquals(res.status, 200);
+  const json = await res.json();
+  assertEquals([json.google_revocation, json.google_revocation_reason], ['scheduled', 'scheduled']);
+  assertEquals(h.calls, ['authenticate', 'isCmsAdmin', 'deleteUser', 'googleRevoke']);
+  assertEquals(h.googleRevokes, [{ token: 'ya29.token', subjects: ['google-sub'] }]);
+  assertEquals(h.background.length, 1, 'handed to the runtime to finish after the response');
+  await Promise.all(h.background);
+  assertEquals(h.logs.find((l) => l.event === 'google_revocation_finished')?.result, 'revoked');
+});
+
+Deno.test('Google: the fallback flag - no token -> still deleted, and google_revocation_skipped carries the reason', async () => {
+  // The PM's Epic 12 rule: getTokens timed out (or failed) on the phone ->
+  // the request goes ahead without a token, and the server says why in the log.
+  const h = harness({ googleRevoker: 'revoked', user: GOOGLE_USER });
+  const res = await handleDeleteAccount(post({ google_token_unavailable: 'timeout' }), h.deps);
+  assertEquals(res.status, 200);
+  assertEquals(h.deleted, [USER]);
+  assertEquals(h.googleRevokes, []);
+  const skipped = h.logs.find((l) => l.event === 'google_revocation_skipped');
+  assertEquals([skipped?.reason, skipped?.client_reason], ['no_token_in_request', 'timeout']);
+});
+
+Deno.test('Google: a malformed flag can never block a deletion - it is logged as unrecognised', async () => {
+  for (const flag of [42, '', 'Not A Reason!', 'x'.repeat(65), { nested: true }]) {
+    const h = harness({ googleRevoker: 'revoked', user: GOOGLE_USER });
+    const res = await handleDeleteAccount(post({ google_token_unavailable: flag }), h.deps);
+    assertEquals(res.status, 200, JSON.stringify(flag));
+    assertEquals(h.deleted, [USER], JSON.stringify(flag));
+    assertEquals(h.logs.find((l) => l.event === 'google_revocation_skipped')?.client_reason, 'unrecognised');
+  }
+});
+
+Deno.test('Google: a revocation that hangs, throws or is refused cannot delay or fail the deletion', async () => {
+  for (const behaviour of ['hang', 'throw', 'failed', 'subject_mismatch', 'client_mismatch'] as const) {
+    for (const background of [true, false]) {
+      const h = harness({ googleRevoker: behaviour, user: GOOGLE_USER, background });
+      const started = Date.now();
+      const res = await handleDeleteAccount(post({ google_access_token: 't' }), h.deps);
+      const label = `${behaviour}, background=${background}`;
+      assertEquals(res.status, 200, label);
+      assertEquals(h.deleted, [USER], label);
+      assert(Date.now() - started < 1_000, `${label}: answered promptly`);
+    }
+  }
+});
+
+Deno.test('Google: every skip names its reason - in the response AND the log', async () => {
+  const cases: [string, Harness, unknown, string][] = [
+    ['Google account, phone sent no token', harness({ googleRevoker: 'revoked', user: GOOGLE_USER }), {}, 'no_token_in_request'],
+    ['GOOGLE_CLIENT_IDS not set', harness({ googleRevoker: null, user: GOOGLE_USER }), { google_access_token: 't' }, 'revocation_not_configured'],
+    ['token sent, no Google identity on the account', harness({ googleRevoker: 'revoked', user: APPLE_USER }), { google_access_token: 't' }, 'no_google_identity_on_account'],
+  ];
+  for (const [label, h, body, reason] of cases) {
+    const res = await handleDeleteAccount(post(body), h.deps);
+    assertEquals(res.status, 200, label);
+    const json = await res.json();
+    assertEquals([json.google_revocation, json.google_revocation_reason], ['not_attempted', reason], label);
+    assertEquals(h.googleRevokes, [], label);
+    assertEquals(h.logs.find((l) => l.event === 'google_revocation_skipped')?.reason, reason, `${label}: logged`);
+  }
+});
+
+Deno.test('Apple and Google linked: both revocations run, each in the background, neither holds the response', async () => {
+  const linked: AuthenticatedUser = { id: USER, appleSubjects: ['apple-sub'], googleSubjects: ['google-sub'] };
+  for (const background of [true, false]) {
+    const h = harness({ revoker: 'hang', googleRevoker: 'hang', user: linked, background });
+    const started = Date.now();
+    const res = await handleDeleteAccount(post({ apple_authorization_code: 'c', google_access_token: 't' }), h.deps);
+    assertEquals(res.status, 200);
+    assertEquals(h.calls.filter((c) => c.endsWith('evoke')).sort(), ['googleRevoke', 'revoke']);
+    if (background) assertEquals(h.background.length, 2);
+    else assertEquals(h.logs.some((l) => l.event === 'revocation_abandoned'), true, 'fallback cap logged');
+    assert(Date.now() - started < 1_000, `background=${background}: answered promptly`);
+  }
+});
+
+Deno.test('Google: the log never carries the access token', async () => {
+  const h = harness({ googleRevoker: 'revoked', user: GOOGLE_USER, background: true });
+  await handleDeleteAccount(post({ google_access_token: 'ya29.secret-token' }), h.deps);
+  await Promise.all(h.background);
+  const line = h.logs.find((l) => l.event === 'delete_account_authenticated');
+  assertEquals([line?.google_identities, line?.google_token_present], [1, true]);
+  const text = JSON.stringify(h.logs);
+  assert(!text.includes('ya29.secret-token') && !text.includes('google-sub'), text);
+});
+
+Deno.test('a plain Apple account deletes with no Google noise in the log', async () => {
+  const h = harness({ revoker: 'revoked', googleRevoker: 'revoked', user: APPLE_USER, background: true });
+  await handleDeleteAccount(post({ apple_authorization_code: 'c' }), h.deps);
+  assertEquals(h.logs.some((l) => String(l.event).startsWith('google_revocation')), false);
+});
+
+// -----------------------------------------------------------------------------
+// Google revocation
+
+type FakeGoogle = (url: string, init?: RequestInit) => Response | Promise<Response>;
+const googleWith = (impl: FakeGoogle, clientIds = ['ios-client.apps.googleusercontent.com']) =>
+  createGoogleRevoker({ clientIds }, { log: () => {}, fetch: (async (url: string | URL | Request, init?: RequestInit) => impl(String(url), init)) as typeof fetch });
+
+Deno.test('Google revoke: checks the token with tokeninfo, then revokes it', async () => {
+  const calls: { url: string; init?: RequestInit }[] = [];
+  const revoker = googleWith((url, init) => {
+    calls.push({ url, init });
+    if (url.startsWith('https://oauth2.googleapis.com/tokeninfo')) {
+      return Response.json({ sub: 'google-sub', aud: 'ios-client.apps.googleusercontent.com', azp: 'ios-client.apps.googleusercontent.com' });
+    }
+    return new Response(null, { status: 200 });
+  });
+  assertEquals(await revoker.revoke('ya29.tok', ['google-sub']), 'revoked');
+  assertEquals(calls[0]!.url, 'https://oauth2.googleapis.com/tokeninfo?access_token=ya29.tok');
+  assertEquals(calls[1]!.url, 'https://oauth2.googleapis.com/revoke');
+  assertEquals(calls[1]!.init?.method, 'POST');
+  assertEquals(new URLSearchParams(calls[1]!.init?.body as URLSearchParams).get('token'), 'ya29.tok');
+});
+
+Deno.test("Google revoke: another Google account's token, or another app's, is NOT revoked", async () => {
+  const cases: [string, Record<string, unknown>, string][] = [
+    ['other Google account', { sub: 'someone-else', aud: 'ios-client.apps.googleusercontent.com' }, 'subject_mismatch'],
+    ['token issued to another app', { sub: 'google-sub', aud: 'other-app.apps.googleusercontent.com', azp: 'other-app.apps.googleusercontent.com' }, 'client_mismatch'],
+    ['no audience at all', { sub: 'google-sub' }, 'client_mismatch'],
+  ];
+  for (const [label, info, expected] of cases) {
+    let revokeCalled = false;
+    const revoker = googleWith((url) => {
+      if (url.endsWith('/revoke')) revokeCalled = true;
+      return Response.json(info);
+    });
+    assertEquals(await revoker.revoke('t', ['google-sub']), expected, label);
+    assertEquals(revokeCalled, false, label);
+  }
+});
+
+Deno.test('Google revoke: Google errors and dead networks are "failed", never a throw', async () => {
+  const failing: FakeGoogle[] = [
+    () => new Response('{"error":"invalid_token"}', { status: 400 }),
+    (url) =>
+      url.includes('tokeninfo')
+        ? Response.json({ sub: 'google-sub', aud: 'ios-client.apps.googleusercontent.com' })
+        : new Response('{"error":"invalid_token"}', { status: 400 }),
+    () => {
+      throw new TypeError('network down');
+    },
+  ];
+  for (const impl of failing) assertEquals(await googleWith(impl).revoke('t', ['google-sub']), 'failed');
+});
+
+Deno.test('Google config: comma-separated client ids, blanks ignored; none -> disabled', () => {
+  assertEquals(googleRevokeConfigFromEnv({}), null);
+  assertEquals(googleRevokeConfigFromEnv({ GOOGLE_CLIENT_IDS: ' , ' }), null);
+  assertEquals(googleRevokeConfigFromEnv({ GOOGLE_CLIENT_IDS: 'web.apps.googleusercontent.com, ios.apps.googleusercontent.com,' })?.clientIds, [
+    'web.apps.googleusercontent.com',
+    'ios.apps.googleusercontent.com',
+  ]);
 });
 
 // -----------------------------------------------------------------------------

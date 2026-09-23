@@ -15,6 +15,7 @@ import type { Session } from '@supabase/supabase-js';
 
 import { describeError } from '../src/lib/describeError.ts';
 import { raceTimeout } from '../src/lib/timeout.ts';
+import appConfig, { googleSignInConfigErrors } from '../app.config.ts';
 import {
   appleFailureDetail,
   runAccountDeletion,
@@ -22,16 +23,20 @@ import {
   type AppleReauthentication,
   type DeleteAccountOutcome,
   type DeletionOptions,
+  type GoogleTokenResult,
   type InvokeResult,
 } from '../src/services/auth/accountDeletion.ts';
 import {
   accountFromSession,
+  currentSessionId,
   hasProvider,
   lastKnownAccessToken,
   markSignedOutLocally,
+  sessionIdOf,
   startAuth,
   useAuth,
 } from '../src/services/auth/authStore.ts';
+import { tearDownLocalSession, type LocalTeardown, type TeardownSteps } from '../src/services/auth/localTeardown.ts';
 import { routeAfterAuthChange } from '../src/navigation/accountGuard.ts';
 import {
   ciphertextKeyFor,
@@ -191,17 +196,22 @@ eq('a missing session is null', await storage.getItem(NAME), null);
 heading('accountFromSession');
 // -----------------------------------------------------------------------------
 
-function session(overrides: { email?: string; provider?: string; meta?: Record<string, unknown> } = {}): Session {
+const b64url = (o: object) => Buffer.from(JSON.stringify(o)).toString('base64url');
+
+function session(
+  overrides: { email?: string; provider?: string; meta?: Record<string, unknown>; userId?: string; sessionId?: string } = {},
+): Session {
   const now = Math.floor(Date.now() / 1000);
-  const b64 = (o: object) => Buffer.from(JSON.stringify(o)).toString('base64url');
+  const userId = overrides.userId ?? 'user-1';
+  const claims = { sub: userId, exp: now + 3600, role: 'authenticated', ...(overrides.sessionId ? { session_id: overrides.sessionId } : {}) };
   return {
-    access_token: `${b64({ alg: 'HS256', typ: 'JWT' })}.${b64({ sub: 'user-1', exp: now + 3600, role: 'authenticated' })}.sig`,
+    access_token: `${b64url({ alg: 'HS256', typ: 'JWT' })}.${b64url(claims)}.sig`,
     refresh_token: 'refresh-1',
     expires_in: 3600,
     expires_at: now + 3600,
     token_type: 'bearer',
     user: {
-      id: 'user-1',
+      id: userId,
       aud: 'authenticated',
       created_at: new Date().toISOString(),
       email: overrides.email,
@@ -303,6 +313,42 @@ eq('...yet the device is signed out', useAuth.getState(), { status: 'signed_out'
 eq('...and the fallback token is forgotten with it', lastKnownAccessToken(), null);
 eq('...and nothing is left in either store', [Object.keys(dumpAsync()), Object.keys(dumpKeychain())], [[], []]);
 
+heading('Sign-out tombstones the SESSION, not the user (Epic 12)');
+{
+  eq('sessionIdOf reads the session_id claim', sessionIdOf(session({ sessionId: 'sess-a' }).access_token), 'sess-a');
+  eq('...null without the claim', sessionIdOf(session().access_token), null);
+  eq('...null for junk, never a throw', [sessionIdOf(null), sessionIdOf(''), sessionIdOf('a.%%%.c'), sessionIdOf('nodots')], [null, null, null, null]);
+  const hebrew = `${b64url({ alg: 'HS256' })}.${b64url({ session_id: 'sess-h', user_metadata: { full_name: 'דוד יוסף' } })}.sig`;
+  eq('...survives a non-ASCII payload (Google/Apple names in user_metadata)', sessionIdOf(hebrew), 'sess-h');
+
+  const signInAs = async (s: Session) => {
+    await new SecureSessionStorage().setItem(storageKey, JSON.stringify(s));
+    __emitAppState('active');
+    for (let i = 0; i < 50 && useAuth.getState().status !== 'signed_in'; i++) await flush();
+  };
+  // user-1 was DELETED above (user tombstone); this person still exists.
+  await signInAs(session({ userId: 'user-2', sessionId: 'sess-1', meta: { name: 'Dana' } }));
+  eq('signed in as user-2', useAuth.getState().account?.id, 'user-2');
+  eq('currentSessionId() is the session on screen', currentSessionId(), 'sess-1');
+
+  markSignedOutLocally({ tombstoneSessionId: 'sess-1' });
+  eq('sign-out purge: signed_out on the very next line', useAuth.getState().status, 'signed_out');
+  // The race: supabase-js still holds sess-1 (a refresh that held the lock
+  // saves it and emits TOKEN_REFRESHED). A foreground recheck re-applies it.
+  __emitAppState('active');
+  for (let i = 0; i < 20; i++) await flush();
+  eq('SESSION TOMBSTONE: a late event for the signed-out session is ignored', useAuth.getState().status, 'signed_out');
+
+  // The reason it is keyed by session: the same person signs straight back in.
+  await signInAs(session({ userId: 'user-2', sessionId: 'sess-2', meta: { name: 'Dana' } }));
+  eq('...but the SAME user signing in again (new session) is shown signed in', useAuth.getState().account?.id, 'user-2');
+  eq('...with the new session id', currentSessionId(), 'sess-2');
+
+  await supabase.auth.signOut({ scope: 'local' });
+  for (let i = 0; i < 50 && useAuth.getState().status !== 'signed_out'; i++) await flush();
+  eq('(clean-up) signed out again', useAuth.getState().status, 'signed_out');
+}
+
 heading('raceTimeout');
 {
   eq('a fast promise wins', await raceTimeout(Promise.resolve(7), 50), { timedOut: false, value: 7 });
@@ -349,7 +395,7 @@ heading('Account deletion flow (TASK-1104, hardened after device QA)');
 type Behaviour<T> = T | 'hang' | 'throw';
 const never = <T>(): Promise<T> => new Promise<T>(() => {});
 /** Short budgets so the hang tests take milliseconds. Production: DELETION_TIMEOUTS. */
-const FAST = { requestMs: 60, signOutMs: 40, googleRevokeMs: 40 };
+const FAST = { googleTokenMs: 40, requestMs: 60, signOutMs: 40, providerSignOutMs: 40 };
 
 function deletionHarness(opts: {
   provider: string | null;
@@ -358,12 +404,15 @@ function deletionHarness(opts: {
   apple?: Behaviour<AppleReauthentication>;
   invoke?: Behaviour<InvokeResult>;
   signOut?: 'ok' | 'hang' | 'throw';
-  google?: 'ok' | 'hang' | 'throw';
+  googleToken?: Behaviour<GoogleTokenResult>;
+  /** The Google SDK's local sign-out. Recorded apart from `calls`: it is not awaited. */
+  providers?: 'ok' | 'hang' | 'throw';
   purge?: 'ok' | 'throw';
   drop?: 'ok' | 'hang' | 'throw';
   options?: DeletionOptions;
 }) {
   const calls: string[] = [];
+  const providerCalls: string[] = [];
   const bodies: Record<string, unknown>[] = [];
   const signals: AbortSignal[] = [];
   const act = <T>(name: string, behaviour: Behaviour<T> | undefined, fallback: T): Promise<T> => {
@@ -376,13 +425,21 @@ function deletionHarness(opts: {
     appleIdentity: opts.provider === 'apple' || opts.linked === 'apple',
     googleIdentity: opts.provider === 'google' || opts.linked === 'google',
     reauthenticateWithApple: () => act('apple', opts.apple, { authorizationCode: 'apple-code' }),
+    getGoogleAccessToken: () => act('googleToken', opts.googleToken, { accessToken: 'ya29.token' }),
     invokeDelete: (body, signal) => {
-      bodies.push(body);
+      bodies.push({ ...body });
       signals.push(signal);
       const reason = typeof body.apple_authorization_code === 'string' ? 'scheduled' : 'no_code_in_request';
+      const googleReason = typeof body.google_access_token === 'string' ? 'scheduled' : 'no_token_in_request';
       return act('invoke', opts.invoke, {
         status: 200,
-        data: { deleted: true, apple_revocation: reason === 'scheduled' ? 'scheduled' : 'not_attempted', apple_revocation_reason: reason },
+        data: {
+          deleted: true,
+          apple_revocation: reason === 'scheduled' ? 'scheduled' : 'not_attempted',
+          apple_revocation_reason: reason,
+          google_revocation: googleReason === 'scheduled' ? 'scheduled' : 'not_attempted',
+          google_revocation_reason: googleReason,
+        },
       });
     },
     signOutLocally: () => act('signOut', opts.signOut === 'ok' ? undefined : opts.signOut, undefined),
@@ -391,12 +448,17 @@ function deletionHarness(opts: {
       if (opts.purge === 'throw') throw new Error('guard exploded');
     },
     dropStoredSession: () => act('drop', opts.drop === 'ok' ? undefined : opts.drop, undefined),
-    revokeGoogleAccess: () => act('google', opts.google === 'ok' ? undefined : opts.google, undefined),
+    signOutProviders: () => {
+      providerCalls.push('providers');
+      if (opts.providers === 'hang') return never<void>();
+      if (opts.providers === 'throw') return Promise.reject(new Error('Google SDK exploded'));
+      return Promise.resolve();
+    },
     options: opts.options,
     timeouts: FAST,
     log: () => {},
   };
-  return { deps, calls, bodies, signals };
+  return { deps, calls, providerCalls, bodies, signals };
 }
 
 /** Runs the flow and measures it: the core property is that it always settles, fast. */
@@ -408,15 +470,15 @@ async function settle(deps: AccountDeletionDeps): Promise<{ outcome: DeleteAccou
 
 {
   const h = deletionHarness({ provider: 'google' });
-  eq('Google: deleted', (await settle(h.deps)).outcome, { kind: 'deleted', appleCodeSent: false, appleRevocation: 'no_code_in_request', localTeardown: 'clean' });
-  eq('...server FIRST, then the UI purge and local sign-out; never Apple', h.calls.slice(0, 3), ['invoke', 'purge', 'signOut']);
-  eq('...and the body names no user', h.bodies, [{}]);
-  await new Promise((r) => setTimeout(r, 5));
-  assert('...Google access revoked afterwards, off the critical path', h.calls.includes('google'));
+  eq('Google: deleted, and says the token was sent', (await settle(h.deps)).outcome, { kind: 'deleted', appleCodeSent: false, appleRevocation: 'no_code_in_request', googleToken: 'sent', googleRevocation: 'scheduled', localTeardown: 'clean' });
+  eq('...token BEFORE the request, then the server, then the UI purge and local sign-out; never Apple', h.calls.slice(0, 4), ['googleToken', 'invoke', 'purge', 'signOut']);
+  eq('...the body carries the token for the SERVER to revoke, and names no user', h.bodies, [{ google_access_token: 'ya29.token' }]);
+  eq('...and the Google SDK is signed out locally (not awaited)', h.providerCalls, ['providers']);
 }
 {
   const h = deletionHarness({ provider: 'apple' });
-  eq('Apple: deleted, and says the code was sent', (await settle(h.deps)).outcome, { kind: 'deleted', appleCodeSent: true, appleRevocation: 'scheduled', localTeardown: 'clean' });
+  eq('Apple: deleted, and says the code was sent', (await settle(h.deps)).outcome, { kind: 'deleted', appleCodeSent: true, appleRevocation: 'scheduled', googleToken: null, googleRevocation: 'no_token_in_request', localTeardown: 'clean' });
+  eq('...never asks Google for a token', h.calls.includes('googleToken'), false);
   eq('...confirms with Apple before anything is sent', h.calls.slice(0, 2), ['apple', 'invoke']);
   eq('...and sends the fresh authorization code', h.bodies, [{ apple_authorization_code: 'apple-code' }]);
 }
@@ -461,7 +523,7 @@ for (const [label, apple, code] of APPLE_FAILURES) {
 {
   // The way out of a sheet that keeps failing: one tap, no sheet.
   const h = deletionHarness({ provider: 'apple', apple: 'throw', options: { skipAppleConfirmation: true } });
-  eq('"Delete without Apple": deleted, and says NO code was sent', (await settle(h.deps)).outcome, { kind: 'deleted', appleCodeSent: false, appleRevocation: 'no_code_in_request', localTeardown: 'clean' });
+  eq('"Delete without Apple": deleted, and says NO code was sent', (await settle(h.deps)).outcome, { kind: 'deleted', appleCodeSent: false, appleRevocation: 'no_code_in_request', googleToken: null, googleRevocation: 'no_token_in_request', localTeardown: 'clean' });
   eq('...WITHOUT presenting the Apple sheet at all', h.calls.includes('apple'), false);
   eq('...and without a code (revocation is the only cost)', h.bodies, [{}]);
 }
@@ -487,8 +549,8 @@ for (const [label, apple, code] of APPLE_FAILURES) {
   const h = deletionHarness({ provider: 'google', linked: 'apple' });
   const { outcome } = await settle(h.deps);
   eq('LINKED Apple identity: the Apple sheet IS shown', h.calls[0], 'apple');
-  eq('...and the code IS sent', h.bodies, [{ apple_authorization_code: 'apple-code' }]);
-  eq('...and the outcome says so', outcome, { kind: 'deleted', appleCodeSent: true, appleRevocation: 'scheduled', localTeardown: 'clean' });
+  eq('...and the code IS sent - with the Google token (both are revoked)', h.bodies, [{ apple_authorization_code: 'apple-code', google_access_token: 'ya29.token' }]);
+  eq('...and the outcome says so', outcome, { kind: 'deleted', appleCodeSent: true, appleRevocation: 'scheduled', googleToken: 'sent', googleRevocation: 'scheduled', localTeardown: 'clean' });
 }
 {
   // After a 200 the session is a ghost: BOTH teardown steps must run, always.
@@ -506,11 +568,11 @@ for (const [label, apple, code] of APPLE_FAILURES) {
 {
   const h = deletionHarness({ provider: 'google', invoke: { status: 401, data: null } });
   await settle(h.deps);
-  eq('401 (session already dead): the same full teardown', h.calls.slice(1), ['purge', 'signOut', 'drop']);
+  eq('401 (session already dead): the same full teardown', h.calls.slice(2), ['purge', 'signOut', 'drop']);
 }
 {
   const h = deletionHarness({ provider: 'apple', invoke: { status: 200, data: { deleted: true } } });
-  eq('an older server without apple_revocation_reason -> null, not a crash', (await settle(h.deps)).outcome, { kind: 'deleted', appleCodeSent: true, appleRevocation: null, localTeardown: 'clean' });
+  eq('an older server without the revocation reasons -> null, not a crash', (await settle(h.deps)).outcome, { kind: 'deleted', appleCodeSent: true, appleRevocation: null, googleToken: null, googleRevocation: null, localTeardown: 'clean' });
 }
 
 // --- RACE ANALYSIS (23 Sep): the UI purge is synchronous, first, and reported ---
@@ -538,7 +600,7 @@ for (const [label, apple, code] of APPLE_FAILURES) {
   // setState) must not stop the rest of the teardown, and must be reported.
   const h = deletionHarness({ provider: 'google', purge: 'throw' });
   const { outcome } = await settle(h.deps);
-  eq('the UI purge throws -> teardown continues', h.calls.slice(1, 4), ['purge', 'signOut', 'drop']);
+  eq('the UI purge throws -> teardown continues', h.calls.slice(2, 5), ['purge', 'signOut', 'drop']);
   eq('...and says so: incomplete', outcome.kind === 'deleted' ? outcome.localTeardown : outcome, 'incomplete');
 }
 {
@@ -581,10 +643,65 @@ eq('no current route yet (navigator not ready) -> stay', routeAfterAuthChange('s
   assert('...session dropped directly', h.calls.includes('drop'));
 }
 {
-  const h = deletionHarness({ provider: 'google', google: 'hang' });
+  const h = deletionHarness({ provider: 'google', providers: 'hang' });
   const { outcome, ms } = await settle(h.deps);
-  eq('HANG: Google revoke never answers -> still "deleted"', outcome.kind, 'deleted');
-  assert('...without waiting for Google at all', ms < FAST.googleRevokeMs, `${ms} ms`);
+  eq('HANG: the Google SDK sign-out never answers -> still "deleted", clean', outcome.kind === 'deleted' ? outcome.localTeardown : outcome, 'clean');
+  assert('...without waiting for it at all', ms < FAST.providerSignOutMs, `${ms} ms`);
+}
+{
+  const h = deletionHarness({ provider: 'google', providers: 'throw' });
+  eq('the Google SDK sign-out rejects -> still "deleted", clean', (await settle(h.deps)).outcome.kind, 'deleted');
+}
+
+// --- EPIC 12, PM CONSTRAINT: the Google token step never blocks a deletion -------
+// getTokens is capped (2 s in production); on a hang, a throw, or no token the
+// request goes out anyway, flagged so the server logs google_revocation_skipped.
+const TOKEN_FAILURES: [string, Behaviour<GoogleTokenResult>, string][] = [
+  ['hangs (network stall, cold-start restore)', 'hang', 'timeout'],
+  ['throws (SDK error)', 'throw', 'error'],
+  ['no Google session on this device', { unavailable: 'no_google_session' }, 'no_google_session'],
+  ['not configured in this build', { unavailable: 'not_configured' }, 'not_configured'],
+  ['an empty access token', { accessToken: '' }, 'error'],
+];
+for (const [label, googleToken, reason] of TOKEN_FAILURES) {
+  const h = deletionHarness({ provider: 'google', googleToken });
+  const { outcome, ms } = await settle(h.deps);
+  eq(`Google token ${label}: the account is STILL deleted`, outcome.kind, 'deleted');
+  eq(`...the request went out with the flag "${reason}" and no token`, h.bodies, [{ google_token_unavailable: reason }]);
+  eq('...and the outcome carries the reason for QA', outcome.kind === 'deleted' ? outcome.googleToken : outcome, reason);
+  assert('...inside the token budget + the rest of the flow', ms < FAST.googleTokenMs + FAST.requestMs + 150, `${ms} ms`);
+}
+{
+  const h = deletionHarness({ provider: 'google', googleToken: 'hang' });
+  let requestedAfter = -1;
+  const started = Date.now();
+  const invoke = h.deps.invokeDelete;
+  h.deps.invokeDelete = (body, signal) => {
+    requestedAfter = Date.now() - started;
+    return invoke(body, signal);
+  };
+  await settle(h.deps);
+  assert('HANG: a token step that never answers delays the request by the cap, not more', requestedAfter >= FAST.googleTokenMs - 5 && requestedAfter < FAST.googleTokenMs + 100, `${requestedAfter} ms`);
+}
+{
+  const h = deletionHarness({ provider: 'google' });
+  h.deps.getGoogleAccessToken = () => {
+    throw new Error('native module threw synchronously');
+  };
+  const { outcome } = await settle(h.deps);
+  eq('a SYNCHRONOUS throw from the Google SDK -> "error", still deleted', outcome.kind === 'deleted' ? outcome.googleToken : outcome, 'error');
+}
+{
+  // Apple sheet first (it is the user reading), then the token - so the token is fresh.
+  const h = deletionHarness({ provider: 'apple', linked: 'google' });
+  await settle(h.deps);
+  eq('Apple + Google: Apple sheet, then Google token, then the request', h.calls.slice(0, 3), ['apple', 'googleToken', 'invoke']);
+}
+{
+  // A failed Apple sheet stops BEFORE the Google token is even asked for.
+  const h = deletionHarness({ provider: 'apple', linked: 'google', apple: { failure: 'cancelled', code: 'ERR_REQUEST_CANCELED' } });
+  await settle(h.deps);
+  eq('a failed Apple sheet: no Google token requested, nothing sent', h.calls, ['apple']);
 }
 {
   const h = deletionHarness({ provider: 'google', invoke: { status: 401, data: null }, signOut: 'hang' });
@@ -616,14 +733,151 @@ for (const [label, invoke, expected] of cases) {
 
 {
   // The invariant, bluntly: a dependency set where EVERYTHING misbehaves.
-  const h = deletionHarness({ provider: 'apple', apple: 'throw', invoke: 'hang', signOut: 'throw', google: 'hang' });
+  const h = deletionHarness({ provider: 'apple', linked: 'google', apple: 'throw', invoke: 'hang', signOut: 'throw', googleToken: 'hang', providers: 'hang' });
   const { outcome, ms } = await settle(h.deps);
   assert('chaos: still settles, never rejects', outcome.kind === 'failed', JSON.stringify(outcome));
-  assert('...inside the total budget', ms < FAST.requestMs + FAST.signOutMs * 2 + 200, `${ms} ms`);
+  assert('...inside the total budget', ms < FAST.googleTokenMs + FAST.requestMs + FAST.signOutMs * 2 + 200, `${ms} ms`);
+}
+{
+  const h = deletionHarness({ provider: 'google', googleToken: 'hang', invoke: { status: 200, data: { deleted: true } }, signOut: 'hang', drop: 'hang', providers: 'hang' });
+  const { outcome, ms } = await settle(h.deps);
+  eq('chaos after a real delete: every Google and local step hangs -> deleted, reported incomplete', outcome.kind === 'deleted' ? [outcome.googleToken, outcome.localTeardown] : outcome, ['timeout', 'incomplete']);
+  assert('...inside the total budget', ms < FAST.googleTokenMs + FAST.signOutMs * 2 + 200, `${ms} ms`);
 }
 {
   const throwsSync = { ...deletionHarness({ provider: 'google' }).deps, invokeDelete: () => { throw new Error('sync boom'); } };
   eq('a dependency that throws synchronously -> server, not a crash', (await settle(throwsSync as AccountDeletionDeps)).outcome, { kind: 'failed', reason: 'server' });
+}
+
+// -----------------------------------------------------------------------------
+heading('Settings sign-out: the shared teardown (Epic 12, gap 3)');
+// -----------------------------------------------------------------------------
+
+function teardownHarness(opts: { purge?: 'throw'; signOut?: 'hang' | 'throw'; drop?: 'hang' | 'throw'; providers?: 'hang' | 'throw' | 'throw_sync' } = {}) {
+  const calls: string[] = [];
+  const logs: string[] = [];
+  const step = (name: string, behaviour: 'hang' | 'throw' | undefined): Promise<void> => {
+    calls.push(name);
+    if (behaviour === 'hang') return never<void>();
+    if (behaviour === 'throw') return Promise.reject(new Error(`${name} exploded`));
+    return Promise.resolve();
+  };
+  const steps: TeardownSteps = {
+    purgeAuthState: () => {
+      calls.push('purge');
+      if (opts.purge === 'throw') throw new Error('guard exploded');
+    },
+    signOutLocally: () => step('signOut', opts.signOut),
+    dropStoredSession: () => step('drop', opts.drop),
+    signOutProviders: () => {
+      if (opts.providers === 'throw_sync') {
+        calls.push('providers');
+        throw new Error('native module threw synchronously');
+      }
+      return step('providers', opts.providers);
+    },
+  };
+  const run = async (): Promise<{ outcome: LocalTeardown; ms: number }> => {
+    const started = Date.now();
+    const outcome = await tearDownLocalSession(steps, { signOutMs: 40, providerSignOutMs: 40 }, (m) => logs.push(m));
+    return { outcome, ms: Date.now() - started };
+  };
+  return { calls, logs, run };
+}
+{
+  const h = teardownHarness();
+  const pending = h.run();
+  eq('sign-out: the UI purge runs SYNCHRONOUSLY, before the first await', h.calls[0], 'purge');
+  eq('...and supabase-js sign-out has been started by then too', h.calls.includes('signOut'), true);
+  const { outcome } = await pending;
+  eq('...clean when every step works', outcome, 'clean');
+  eq('...all four steps ran', [...h.calls].sort(), ['drop', 'providers', 'purge', 'signOut']);
+}
+{
+  // THE BUG THIS FIXES: AuthService.signOut awaited supabase-js with no bound,
+  // and supabase-js holds the auth lock across network retries.
+  const h = teardownHarness({ signOut: 'hang' });
+  const { outcome, ms } = await h.run();
+  eq('HANG: supabase-js sign-out never answers -> forced (storage dropped directly)', outcome, 'forced');
+  assert('...bounded by signOutMs', ms < 40 + 150, `${ms} ms`);
+  assert('...and the stall is logged, not hidden', h.logs.some((l) => l.includes('did not finish')));
+}
+{
+  const h = teardownHarness({ signOut: 'hang', drop: 'hang' });
+  const { outcome, ms } = await h.run();
+  eq('HANG: supabase-js AND storage -> incomplete (the Settings screen says so)', outcome, 'incomplete');
+  assert('...bounded by 2 x signOutMs', ms < 80 + 150, `${ms} ms`);
+}
+{
+  const h = teardownHarness({ providers: 'hang' });
+  const { outcome, ms } = await h.run();
+  eq('HANG: the Google SDK sign-out never answers -> clean, and never waited for', outcome, 'clean');
+  assert('...', ms < 40, `${ms} ms`);
+}
+{
+  for (const providers of ['throw', 'throw_sync'] as const) {
+    const h = teardownHarness({ providers });
+    eq(`the Google SDK sign-out ${providers === 'throw' ? 'rejects' : 'throws synchronously'} -> clean`, (await h.run()).outcome, 'clean');
+    await new Promise((r) => setTimeout(r, 5));
+    assert('...and it is LOGGED - the old code swallowed it as "cosmetic"', h.logs.some((l) => l.includes('provider sign-out failed')));
+  }
+}
+{
+  const h = teardownHarness({ purge: 'throw' });
+  const { outcome } = await h.run();
+  eq('a throwing purge -> the rest still runs, reported incomplete', [outcome, h.calls.includes('drop')], ['incomplete', true]);
+}
+{
+  const h = teardownHarness({ signOut: 'throw' });
+  eq('supabase-js returns an error (wrapper throws) -> forced', (await h.run()).outcome, 'forced');
+}
+
+// -----------------------------------------------------------------------------
+heading('EAS build refuses to start without Google client IDs (Epic 12)');
+// -----------------------------------------------------------------------------
+{
+  const WEB = '123-web.apps.googleusercontent.com';
+  const IOS = '123-ios.apps.googleusercontent.com';
+  eq('both valid -> no errors', googleSignInConfigErrors({ EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID: WEB, EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID: IOS }), []);
+  eq('both missing -> both named', googleSignInConfigErrors({}), ['EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID is not set', 'EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID is not set']);
+  eq('blank counts as missing', googleSignInConfigErrors({ EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID: '  ', EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID: IOS }), ['EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID is not set']);
+  eq('a malformed id (e.g. the client SECRET pasted) is refused', googleSignInConfigErrors({ EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID: 'GOCSPX-abc', EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID: IOS }).length, 1);
+
+  const KEYS = ['EAS_BUILD', 'EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID', 'EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID'] as const;
+  const saved = Object.fromEntries(KEYS.map((k) => [k, process.env[k]]));
+  const withEnv = (env: Partial<Record<(typeof KEYS)[number], string>>) => {
+    for (const k of KEYS) {
+      if (env[k] === undefined) delete process.env[k];
+      else process.env[k] = env[k];
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return appConfig({ config: { name: 'Audio Tour', slug: 'audio-tour-app' } } as any);
+  };
+  let message = '';
+  try {
+    withEnv({ EAS_BUILD: 'true', EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID: WEB });
+  } catch (err) {
+    message = err instanceof Error ? err.message : String(err);
+  }
+  assert('EAS build with the iOS id missing -> the config THROWS (the build fails)', message.includes('EAS build refused'), message);
+  assert('...naming the missing variable', message.includes('EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID is not set'));
+  let threw = false;
+  try {
+    withEnv({});
+  } catch {
+    threw = true;
+  }
+  assert('NOT an EAS build (expo start, CI) -> no throw; Google is just off', !threw);
+  const built = withEnv({ EAS_BUILD: 'true', EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID: WEB, EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID: IOS });
+  eq(
+    'EAS build with both -> the Google plugin gets the DERIVED iOS URL scheme',
+    (built.plugins ?? []).find((p) => Array.isArray(p) && p[0] === '@react-native-google-signin/google-signin'),
+    ['@react-native-google-signin/google-signin', { iosUrlScheme: 'com.googleusercontent.apps.123-ios' }],
+  );
+  for (const k of KEYS) {
+    if (saved[k] === undefined) delete process.env[k];
+    else process.env[k] = saved[k];
+  }
 }
 
 stop();
