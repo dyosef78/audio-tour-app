@@ -1,4 +1,4 @@
-import { useRef, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
@@ -38,8 +38,14 @@ const FAILURE: Record<DeletionFailureReason, { title: string; message: string }>
   },
 };
 
-/** Lets our confirmation dialog finish dismissing before iOS is asked to present the Apple sheet. */
-const ALERT_DISMISS_MS = 300;
+/**
+ * Confirmation is INLINE, never a UIAlertController in front of the Apple sheet
+ * (device QA, 23 Sep: the sheet hung or re-prompted after Face ID when it was
+ * presented straight after an alert's dismissal, while the identical call from a
+ * plain button tap - the sign-in - works). The confirm button only becomes
+ * active this long after arming, so one double-tap cannot arm and confirm.
+ */
+const ARM_DELAY_MS = 600;
 /** Lets the guard's navigation reset settle before the "deleted" alert is presented over Discovery. */
 const CONFIRMATION_DELAY_MS = 450;
 
@@ -70,6 +76,20 @@ export default function DeleteAccountScreen({ navigation }: DeleteAccountScreenP
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<{ text: string; reference: string | null } | null>(null);
   const inFlight = useRef(false);
+  // Two-step, on this screen: 'idle' -> tap -> 'arming' -> ARM_DELAY_MS -> 'armed' -> tap -> run.
+  const [confirmStep, setConfirmStep] = useState<'idle' | 'arming' | 'armed'>('idle');
+  const armTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(armTimer.current), []);
+
+  const arm = () => {
+    clearTimeout(armTimer.current);
+    setConfirmStep('arming');
+    armTimer.current = setTimeout(() => setConfirmStep('armed'), ARM_DELAY_MS);
+  };
+  const disarm = () => {
+    clearTimeout(armTimer.current);
+    setConfirmStep('idle');
+  };
 
   const run = async (options: DeletionOptions = {}) => {
     if (inFlight.current) return;
@@ -77,12 +97,13 @@ export default function DeleteAccountScreen({ navigation }: DeleteAccountScreenP
     setMessage(null);
     setBusy(true);
 
+    disarm();
+
     let outcome: DeleteAccountOutcome;
     try {
-      // Only needed when an Apple sheet is about to be presented over our dialog.
-      if (appleIdentity && !options.skipAppleConfirmation) {
-        await new Promise((resolve) => setTimeout(resolve, ALERT_DISMISS_MS));
-      }
+      // Called from a direct button tap (or from the failure alert's "Delete
+      // without Apple", which presents no sheet). AccountService waits for the
+      // app to be active and idle before it presents the Apple sheet.
       outcome = await deleteAccount(options);
     } catch (err) {
       console.warn('[Account] unexpected deletion error:', err);
@@ -94,17 +115,22 @@ export default function DeleteAccountScreen({ navigation }: DeleteAccountScreenP
 
     if (outcome.kind === 'failed') {
       const { title, message: text } = FAILURE[outcome.reason];
-      // A short reference ("apple_confirmation / ERR_REQUEST_CANCELED") so a
-      // tester can report WHICH branch ran - client failures leave no server log.
-      setMessage({ text, reference: outcome.detail ? `${outcome.reason} / ${outcome.detail}` : outcome.reason });
+      // The reference goes IN the alert, not only on the screen behind it: in
+      // device QA the tester read the alert, and the reference was not in it.
+      // Client-side failures leave no server log; this line is the evidence.
+      const reference = outcome.detail ? `${outcome.reason} / ${outcome.detail}` : outcome.reason;
+      setMessage({ text, reference });
+      const body = `${text}\n\nReference: ${reference}`;
       if (outcome.reason === 'apple_confirmation') {
-        Alert.alert(title, text, [
+        Alert.alert(title, body, [
           { text: 'Keep my account', style: 'cancel' },
-          { text: 'Try Apple again', onPress: () => void run() },
+          // Re-arms the button on this screen - the next Apple sheet opens from a
+          // plain tap again, never straight out of this alert.
+          { text: 'Try Apple again', onPress: arm },
           { text: 'Delete without Apple', style: 'destructive', onPress: () => void run({ skipAppleConfirmation: true }) },
         ]);
       } else {
-        Alert.alert(title, text);
+        Alert.alert(title, body);
       }
       return;
     }
@@ -136,18 +162,9 @@ export default function DeleteAccountScreen({ navigation }: DeleteAccountScreenP
     }, CONFIRMATION_DELAY_MS);
   };
 
-  const confirm = () => {
-    Alert.alert(
-      'Delete your account?',
-      appleIdentity
-        ? "This can't be undone. You'll confirm with Apple one last time."
-        : "This can't be undone.",
-      [
-        { text: 'Cancel', style: 'cancel' },
-        { text: 'Delete', style: 'destructive', onPress: () => void run() },
-      ],
-    );
-  };
+  const disabled = busy || !signedIn;
+  const primaryLabel =
+    confirmStep === 'idle' ? 'Delete account' : appleIdentity ? 'Confirm with Apple and delete' : 'Yes, delete my account';
 
   return (
     <View style={styles.root}>
@@ -181,17 +198,33 @@ export default function DeleteAccountScreen({ navigation }: DeleteAccountScreenP
       </ScrollView>
 
       <View style={[styles.footer, { paddingBottom: insets.bottom + 14 }]}>
+        {confirmStep !== 'idle' && !busy && (
+          <Text style={styles.confirmNote} accessibilityRole="alert">
+            {appleIdentity
+              ? "This can't be undone. Apple will ask you to confirm one last time."
+              : "This can't be undone."}
+          </Text>
+        )}
         <Pressable
-          onPress={confirm}
-          disabled={busy || !signedIn}
+          onPress={confirmStep === 'armed' ? () => void run() : arm}
+          disabled={disabled || confirmStep === 'arming'}
           accessibilityRole="button"
-          accessibilityState={{ disabled: busy || !signedIn, busy }}
-          style={({ pressed }) => [styles.delete, (busy || !signedIn) && styles.deleteDisabled, pressed && styles.pressed]}
+          accessibilityState={{ disabled: disabled || confirmStep === 'arming', busy }}
+          style={({ pressed }) => [
+            styles.delete,
+            (disabled || confirmStep === 'arming') && styles.deleteDisabled,
+            pressed && styles.pressed,
+          ]}
         >
-          {busy ? <ActivityIndicator color={colors.canvas} /> : <Text style={styles.deleteText}>Delete account</Text>}
+          {busy ? <ActivityIndicator color={colors.canvas} /> : <Text style={styles.deleteText}>{primaryLabel}</Text>}
         </Pressable>
-        <Pressable onPress={() => navigation.goBack()} disabled={busy} accessibilityRole="button" style={styles.keep}>
-          <Text style={styles.keepText}>Keep my account</Text>
+        <Pressable
+          onPress={confirmStep === 'idle' ? () => navigation.goBack() : disarm}
+          disabled={busy}
+          accessibilityRole="button"
+          style={styles.keep}
+        >
+          <Text style={styles.keepText}>{confirmStep === 'idle' ? 'Keep my account' : 'Cancel'}</Text>
         </Pressable>
       </View>
     </View>
@@ -231,5 +264,6 @@ const styles = StyleSheet.create({
   pressed: { opacity: 0.85 },
   deleteText: { color: colors.canvas, fontSize: 17, fontWeight: '700' },
   keep: { minHeight: 48, alignItems: 'center', justifyContent: 'center' },
+  confirmNote: { fontSize: 14, lineHeight: 20, color: colors.dangerInk, textAlign: 'center', marginBottom: 4 },
   keepText: { fontSize: 16, fontWeight: '600', color: colors.accent },
 });

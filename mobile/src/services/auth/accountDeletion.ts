@@ -1,3 +1,4 @@
+import { describeError } from '../../lib/describeError';
 import { raceTimeout } from '../../lib/timeout';
 
 /**
@@ -86,9 +87,11 @@ export type AppleReauthentication =
    * `cancelled`: iOS said ASAuthorizationError.canceled - the user backing out
    * OR a system failure iOS reports the same way; they cannot be told apart.
    * `error`: any other failure, or a credential without an authorization code.
-   * `code` is the native code, kept for the screen's reference line.
+   * `code` / `message` come from describeError, so no failure shape loses
+   * them; `elapsedMs` is how long the sheet was up - a sheet closed by hand
+   * after 20 s is a hang, one refused in 50 ms never showed (device QA, 23 Sep).
    */
-  | { failure: 'cancelled' | 'error'; code: string }
+  | { failure: 'cancelled' | 'error'; code: string; message?: string; elapsedMs?: number }
   /** No Apple sheet on this device (e.g. an Apple account opened on Android). */
   | 'unavailable';
 
@@ -130,7 +133,17 @@ export interface AccountDeletionDeps {
   log?: (message: string) => void;
 }
 
-const describe = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+const describe = (err: unknown): string => {
+  const { code, message } = describeError(err);
+  return `${code}: ${message}`;
+};
+
+/** "ERR_REQUEST_CANCELED after 21400 ms: The user canceled the authorization attempt" */
+export function appleFailureDetail(failure: { code: string; message?: string; elapsedMs?: number }): string {
+  const after = failure.elapsedMs !== undefined ? ` after ${failure.elapsedMs} ms` : '';
+  const why = failure.message ? `: ${failure.message}` : '';
+  return `${failure.code}${after}${why}`;
+}
 
 export async function runAccountDeletion(deps: AccountDeletionDeps): Promise<DeleteAccountOutcome> {
   const log = deps.log ?? ((message) => console.warn(`[Account] ${message}`));
@@ -157,15 +170,17 @@ async function deletionFlow(
     try {
       reauth = await deps.reauthenticateWithApple();
     } catch (err) {
-      reauth = { failure: 'error', code: `EXCEPTION: ${describe(err)}` };
+      const { code, message } = describeError(err);
+      reauth = { failure: 'error', code: `EXCEPTION ${code}`, message };
     }
     if (reauth !== 'unavailable') {
       if ('failure' in reauth) {
         // Stop BEFORE the request, and say so. Never proceed silently without
         // the code (that hid the failure and skipped revocation), and never
         // return nothing (that looked like a dead button and invited the loop).
-        log(`Apple confirmation did not complete (${reauth.failure}: ${reauth.code}); nothing sent`);
-        return { kind: 'failed', reason: 'apple_confirmation', detail: reauth.code };
+        const detail = appleFailureDetail(reauth);
+        log(`Apple confirmation did not complete (${reauth.failure}): ${detail}; nothing sent`);
+        return { kind: 'failed', reason: 'apple_confirmation', detail };
       }
       body.apple_authorization_code = reauth.authorizationCode;
     }

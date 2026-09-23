@@ -1,7 +1,8 @@
 import { GoogleSignin } from '@react-native-google-signin/google-signin';
 import * as AppleAuthentication from 'expo-apple-authentication';
-import { Platform } from 'react-native';
+import { AppState, InteractionManager, Platform } from 'react-native';
 
+import { describeError } from '../../lib/describeError';
 import { raceTimeout } from '../../lib/timeout';
 import { isSupabaseConfigured, supabase, supabaseEndpoint } from '../supabase/client';
 import {
@@ -38,13 +39,57 @@ const DELETE_FUNCTION = 'delete-account';
 /** How long getSession() gets before the last known token is used instead. */
 const SESSION_LOOKUP_MS = 2_500;
 
+/** How long to wait for the app to be active and idle before presenting the Apple sheet. */
+const PRESENT_READY_MS = 1_500;
+
+/**
+ * Resolve once nothing native is mid-transition: the app is `active` (not
+ * `inactive` behind a system UI) and React Native has finished pending
+ * interactions and animations. Bounded - a stuck AppState must not block the
+ * sheet forever; it is presented anyway after PRESENT_READY_MS.
+ *
+ * Replaces a fixed 300 ms wait after a UIAlertController. The initial Apple
+ * sign-in - which works - is presented from a plain button tap; the failing
+ * re-auth was presented straight after an alert's dismissal. Device QA,
+ * 23 Sep: sheet hung or re-prompted after Face ID on that path.
+ */
+async function readyToPresentSystemSheet(): Promise<void> {
+  if (AppState.currentState !== 'active') {
+    let sub: { remove: () => void } | undefined;
+    try {
+      await raceTimeout(
+        new Promise<void>((resolve) => {
+          sub = AppState.addEventListener('change', (state) => {
+            if (state === 'active') resolve();
+          });
+        }),
+        PRESENT_READY_MS,
+      );
+    } finally {
+      // Removed on success AND on timeout, so a stuck wait leaves no listener behind.
+      sub?.remove();
+    }
+  }
+  await raceTimeout(
+    new Promise<void>((resolve) => {
+      InteractionManager.runAfterInteractions(() => resolve());
+    }),
+    PRESENT_READY_MS,
+  );
+}
+
 /**
  * One Apple sheet, one answer. Only "this device has no Apple sheet" is
  * 'unavailable' (the flow then proceeds without a code, as on Android). Every
- * failure of a sheet that WAS shown is reported as a failure with its native
- * code - b89da6c mapped ERR_REQUEST_CANCELED to a silent cancel and every other
- * error to 'unavailable', so a failed sheet either did nothing visible or was
- * quietly skipped.
+ * failure of a sheet that WAS shown carries iOS's code, its message, and how
+ * long the sheet was up.
+ *
+ * The request itself is deliberately minimal and is the SAME native call as
+ * the working sign-in (signInAsync -> requestAsync, operation LOGIN):
+ * - requestedScopes: [] - an existing authorisation never re-sends name or
+ *   email, and asking for nothing cannot be an "invalid scope".
+ * - no nonce - it binds an ID token to a server-side check; the code exchange
+ *   in delete-account does not use it, and it has no effect on the sheet.
  */
 async function reauthenticateWithApple(): Promise<AppleReauthentication> {
   if (Platform.OS !== 'ios') return 'unavailable';
@@ -56,17 +101,23 @@ async function reauthenticateWithApple(): Promise<AppleReauthentication> {
   }
   if (!available) return 'unavailable';
 
+  await readyToPresentSystemSheet();
+  const started = Date.now();
   try {
-    // No scopes: this is a confirmation, and Apple would not resend the name anyway.
     const credential = await AppleAuthentication.signInAsync({ requestedScopes: [] });
     return credential.authorizationCode
       ? { authorizationCode: credential.authorizationCode }
-      : { failure: 'error', code: 'NO_AUTHORIZATION_CODE' };
+      : { failure: 'error', code: 'NO_AUTHORIZATION_CODE', elapsedMs: Date.now() - started };
   } catch (err) {
-    const code = typeof err === 'object' && err !== null && 'code' in err ? String((err as { code: unknown }).code) : 'UNKNOWN';
+    const { code, message } = describeError(err);
     // iOS reports some system failures as .canceled too, so this is NOT treated
     // as the user's final word - the screen explains and offers a way forward.
-    return { failure: code === 'ERR_REQUEST_CANCELED' ? 'cancelled' : 'error', code };
+    return {
+      failure: code === 'ERR_REQUEST_CANCELED' ? 'cancelled' : 'error',
+      code,
+      message,
+      elapsedMs: Date.now() - started,
+    };
   }
 }
 

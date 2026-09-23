@@ -13,8 +13,10 @@ import { mock } from 'node:test';
 
 import type { Session } from '@supabase/supabase-js';
 
+import { describeError } from '../src/lib/describeError.ts';
 import { raceTimeout } from '../src/lib/timeout.ts';
 import {
+  appleFailureDetail,
   runAccountDeletion,
   type AccountDeletionDeps,
   type AppleReauthentication,
@@ -314,6 +316,32 @@ heading('raceTimeout');
   assert('a rejection is passed through, not turned into a timeout', rejected);
 }
 
+heading('describeError: no thrown shape loses its code or message (device QA, 23 Sep)');
+{
+  class CodedError extends Error {
+    code: string;
+    constructor(code: string, message: string) {
+      super(message);
+      this.code = code;
+    }
+  }
+  eq('Expo CodedError (what signInAsync throws)', describeError(new CodedError('ERR_REQUEST_CANCELED', 'The user canceled the authorization attempt')), { code: 'ERR_REQUEST_CANCELED', message: 'The user canceled the authorization attempt' });
+  eq('a plain Error keeps its NAME and message - it used to become UNKNOWN', describeError(new TypeError("Cannot read properties of undefined (reading 'x')")), { code: 'TypeError', message: "Cannot read properties of undefined (reading 'x')" });
+  eq('an NSError-style numeric code', describeError({ code: 1001, message: 'canceled' }), { code: '1001', message: 'canceled' });
+  eq('a thrown string', describeError('boom'), { code: 'STRING_THROWN', message: 'boom' });
+  eq('null', describeError(null), { code: 'UNKNOWN', message: 'null' });
+  eq('a number', describeError(42), { code: 'UNKNOWN', message: 'non-error value of type number' });
+  eq('an Error with an empty message', describeError(new Error('')), { code: 'Error', message: '(no message)' });
+  eq('multi-line native messages are flattened', describeError({ code: 'X', message: 'line one\n  line two' }).message, 'line one line two');
+  assert('long messages are clipped for an alert', describeError({ code: 'X', message: 'y'.repeat(500) }).message.length <= 160);
+}
+eq(
+  'appleFailureDetail: code, time the sheet was up, and why',
+  appleFailureDetail({ code: 'ERR_REQUEST_CANCELED', elapsedMs: 21400, message: 'The user canceled the authorization attempt' }),
+  'ERR_REQUEST_CANCELED after 21400 ms: The user canceled the authorization attempt',
+);
+eq('appleFailureDetail with only a code', appleFailureDetail({ code: 'NO_AUTHORIZATION_CODE' }), 'NO_AUTHORIZATION_CODE');
+
 // -----------------------------------------------------------------------------
 heading('Account deletion flow (TASK-1104, hardened after device QA)');
 // -----------------------------------------------------------------------------
@@ -403,6 +431,17 @@ const APPLE_FAILURES: [string, AppleReauthentication, string][] = [
   ['unknown', { failure: 'error', code: 'ERR_REQUEST_UNKNOWN' }, 'ERR_REQUEST_UNKNOWN'],
   ['no authorization code', { failure: 'error', code: 'NO_AUTHORIZATION_CODE' }, 'NO_AUTHORIZATION_CODE'],
 ];
+{
+  const h = deletionHarness({
+    provider: 'apple',
+    apple: { failure: 'cancelled', code: 'ERR_REQUEST_CANCELED', message: 'The user canceled the authorization attempt', elapsedMs: 21400 },
+  });
+  eq(
+    'the outcome keeps the iOS code, the sheet time AND the message (the alert shows all three)',
+    (await settle(h.deps)).outcome,
+    { kind: 'failed', reason: 'apple_confirmation', detail: 'ERR_REQUEST_CANCELED after 21400 ms: The user canceled the authorization attempt' },
+  );
+}
 for (const [label, apple, code] of APPLE_FAILURES) {
   const h = deletionHarness({ provider: 'apple', apple });
   const { outcome } = await settle(h.deps);
