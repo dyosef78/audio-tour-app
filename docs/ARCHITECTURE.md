@@ -172,24 +172,22 @@ CMS admins.
   these variables, so no shipped build ever showed the Google button.
 - **Google nonce: the SDK cannot send one.** Supabase checks an ID token's
   `nonce` claim against a hash of the raw nonce the app passes to
-  `signInWithIdToken`, and production keeps that check on
-  (`skip_nonce_check = false`). The free "Original" API of
+  `signInWithIdToken`. The free "Original" API of
   `@react-native-google-signin/google-signin` (v16) takes **no nonce parameter**:
   none in its TypeScript types, none in its iOS sources. So a client-side nonce
   (random value, SHA-256 hash to Google, raw value to Supabase, as Apple does)
-  **cannot be built on this SDK**. Sign-in passed on a device on 24 Sep 2026
-  without the fallback below being reported as used. With the check still on,
-  that implies the SDK's ID tokens currently carry no nonce claim, so Supabase
-  has nothing to compare. If a future SDK or iOS update starts adding one,
-  sign-in will fail with a nonce mismatch. **Approved fallback (PM, 24 Sep): turn on "Skip nonce
-  checks" for Google in the Supabase dashboard, AND set `skip_nonce_check =
-  true` under `[auth.external.google]` in `supabase/config.toml`**, or a
-  `supabase config push` would switch it back. Signature, audience and expiry
-  are still verified; what is lost is replay protection for a stolen ID token
-  during its one-hour life, which is low-value here because being signed in
-  grants nothing (see below). The alternatives both cost a rebuild: the paid
-  Universal Sign In module (`GoogleOneTapSignIn` takes a nonce), or a
-  browser-based OAuth flow.
+  **cannot be built on this SDK**. On a device (24 Sep 2026) the iOS SDK's ID
+  token carried a nonce the app could not supply, and Supabase rejected the
+  sign-in. **Production therefore runs with "Skip nonce checks" ON for Google**
+  (PM decision, 24 Sep; sign-in succeeded immediately after). `supabase/config.toml`
+  matches (`skip_nonce_check = true` under `[auth.external.google]`); keep them
+  in step, or a `supabase config push` switches the check back on and breaks
+  iOS Google sign-in. Signature, audience and expiry are still verified. What
+  is lost is replay protection for a stolen ID token during its one-hour life,
+  which is low-value here because being signed in grants nothing (see below).
+  Turning the check back on needs a nonce-capable client, and both options
+  cost a rebuild: the paid Universal Sign In module (`GoogleOneTapSignIn` takes
+  a nonce), or a browser-based OAuth flow.
 - **Sign-out (Epic 12) uses the same teardown as deletion** (`localTeardown.ts`):
   the UI is purged synchronously before the first await, then supabase-js
   `signOut` and the stored-session drop run, each capped at 3 s, and the Google
@@ -741,8 +739,9 @@ Credentials live outside the repo, set by the PM: the EAS environment
 variables, the Android OAuth client (the EAS keystore **and** Play App Signing
 SHA-1s), Supabase's Google Authorized Client IDs, and the function secret. The
 OAuth consent screen is in **Testing** mode: only listed test users can sign in,
-so it must be published before release. Nonce: see §3.2; the approved fallback
-was not needed.
+so it must be published before release. Nonce: the iOS SDK's nonce failed
+validation on the device, and the approved fallback is live: "Skip nonce
+checks" is on for Google (§3.2).
 
 ---
 
@@ -760,7 +759,7 @@ needs a PM decision or a task; none should be assumed.
 | **Skip to next stop** for a missed zone | Only the debug manual trigger; a missed zone blocks the remaining stops | Post-MVP backlog |
 | **Proximity-based start** (`preferences.start`) | Not sent; scored routes start at the first authored stop | Post-MVP backlog |
 | **Retry of failed Apple revocations** ("zombie grant") | A revocation that fails after the delete is logged, not retried: the user is gone from Supabase but Apple may still list the app as connected | Post-MVP backlog (PM, 22 Sep 2026). Accepted MVP risk; design in §7.1. |
-| **In-app account deletion** (App Store guideline 5.1.1(v)) | Built (TASK-1104, Epic 12). The `delete-account` Edge Function is **live in production**: first deployed 18 Sep 2026, hardened 22 Sep, version 7 with server-side Google revocation since 24 Sep | Secrets set: the four `APPLE_*` (22 Sep; `APPLE_CLIENT_ID` verified to be exactly the bundle id) and `GOOGLE_CLIENT_IDS` (23 Sep). **Google deletion and revocation confirmed on a physical device on 24 Sep** (TestFlight production build; the token was revoked). Apple deletion was part of Epic 11's device QA; a `apple_revocation_finished` → `revoked` log line has not been recorded here. |
+| **In-app account deletion** (App Store guideline 5.1.1(v)) | Built (TASK-1104, Epic 12). The `delete-account` Edge Function is **live in production**: first deployed 18 Sep 2026, hardened 22 Sep, version 7 with server-side Google revocation since 24 Sep | Secrets set: the four `APPLE_*` (22 Sep; `APPLE_CLIENT_ID` verified to be exactly the bundle id) and `GOOGLE_CLIENT_IDS` (23 Sep). **Google deletion and revocation confirmed on a physical device on 24 Sep** (TestFlight production build; the token was revoked). Apple deletion and revocation confirmed in production during Epic 11 device QA (function log `{"event":"apple_revocation_finished","result":"revoked"}`). |
 | **Future trip planning** (travel dates, time-simulated routing) | Routing scores the device's current `context.local_time`; onboarding asks for no dates | Post-MVP backlog (PM, Epic 11 kickoff). The server already takes any `local_time`, so the backend gap is small; the work is the dates UI and offline bundles for a trip that is weeks away. |
 | **Precise kids' ages** scoring | One `family_kids` audience tag; no ages collected | Post-MVP backlog (PM, Epic 11 kickoff) |
 | **User-selectable bicycle / car modes** | Walking only in onboarding. `transit_mode` belongs to the tour, and `route-stops` refuses a mismatch (400 `transit_mode_mismatch`) | Post-MVP backlog (PM, Epic 11 kickoff). The engine already has biking/driving profiles, but geofence radii are authored for each tour's own mode, so this is a content change as well as a code change. |

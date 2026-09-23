@@ -393,7 +393,12 @@ url = ""
 # - client_id here is a single value. Miss one and the token is rejected as
 # audience-mismatched, a failure that appears only on device, never in a browser,
 # and reads as "sign-in silently does nothing".
-skip_nonce_check = false
+# Epic 12 (PM, 24 Sep 2026): ON in production. The iOS Google SDK puts a nonce
+# in its ID token that the app cannot supply to Supabase: the free
+# @react-native-google-signin API takes no nonce parameter. Signature, audience
+# and expiry are still verified. Keep this true, or a config push breaks iOS
+# Google sign-in. See ARCHITECTURE.md §3.2.
+skip_nonce_check = true
 email_optional = false
 
 # Allow Solana wallet holders to sign in to your project via the Sign in with Solana (SIWS, EIP-4361) standard.
