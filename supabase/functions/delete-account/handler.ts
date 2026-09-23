@@ -8,11 +8,17 @@
  * CONTRACT
  *
  *   POST   Authorization: Bearer <the user's access token>
- *          { "apple_authorization_code"?: string }   optional; see appleRevoke.ts
+ *          { "apple_authorization_code"?: string,    optional; see appleRevoke.ts
+ *            "google_access_token"?: string,         optional; see googleRevoke.ts
+ *            "google_token_unavailable"?: string }   why the app sent no Google token
+ *                                                    (e.g. "timeout"); logged, never trusted
  *
  *   200  { "deleted": true, "apple_revocation": "scheduled" | "not_attempted",
  *          "apple_revocation_reason": "scheduled" | "no_code_in_request"
- *                                     | "revocation_not_configured" | "no_apple_identity_on_account" }
+ *                                     | "revocation_not_configured" | "no_apple_identity_on_account",
+ *          "google_revocation": "scheduled" | "not_attempted",
+ *          "google_revocation_reason": "scheduled" | "no_token_in_request"
+ *                                      | "revocation_not_configured" | "no_google_identity_on_account" }
  *   400  malformed body
  *   401  not_signed_in          no valid user session (the anon key is not one)
  *   403  admin_account          CMS administrators are removed by the team, not from the app
@@ -30,10 +36,11 @@
  *   1. authenticate   (GoTrue)            deadline 3 s
  *   2. admin check    (Postgres)          deadline 2.5 s
  *   3. deleteUser     (GoTrue admin)      deadline 4 s
- *   4. Apple revocation - AFTER the delete, in the background. It used to run
- *      before the delete, so a slow appleid.apple.com held the account hostage
- *      and ate the phone's time budget. The Apple subjects it checks against
- *      are captured in step 1, so they survive the delete.
+ *   4. Apple and Google revocation - AFTER the delete, in the background. Apple
+ *      used to run before the delete, so a slow appleid.apple.com held the
+ *      account hostage and ate the phone's time budget. The Apple and Google
+ *      subjects they check against are captured in step 1, so they survive the
+ *      delete.
  *   Worst case before responding: ~9.5 s, inside the app's 10 s budget; the
  *   usual case is well under 2 s.
  *
@@ -58,11 +65,14 @@
  */
 
 import type { AppleRevoker } from './appleRevoke.ts';
+import type { GoogleRevoker } from './googleRevoke.ts';
 
 export interface AuthenticatedUser {
   id: string;
   /** Apple `sub` values from the user's Apple identities; empty for other providers. */
   appleSubjects: readonly string[];
+  /** Google `sub` values from the user's Google identities; empty for other providers. */
+  googleSubjects: readonly string[];
 }
 
 export interface StepDeadlines {
@@ -86,6 +96,7 @@ export interface DeleteAccountDeps {
   isCmsAdmin: ((userId: string) => Promise<boolean>) | null;
   deleteUser: ((userId: string) => Promise<'deleted' | 'not_found'>) | null;
   appleRevoker: AppleRevoker | null;
+  googleRevoker: GoogleRevoker | null;
   /**
    * Keeps a task alive after the response is sent - EdgeRuntime.waitUntil on
    * Supabase. Without it the revocation is awaited, capped at
@@ -98,6 +109,8 @@ export interface DeleteAccountDeps {
 
 const MAX_BODY_BYTES = 8 * 1024;
 const MAX_CODE_LENGTH = 1024;
+/** Google documents access tokens as up to 2048 bytes. */
+const MAX_GOOGLE_TOKEN_LENGTH = 4096;
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
@@ -165,13 +178,15 @@ export async function handleDeleteAccount(request: Request, deps: DeleteAccountD
   if (!user) return fail(401, 'not_signed_in', 'Sign in to delete your account.');
   const parsed = await parseBody(request);
   if (!parsed.ok) return fail(400, 'invalid_request', parsed.message);
-  // Both halves of the revocation decision on one line: whether the account has
-  // an Apple identity, and whether the phone sent a code. Never the code itself.
+  // Both halves of each revocation decision on one line: whether the account
+  // has the identity, and what the phone sent. Never the code or token itself.
   log({
     event: 'delete_account_authenticated',
     user_id: user.id,
     apple_identities: user.appleSubjects.length,
     apple_code_present: parsed.appleAuthorizationCode !== null,
+    google_identities: user.googleSubjects.length,
+    google_token_present: parsed.googleAccessToken !== null,
   });
 
   // 2. Admins are removed by the team. Fails CLOSED: no answer, no delete.
@@ -205,10 +220,12 @@ export async function handleDeleteAccount(request: Request, deps: DeleteAccountD
     return fail(500, 'delete_failed', 'Your account could not be deleted. Nothing was removed; please try again.');
   }
 
-  // 4. Best-effort Apple revocation, off the critical path. Every outcome is
-  // logged with its reason: "no apple_revocation_finished line" used to mean
-  // any of three different things (device QA, 23 Sep).
-  const skipReason =
+  // 4. Best-effort revocation, off the critical path. Every outcome is logged
+  // with its reason: "no apple_revocation_finished line" used to mean any of
+  // three different things (device QA, 23 Sep). Google follows the same rule.
+  const background: Promise<unknown>[] = [];
+
+  const appleSkip =
     parsed.appleAuthorizationCode === null
       ? 'no_code_in_request'
       : !deps.appleRevoker
@@ -216,36 +233,83 @@ export async function handleDeleteAccount(request: Request, deps: DeleteAccountD
         : user.appleSubjects.length === 0
           ? 'no_apple_identity_on_account'
           : null;
-  let appleRevocation: 'scheduled' | 'not_attempted' = 'not_attempted';
-  if (skipReason !== null) {
+  if (appleSkip !== null) {
     // Silent for plain Google accounts; logged whenever Apple is involved at all.
     if (user.appleSubjects.length > 0 || parsed.appleAuthorizationCode !== null) {
-      log({ event: 'apple_revocation_skipped', user_id: user.id, reason: skipReason });
+      log({ event: 'apple_revocation_skipped', user_id: user.id, reason: appleSkip });
     }
   } else if (parsed.appleAuthorizationCode !== null && deps.appleRevoker) {
-    appleRevocation = 'scheduled';
     log({ event: 'apple_revocation_scheduled', user_id: user.id, background: Boolean(deps.runInBackground) });
-    const task = deps.appleRevoker
-      .revoke(parsed.appleAuthorizationCode, user.appleSubjects)
-      .then((result) => log({ event: 'apple_revocation_finished', user_id: user.id, result }))
-      .catch((cause) => log({ event: 'apple_revocation_finished', user_id: user.id, result: 'failed', message: String(cause) }));
+    background.push(
+      deps.appleRevoker
+        .revoke(parsed.appleAuthorizationCode, user.appleSubjects)
+        .then((result) => log({ event: 'apple_revocation_finished', user_id: user.id, result }))
+        .catch((cause) => log({ event: 'apple_revocation_finished', user_id: user.id, result: 'failed', message: String(cause) })),
+    );
+  }
+
+  const googleSkip =
+    parsed.googleAccessToken === null
+      ? 'no_token_in_request'
+      : !deps.googleRevoker
+        ? 'revocation_not_configured'
+        : user.googleSubjects.length === 0
+          ? 'no_google_identity_on_account'
+          : null;
+  if (googleSkip !== null) {
+    // Silent for plain Apple accounts; logged whenever Google is involved at all.
+    // `client_reason` is the phone's account of why it sent no token (the
+    // Epic 12 fallback: the 2 s cap, a cold start, no Google session on the
+    // device). It feeds this log line and decides nothing.
+    if (user.googleSubjects.length > 0 || parsed.googleAccessToken !== null || parsed.googleTokenUnavailable !== null) {
+      log({ event: 'google_revocation_skipped', user_id: user.id, reason: googleSkip, client_reason: parsed.googleTokenUnavailable });
+    }
+  } else if (parsed.googleAccessToken !== null && deps.googleRevoker) {
+    log({ event: 'google_revocation_scheduled', user_id: user.id, background: Boolean(deps.runInBackground) });
+    background.push(
+      deps.googleRevoker
+        .revoke(parsed.googleAccessToken, user.googleSubjects)
+        .then((result) => log({ event: 'google_revocation_finished', user_id: user.id, result }))
+        .catch((cause) => log({ event: 'google_revocation_finished', user_id: user.id, result: 'failed', message: String(cause) })),
+    );
+  }
+
+  if (background.length > 0) {
     if (deps.runInBackground) {
-      deps.runInBackground(task);
+      for (const task of background) deps.runInBackground(task);
     } else {
-      await withDeadline(task, deadlines.revocationFallbackMs, 'apple_revocation').catch(() =>
-        log({ event: 'apple_revocation_abandoned', user_id: user.id }),
+      // Both in parallel under one cap: the response waits at most this long.
+      await withDeadline(Promise.all(background), deadlines.revocationFallbackMs, 'revocation').catch(() =>
+        log({ event: 'revocation_abandoned', user_id: user.id }),
       );
     }
   }
 
   return json(
     200,
-    { deleted: true, apple_revocation: appleRevocation, apple_revocation_reason: skipReason ?? 'scheduled' },
+    {
+      deleted: true,
+      apple_revocation: appleSkip === null ? 'scheduled' : 'not_attempted',
+      apple_revocation_reason: appleSkip ?? 'scheduled',
+      google_revocation: googleSkip === null ? 'scheduled' : 'not_attempted',
+      google_revocation_reason: googleSkip ?? 'scheduled',
+    },
     idHeader,
   );
 }
 
-type ParsedBody = { ok: true; appleAuthorizationCode: string | null } | { ok: false; message: string };
+type ParsedBody =
+  | {
+      ok: true;
+      appleAuthorizationCode: string | null;
+      googleAccessToken: string | null;
+      /** The phone's reason for sending no Google token, or 'unrecognised'. Log-only. */
+      googleTokenUnavailable: string | null;
+    }
+  | { ok: false; message: string };
+
+const EMPTY_BODY: ParsedBody = { ok: true, appleAuthorizationCode: null, googleAccessToken: null, googleTokenUnavailable: null };
+const REASON_PATTERN = /^[a-z0-9_]{1,64}$/;
 
 async function parseBody(request: Request): Promise<ParsedBody> {
   let text: string;
@@ -255,7 +319,7 @@ async function parseBody(request: Request): Promise<ParsedBody> {
     return { ok: false, message: 'Body could not be read.' };
   }
   if (new TextEncoder().encode(text).length > MAX_BODY_BYTES) return { ok: false, message: 'Body too large.' };
-  if (text.trim() === '') return { ok: true, appleAuthorizationCode: null };
+  if (text.trim() === '') return EMPTY_BODY;
 
   let raw: unknown;
   try {
@@ -264,13 +328,33 @@ async function parseBody(request: Request): Promise<ParsedBody> {
     return { ok: false, message: 'Body is not JSON.' };
   }
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return { ok: false, message: 'Body must be a JSON object.' };
+  const body = raw as Record<string, unknown>;
 
-  const code = (raw as Record<string, unknown>).apple_authorization_code;
-  if (code === undefined || code === null) return { ok: true, appleAuthorizationCode: null };
-  if (typeof code !== 'string' || code.length === 0 || code.length > MAX_CODE_LENGTH) {
+  const code = body.apple_authorization_code;
+  if (code !== undefined && code !== null && (typeof code !== 'string' || code.length === 0 || code.length > MAX_CODE_LENGTH)) {
     return { ok: false, message: 'apple_authorization_code must be a non-empty string.' };
   }
-  return { ok: true, appleAuthorizationCode: code };
+  const token = body.google_access_token;
+  if (token !== undefined && token !== null && (typeof token !== 'string' || token.length === 0 || token.length > MAX_GOOGLE_TOKEN_LENGTH)) {
+    return { ok: false, message: 'google_access_token must be a non-empty string.' };
+  }
+  // Never a 400: the flag only feeds a log line, and the PM's rule for Epic 12
+  // is that nothing about Google may stop a deletion. A value that is not a
+  // short snake_case reason is recorded as 'unrecognised'.
+  const unavailable = body.google_token_unavailable;
+  const googleTokenUnavailable =
+    unavailable === undefined || unavailable === null
+      ? null
+      : typeof unavailable === 'string' && REASON_PATTERN.test(unavailable)
+        ? unavailable
+        : 'unrecognised';
+
+  return {
+    ok: true,
+    appleAuthorizationCode: typeof code === 'string' ? code : null,
+    googleAccessToken: typeof token === 'string' ? token : null,
+    googleTokenUnavailable,
+  };
 }
 
 function error(status: number, code: string, message: string, headers: Record<string, string> = {}): Response {

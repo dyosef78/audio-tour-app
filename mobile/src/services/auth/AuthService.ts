@@ -24,7 +24,10 @@ import { supabase } from '../supabase/client';
  * (the token audience Supabase verifies) everywhere, plus
  * EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID on iOS, from which app.config.ts derives the
  * URL scheme. Until both exist isGoogleSignInConfigured() is false and the UI
- * must not show the button.
+ * must not show the button. EAS builds refuse to start without them (Epic 12,
+ * app.config.ts), so that fallback is for local development only.
+ *
+ * Sign-out lives in sessionTeardown.ts (Epic 12): bounded, UI purged first.
  */
 
 export type SignInOutcome =
@@ -108,16 +111,18 @@ export async function signInWithApple(): Promise<SignInOutcome> {
 // Google
 // -----------------------------------------------------------------------------
 
+const GOOGLE_CLIENT_ID_SUFFIX = '.apps.googleusercontent.com';
+
 export function isGoogleSignInConfigured(): boolean {
-  if (GOOGLE_WEB_CLIENT_ID === '') return false;
+  if (!GOOGLE_WEB_CLIENT_ID.endsWith(GOOGLE_CLIENT_ID_SUFFIX)) return false;
   // The same test app.config.ts applies before it registers the URL scheme; a
   // looser one here would show a button whose native flow crashes on iOS.
-  return Platform.OS !== 'ios' || GOOGLE_IOS_CLIENT_ID.endsWith('.apps.googleusercontent.com');
+  return Platform.OS !== 'ios' || GOOGLE_IOS_CLIENT_ID.endsWith(GOOGLE_CLIENT_ID_SUFFIX);
 }
 
 let googleConfigured = false;
 
-/** Idempotent. Every GoogleSignin call needs it in this process, including revokeAccess (TASK-1104). */
+/** Idempotent. Every GoogleSignin call needs it in this process, including getTokens and signOut. */
 export function configureGoogle(): void {
   if (googleConfigured) return;
   GoogleSignin.configure({
@@ -144,32 +149,5 @@ export async function signInWithGoogle(): Promise<SignInOutcome> {
   } catch (err) {
     if (isErrorWithCode(err) && err.code === statusCodes.SIGN_IN_CANCELLED) return { kind: 'cancelled' };
     return failed('google', err);
-  }
-}
-
-// -----------------------------------------------------------------------------
-// Sign-out
-// -----------------------------------------------------------------------------
-
-/**
- * Signs out THIS device and returns the app to guest.
- *
- * `local`, not the default `global`: signing out on a phone should not end the
- * user's other sessions. Works offline - supabase-js 2.112 removes the stored
- * session even when the revoke request fails - but the refresh token is then
- * only forgotten, not revoked, until it expires server-side.
- */
-export async function signOut(): Promise<void> {
-  const { error } = await supabase.auth.signOut({ scope: 'local' });
-  if (error) console.warn('[Auth] sign-out could not reach the server; signed out locally:', error.message);
-
-  if (isGoogleSignInConfigured()) {
-    try {
-      configureGoogle();
-      // So the next Google sign-in offers the account chooser again.
-      await GoogleSignin.signOut();
-    } catch {
-      // Cosmetic only.
-    }
   }
 }

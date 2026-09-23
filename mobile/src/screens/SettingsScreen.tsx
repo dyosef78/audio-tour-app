@@ -1,13 +1,13 @@
 import { useState } from 'react';
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
 import SignInButtons from '../components/auth/SignInButtons';
 import type { SettingsScreenProps } from '../navigation/types';
 import { useCityCatalogue } from '../personalization/cityCatalogue';
 import { GROUP_TYPES, INTERESTS, TIME_BUDGETS, labelFor } from '../personalization/options';
 import { usePreferences } from '../personalization/preferencesStore';
-import { signOut } from '../services/auth/AuthService';
 import { useAuth } from '../services/auth/authStore';
+import { signOut } from '../services/auth/sessionTeardown';
 import { colors, MIN_TOUCH } from '../ui/theme';
 
 const PROVIDER_LABEL: Record<string, string> = { apple: 'Apple', google: 'Google' };
@@ -38,10 +38,22 @@ export default function SettingsScreen({ navigation }: SettingsScreenProps) {
     .filter(Boolean)
     .join(' · ');
 
+  // The account section switches to the guest view synchronously, inside
+  // signOut(), before its first await (Epic 12) - so there is no "Signing out…"
+  // to watch; `signingOut` only guards a double tap. signOut() is bounded and
+  // never rejects.
   const doSignOut = async () => {
     setSigningOut(true);
-    await signOut();
+    const outcome = await signOut();
     setSigningOut(false);
+    if (outcome === 'incomplete') {
+      // Fail loud: the stored session could not be confirmed removed, so it may
+      // come back on the next launch. Say so instead of pretending.
+      Alert.alert(
+        'Sign-out may not be complete',
+        "You're signed out for now, but this phone couldn't confirm it removed your sign-in. If you're signed in again next time you open the app, sign out once more.\n\nReference: sign_out / incomplete",
+      );
+    }
   };
 
   return (

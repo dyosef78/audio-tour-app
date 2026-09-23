@@ -15,7 +15,7 @@
 | **Stack** | Supabase (PostgreSQL 15 + PostGIS, Auth, Storage, Edge Functions on Deno) · React Native 0.86 / Expo SDK 57 · TypeScript throughout |
 | **Routing** | Valhalla via Stadia Maps, behind the `route-stops` Edge Function |
 | **Audio** | AAC-LC `.m4a`, mono 48 kHz, 96 kbps (64 kbps for long tracks), EBU R128 −16 LUFS, **≤ 5 MiB per file** |
-| **Status** | Epics 1–10 closed. **Epic 11 (Mobile UI & Onboarding Wizard) is feature-complete and awaiting on-device QA** (§6.4). Its branch `feat/epic-11-onboarding` is **held and NOT merged to `main`** until the engineering team clears that pass, so the mobile code described in §4 is on that branch, not here. Already live in production regardless: the `cities` migration and the `delete-account` Edge Function |
+| **Status** | Epics 1–11 closed; Epic 11 merged to `main` on 23 Sep 2026. **Epic 12 (Google Sign-In parity) is in progress** on `feat/epic-12-google`: server-side Google grant revocation on deletion, a bounded sign-out, and EAS builds that refuse to start without the Google client IDs (§3.2). Live in production: the `cities` migration and the `delete-account` Edge Function (the Epic 12 version is **not deployed yet**) |
 
 ## Contents
 
@@ -162,9 +162,23 @@ CMS admins.
 - **Sign-in on the phone is optional (Epic 11, TASK-1102).** Guest is the
   default and loses nothing: every grant the app uses is `TO anon, authenticated`,
   and telemetry is keyed by device, not user. Apple (iOS) and Google hand an ID
-  token to `signInWithIdToken`, with no browser redirect. Google stays hidden until
-  `EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID` (and, on iOS, `EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID`)
-  are set.
+  token to `signInWithIdToken`, with no browser redirect. Google needs
+  `EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID` and `EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID`.
+  **An EAS build without both fails** (Epic 12, `app.config.ts`, checked when
+  `EAS_BUILD=true`); `expo start`, prebuild and CI only warn and hide the button.
+  The build cannot check what lives outside it: the Android OAuth client's
+  SHA-1s (EAS keystore **and** Play App Signing key) and the client IDs in
+  Supabase's Google "Authorized Client IDs". Until Epic 12 no EAS profile set
+  these variables, so no shipped build ever showed the Google button.
+- **Sign-out (Epic 12) uses the same teardown as deletion** (`localTeardown.ts`):
+  the UI is purged synchronously before the first await, then supabase-js
+  `signOut` and the stored-session drop run, each capped at 3 s, and the Google
+  SDK's local sign-out runs without being awaited. The old sign-out awaited
+  supabase-js with no bound, the same auth-lock hang that froze deletion.
+  Sign-out **tombstones the session** (the JWT `session_id` claim), not the user,
+  so a late `TOKEN_REFRESHED` cannot bring it back but the same person can sign
+  straight back in. Deletion tombstones the user id. An `incomplete` teardown
+  is shown to the user: the session may come back on the next launch.
 - **The session is encrypted at rest** (`secureSessionStorage.ts`). An AES-256-GCM
   key in the Keychain/Keystore, `AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY` so a
   locked-phone tour can still read it; the ciphertext is in AsyncStorage. A
@@ -182,7 +196,16 @@ CMS admins.
   revoke their Apple tokens **after** the delete, in the background
   (`EdgeRuntime.waitUntil`), so Apple can never hold an account hostage.
   Revocation is recommended by Apple, not required, and a failed one is logged
-  (`apple_revocation_finished`) but not yet retried (§7.1). Every response and
+  (`apple_revocation_finished`) but not yet retried (§7.1). **Google (Epic 12)
+  follows the same pattern.** Just before the request the app gets a Google
+  access token (silent restore + `getTokens()`, **capped at 2 s as a whole**).
+  The server checks it with `tokeninfo` (its `sub` must be one of the account's
+  Google identities, and its audience one of `GOOGLE_CLIENT_IDS`), then revokes
+  it in the background, which ends the whole grant. With no token (timeout,
+  no Google session on the device, SDK error) the account is still deleted: the
+  app sends `google_token_unavailable: <reason>` and the server logs
+  `google_revocation_skipped` with it. Without the `GOOGLE_CLIENT_IDS` secret
+  every Google revocation is skipped as `revocation_not_configured`. Every response and
   log line carries `X-Request-Id`. Telemetry is not deleted because it is not
   linked to accounts: events carry a random device id and no user id.
   Downloads and preferences stay on the phone.
@@ -671,7 +694,7 @@ needs a PM decision or a task; none should be assumed.
 | **Skip to next stop** for a missed zone | Only the debug manual trigger; a missed zone blocks the remaining stops | Post-MVP backlog |
 | **Proximity-based start** (`preferences.start`) | Not sent; scored routes start at the first authored stop | Post-MVP backlog |
 | **Retry of failed Apple revocations** ("zombie grant") | A revocation that fails after the delete is logged, not retried: the user is gone from Supabase but Apple may still list the app as connected | Post-MVP backlog (PM, 22 Sep 2026). Accepted MVP risk; design in §7.1. |
-| **In-app account deletion** (App Store guideline 5.1.1(v)) | Built (TASK-1104); the `delete-account` Edge Function is **live in production** since 18 Sep 2026, hardened version since 22 Sep | The four `APPLE_*` secrets are set (22 Sep 2026; `APPLE_CLIENT_ID` verified to be exactly the bundle id). Outstanding before submission: one live deletion of a real Apple and a real Google account during device QA, confirming `apple_revocation_finished` → `revoked` in the logs. |
+| **In-app account deletion** (App Store guideline 5.1.1(v)) | Built (TASK-1104); the `delete-account` Edge Function is **live in production** since 18 Sep 2026, hardened version since 22 Sep. Google revocation (Epic 12) is on `feat/epic-12-google`, not deployed | The four `APPLE_*` secrets are set (22 Sep 2026; `APPLE_CLIENT_ID` verified to be exactly the bundle id). `GOOGLE_CLIENT_IDS` is not set yet. Outstanding before submission: one live deletion of a real Apple and a real Google account during device QA, confirming `apple_revocation_finished` → `revoked` and `google_revocation_finished` → `revoked` in the logs. |
 | **Future trip planning** (travel dates, time-simulated routing) | Routing scores the device's current `context.local_time`; onboarding asks for no dates | Post-MVP backlog (PM, Epic 11 kickoff). The server already takes any `local_time`, so the backend gap is small; the work is the dates UI and offline bundles for a trip that is weeks away. |
 | **Precise kids' ages** scoring | One `family_kids` audience tag; no ages collected | Post-MVP backlog (PM, Epic 11 kickoff) |
 | **User-selectable bicycle / car modes** | Walking only in onboarding. `transit_mode` belongs to the tour, and `route-stops` refuses a mismatch (400 `transit_mode_mismatch`) | Post-MVP backlog (PM, Epic 11 kickoff). The engine already has biking/driving profiles, but geofence radii are authored for each tour's own mode, so this is a content change as well as a code change. |
@@ -723,7 +746,7 @@ good practice rather than an App Store rejection risk on its own.
 | Area | Path |
 |---|---|
 | Migrations & seeds | `supabase/migrations/`, `supabase/seed.sql`, `prod_test_seed.sql` |
-| Edge Functions | `supabase/functions/route-stops/` (`handler.ts` contract, `legCache.ts`, `routeCache.ts`, `rateLimit.ts`); `supabase/functions/delete-account/` (`handler.ts` contract, `appleRevoke.ts`) |
+| Edge Functions | `supabase/functions/route-stops/` (`handler.ts` contract, `legCache.ts`, `routeCache.ts`, `rateLimit.ts`); `supabase/functions/delete-account/` (`handler.ts` contract, `appleRevoke.ts`, `googleRevoke.ts`) |
 | Shared (Deno + Node + Metro) | `shared/src/` (`smartSorter.ts`, `polyline.ts`, `routeTolerance.ts`, `routing/valhalla.ts`) |
 | CMS ingest | `backend/cms/` |
 | Media pipeline | `backend/media/` (`presets.ts` is the audio standard, per-file limit and bitrate planning) |
@@ -737,6 +760,6 @@ good practice rather than an App Store rejection risk on its own.
 | Telemetry | `mobile/src/services/telemetry/` |
 | Personalisation | `mobile/src/personalization/` (`preferencesStore.ts` is persisted, v2; `onboardingFlow.ts`, `cityCatalogue.ts`) |
 | Onboarding screens | `mobile/src/screens/onboarding/`, `mobile/src/components/onboarding/` |
-| Auth (optional sign-in) | `mobile/src/services/auth/` (`secureSessionStorage.ts`, `authStore.ts`, `AuthService.ts`, `accountDeletion.ts`, `AccountService.ts`) |
+| Auth (optional sign-in) | `mobile/src/services/auth/` (`secureSessionStorage.ts`, `authStore.ts`, `AuthService.ts`, `accountDeletion.ts`, `AccountService.ts`, `localTeardown.ts`, `sessionTeardown.ts`) |
 | Settings & account | `mobile/src/screens/SettingsScreen.tsx`, `DeleteAccountScreen.tsx`, `mobile/src/components/auth/SignInButtons.tsx` |
 | Tests & harnesses | `mobile/scripts/` (`test-ui-logic.ts`, `test-auth.ts`, `simulate-walk.ts`), `backend/scripts/` |

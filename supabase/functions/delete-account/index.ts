@@ -11,6 +11,10 @@
  *   APPLE_TEAM_ID, APPLE_KEY_ID, APPLE_CLIENT_ID, APPLE_PRIVATE_KEY
  *                                     optional, all four or none; enables Sign in
  *                                     with Apple token revocation (appleRevoke.ts)
+ *   GOOGLE_CLIENT_IDS                 optional, comma-separated: our web, iOS and
+ *                                     Android OAuth client ids (the same list as
+ *                                     Supabase's Google "Authorized Client IDs");
+ *                                     enables Google grant revocation (googleRevoke.ts)
  *
  * The SERVICE ROLE is used for exactly two things, both only after the caller's
  * own token has been verified: the app_admins check and auth.admin.deleteUser
@@ -20,6 +24,7 @@
 import { createClient } from '@supabase/supabase-js';
 
 import { appleRevokeConfigFromEnv, createAppleRevoker } from './appleRevoke.ts';
+import { createGoogleRevoker, googleRevokeConfigFromEnv } from './googleRevoke.ts';
 import { DEFAULT_DEADLINES, handleDeleteAccount, type DeleteAccountDeps } from './handler.ts';
 
 const env = Deno.env.toObject();
@@ -41,12 +46,13 @@ const authenticate: DeleteAccountDeps['authenticate'] = async (request) => {
   const { data, error } = await client.auth.getUser(token);
   if (error || !data.user) return null;
 
-  const appleSubjects = (data.user.identities ?? [])
-    .filter((identity) => identity.provider === 'apple')
-    .map((identity) => (identity.identity_data?.sub as string | undefined) ?? identity.id)
-    .filter((sub): sub is string => typeof sub === 'string' && sub !== '');
+  const subjectsFor = (provider: string): string[] =>
+    (data.user.identities ?? [])
+      .filter((identity) => identity.provider === provider)
+      .map((identity) => (identity.identity_data?.sub as string | undefined) ?? identity.id)
+      .filter((sub): sub is string => typeof sub === 'string' && sub !== '');
 
-  return { id: data.user.id, appleSubjects };
+  return { id: data.user.id, appleSubjects: subjectsFor('apple'), googleSubjects: subjectsFor('google') };
 };
 
 const isCmsAdmin: DeleteAccountDeps['isCmsAdmin'] = admin
@@ -76,15 +82,18 @@ const deleteUser: DeleteAccountDeps['deleteUser'] = admin
 const appleConfig = appleRevokeConfigFromEnv(env);
 const appleRevoker = appleConfig ? createAppleRevoker(appleConfig) : null;
 if (!appleRevoker) console.log(JSON.stringify({ event: 'apple_revoke_disabled', reason: 'APPLE_* secrets not set' }));
+const googleConfig = googleRevokeConfigFromEnv(env);
+const googleRevoker = googleConfig ? createGoogleRevoker(googleConfig) : null;
+if (!googleRevoker) console.log(JSON.stringify({ event: 'google_revoke_disabled', reason: 'GOOGLE_CLIENT_IDS not set' }));
 if (!admin) console.log(JSON.stringify({ event: 'delete_account_disabled', reason: 'SUPABASE_SERVICE_ROLE_KEY missing' }));
 
 // Supabase's Edge Runtime keeps a promise alive after the response with
-// EdgeRuntime.waitUntil, so Apple revocation never delays the answer. Read off
+// EdgeRuntime.waitUntil, so revocation never delays the answer. Read off
 // globalThis: under `deno test` or a plain Deno the global does not exist.
 const edgeRuntime = (globalThis as { EdgeRuntime?: { waitUntil?: (task: Promise<unknown>) => void } }).EdgeRuntime;
 const runInBackground =
   typeof edgeRuntime?.waitUntil === 'function' ? (task: Promise<unknown>) => edgeRuntime.waitUntil!(task) : null;
 
 Deno.serve((request) =>
-  handleDeleteAccount(request, { authenticate, isCmsAdmin, deleteUser, appleRevoker, runInBackground }),
+  handleDeleteAccount(request, { authenticate, isCmsAdmin, deleteUser, appleRevoker, googleRevoker, runInBackground }),
 );

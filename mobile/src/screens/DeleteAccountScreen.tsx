@@ -145,11 +145,14 @@ export default function DeleteAccountScreen({ navigation }: DeleteAccountScreenP
       navigation.reset({ index: 0, routes: [{ name: 'Discovery' }] });
     }
 
-    // Confirm on the guest Discovery screen. For Apple accounts, and whenever
-    // the local teardown was not clean, show the evidence QA needs.
+    // Confirm on the guest Discovery screen. For Apple and Google accounts, and
+    // whenever the local teardown was not clean, show the evidence QA needs.
     const lines = [
       appleIdentity
         ? `Apple code sent: ${outcome.appleCodeSent ? 'yes' : 'no'} / revocation: ${outcome.appleRevocation ?? 'unknown'}`
+        : null,
+      googleIdentity
+        ? `Google token: ${outcome.googleToken ?? 'not requested'} / revocation: ${outcome.googleRevocation ?? 'unknown'}`
         : null,
       outcome.localTeardown !== 'clean' ? `Local sign-out: ${outcome.localTeardown}` : null,
     ].filter((line): line is string => line !== null);
