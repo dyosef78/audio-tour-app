@@ -109,7 +109,7 @@ async function main(): Promise<void> {
 
   const { data: tours, error: toursError } = await supabase
     .from('tours')
-    .select('id, title, status, duration_minutes, start_point');
+    .select('id, title, status, duration_minutes, start_point, city_id');
 
   check('tours query succeeds', !toursError, toursError?.message);
   if (toursError) return;
@@ -134,6 +134,30 @@ async function main(): Promise<void> {
     'every visible tour has a start_point',
     tours.every((t) => t.start_point !== null),
     'the TASK-301 backfill or refresh trigger did not run',
+  );
+
+  // --- 1b. Every tour sits under a city the app can list (TASK-1101) --------
+  // A published tour with no city is listed under every city; one whose city
+  // anon cannot read would put Discovery on a city picker with nothing in it.
+  check(
+    'every visible tour has a city',
+    tours.every((t) => t.city_id !== null),
+    'seed publishes a tour without city_id - cms_validate_tour would refuse it',
+  );
+
+  const { data: cities, error: citiesError } = await supabase.from('cities').select('id, slug, name');
+  check('cities query succeeds', !citiesError, citiesError?.message);
+  const visibleCityIds = new Set((cities ?? []).map((c) => c.id));
+  check(
+    "every visible tour's city is visible to anon",
+    tours.every((t) => t.city_id === null || visibleCityIds.has(t.city_id)),
+    'cities_read_with_published_tour is hiding a city that has a published tour',
+  );
+  const tourCityIds = new Set(tours.map((t) => t.city_id));
+  check(
+    'no city is visible without a published tour',
+    (cities ?? []).every((c) => tourCityIds.has(c.id)),
+    `anon can see empty cities: ${(cities ?? []).filter((c) => !tourCityIds.has(c.id)).map((c) => c.slug).join(', ')}`,
   );
 
   let deepDives = 0;

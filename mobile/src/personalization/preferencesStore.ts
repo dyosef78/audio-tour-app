@@ -23,6 +23,14 @@ export interface PreferencesState {
   timeBudget: TimeBudget | null;
   /** Gates the initial route. Set only by finishing the last step. */
   onboardingComplete: boolean;
+  /**
+   * The sign-in / "Continue without account" screen has been answered (TASK-1102).
+   * Separate from the session: a guest has seen it and has no session, and
+   * signing out later must not send anyone back through onboarding.
+   */
+  welcomeSeen: boolean;
+  /** `cities.id` of the city Discovery lists (TASK-1101). Null until chosen or auto-selected. */
+  cityId: string | null;
 }
 
 export interface PreferencesActions {
@@ -30,6 +38,8 @@ export interface PreferencesActions {
   toggleInterest: (interest: Interest) => void;
   setTimeBudget: (timeBudget: TimeBudget) => void;
   completeOnboarding: () => void;
+  markWelcomeSeen: () => void;
+  setCity: (cityId: string) => void;
   resetPreferences: () => void;
 }
 
@@ -38,7 +48,29 @@ const initial: PreferencesState = {
   interests: [],
   timeBudget: null,
   onboardingComplete: false,
+  welcomeSeen: false,
+  cityId: null,
 };
+
+/** The persisted shape's version. Bump with a step in migratePreferences. */
+export const PREFERENCES_VERSION = 2;
+
+/**
+ * Brings a stored state from any earlier version up to PREFERENCES_VERSION.
+ *
+ * Exported so test:ui can run it on a literal v1 blob. v1 -> v2 (TASK-1102):
+ * someone who finished onboarding before the Welcome screen existed is treated
+ * as having chosen guest - sending a returning user through sign-in on update
+ * would be exactly the wall the PM ruled out. cityId starts null for everyone.
+ */
+export function migratePreferences(persisted: unknown, version: number): PreferencesState {
+  const old = (typeof persisted === 'object' && persisted !== null ? persisted : {}) as Partial<PreferencesState>;
+  let state: PreferencesState = { ...initial, ...old };
+  if (version < 2) {
+    state = { ...state, welcomeSeen: old.onboardingComplete === true, cityId: null };
+  }
+  return state;
+}
 
 /**
  * Whether the persisted preferences have been read back yet.
@@ -72,18 +104,26 @@ export const usePreferences = create<PreferencesState & PreferencesActions>()(
 
       completeOnboarding: () => set({ onboardingComplete: true }),
 
+      markWelcomeSeen: () => set({ welcomeSeen: true }),
+
+      setCity: (cityId) => set({ cityId }),
+
       resetPreferences: () => set({ ...initial }),
     }),
     {
       name: 'user-preferences',
-      // Bump with a `migrate` when an id in options.ts is retired.
-      version: 1,
+      // Bump, with a step in migratePreferences, when an id in options.ts is
+      // retired or the shape changes.
+      version: PREFERENCES_VERSION,
+      migrate: migratePreferences,
       storage: createJSONStorage(() => AsyncStorage),
       partialize: (s): PreferencesState => ({
         groupType: s.groupType,
         interests: s.interests,
         timeBudget: s.timeBudget,
         onboardingComplete: s.onboardingComplete,
+        welcomeSeen: s.welcomeSeen,
+        cityId: s.cityId,
       }),
       onRehydrateStorage: () => (_state, error) => {
         // A failed restore degrades to first-run onboarding. Showing it again is

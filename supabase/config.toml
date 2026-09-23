@@ -457,6 +457,14 @@ enabled = true
 verify_jwt = true
 import_map = "./functions/import_map.json"
 
+# TASK-1104. verify_jwt only proves the token is signed - the anon key passes
+# it - so handler.ts still resolves the caller with auth.getUser() and refuses
+# anything that is not a real user session.
+[functions.delete-account]
+enabled = true
+verify_jwt = true
+import_map = "./functions/import_map.json"
+
 [analytics]
 enabled = true
 port = 54327

@@ -32,7 +32,9 @@ export const GROUP_TYPES: readonly ChoiceOption<GroupType>[] = [
 
 export const INTERESTS: readonly ChoiceOption<Interest>[] = [
   { id: 'history', label: 'History', description: 'Stories behind the streets', icon: '🏛️' },
-  { id: 'culinary', label: 'Culinary', description: 'Cafés, markets, local food', icon: '🍽️' },
+  // One tag, PM decision (Epic 11): street food, markets and fine dining are how
+  // the screen SELLS culinary, not separate ids - more tags would filter stops harder.
+  { id: 'culinary', label: 'Culinary', description: 'Street food, markets, fine dining', icon: '🍽️' },
   { id: 'nature', label: 'Nature', description: 'Parks, gardens, the sea', icon: '🌳' },
   { id: 'architecture', label: 'Architecture', description: 'Buildings and design', icon: '🏙️' },
   { id: 'art_culture', label: 'Art & Culture', description: 'Museums, theatre, music', icon: '🎭' },
@@ -43,10 +45,15 @@ export interface TimeBudgetOption extends ChoiceOption<TimeBudget> {
   maxMinutes: number;
 }
 
+/**
+ * PM-confirmed at Epic 11 kickoff: 120 / 240 / 480 minutes. These pick which
+ * TOURS Discovery puts first; they never cut stops out of a route. `quick` was
+ * 60 minutes before TASK-1101 - the id is kept, since it is stored on devices.
+ */
 export const TIME_BUDGETS: readonly TimeBudgetOption[] = [
-  { id: 'quick', label: 'Quick walk', description: 'About an hour', icon: '⏱️', maxMinutes: 60 },
-  { id: 'half_day', label: 'Half-day exploration', description: 'Up to four hours', icon: '🌤️', maxMinutes: 240 },
-  { id: 'full_day', label: 'Full day', description: 'Take it all in', icon: '🗺️', maxMinutes: 480 },
+  { id: 'quick', label: '2 hours', description: 'A focused walk', icon: '⏱️', maxMinutes: 120 },
+  { id: 'half_day', label: 'Half day', description: 'Up to four hours', icon: '🌤️', maxMinutes: 240 },
+  { id: 'full_day', label: 'Full day', description: 'Up to eight hours', icon: '🗺️', maxMinutes: 480 },
 ];
 
 const GROUP_TYPE_IDS: ReadonlySet<string> = new Set(GROUP_TYPES.map((o) => o.id));

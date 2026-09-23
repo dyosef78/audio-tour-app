@@ -24,7 +24,14 @@ DELETE FROM public.tours WHERE id = 'eeeeeeee-0000-4000-8000-000000000001';
 -- audiences/interests need migrations 20260915120000+ (TASK-603). Run against a
 -- database without them and this INSERT fails on the unknown column - loudly,
 -- which is the right way round.
-INSERT INTO public.tours (id, title, topology, transit_mode, duration_minutes, status, audiences, interests) VALUES
+-- city_id needs migration 20260918090000 (TASK-1101). Production has no
+-- Jerusalem city, so this adds one; it is public only while this test tour is
+-- published, and the cleanup at the bottom removes it again.
+INSERT INTO public.cities (slug, name, country_code, center) VALUES
+    ('jerusalem', 'Jerusalem', 'IL', ST_SetSRID(ST_MakePoint(35.2137, 31.7683), 4326)::geography)
+ON CONFLICT (slug) DO NOTHING;
+
+INSERT INTO public.tours (id, title, topology, transit_mode, duration_minutes, status, audiences, interests, city_id) VALUES
     ('eeeeeeee-0000-4000-8000-000000000001',
      '[TEST] Jerusalem Gate Walk - delete after TASK-202',
      'in_city',
@@ -32,7 +39,8 @@ INSERT INTO public.tours (id, title, topology, transit_mode, duration_minutes, s
      15,
      'published',
      ARRAY['solo'],
-     ARRAY['history']);
+     ARRAY['history'],
+     (SELECT id FROM public.cities WHERE slug = 'jerusalem'));
 
 -- --- Waypoints ----------------------------------------------------------------
 -- Jaffa Gate and the Tower of David: 58.7 m apart, which matters.
@@ -170,6 +178,8 @@ INSERT INTO public.audio_tracks
 -- =============================================================================
 -- CLEANUP - run when TASK-202 sign-off is done
 --   DELETE FROM public.tours WHERE id = 'eeeeeeee-0000-4000-8000-000000000001';
+--   DELETE FROM public.cities c WHERE c.slug = 'jerusalem'
+--      AND NOT EXISTS (SELECT 1 FROM public.tours t WHERE t.city_id = c.id);
 -- Storage objects are not cascaded by that delete; remove the folder in the
 -- Storage UI as well.
 -- =============================================================================

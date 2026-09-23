@@ -44,11 +44,21 @@ SET search_path = public, extensions;
 -- Idempotency guard: removes the previous run of this seed and nothing else.
 DELETE FROM public.tours WHERE id = 'aaaaaaaa-0000-4000-8000-000000000001';
 
+-- --- City (TASK-1101) -----------------------------------------------------------
+-- The migration adds only Tel Aviv, which has no tour here and so stays hidden
+-- from anon. Jerusalem is the one city this seed's catalogue shows. A published
+-- tour without city_id would be listed under every city, and cms_validate_tour
+-- refuses to publish one - so the seed must not create one either.
+INSERT INTO public.cities (id, slug, name, country_code, center) VALUES
+    ('cccccccc-0000-4000-8000-000000000001', 'jerusalem', 'Jerusalem', 'IL',
+     ST_SetSRID(ST_MakePoint(35.2137, 31.7683), 4326)::geography)
+ON CONFLICT (slug) DO NOTHING;
+
 -- --- Tour ---------------------------------------------------------------------
 -- audiences/interests (TASK-603) must come from audience_tag_vocabulary() and
 -- interest_tag_vocabulary(). A typo fails `db reset` on the CHECK constraint,
 -- which is exactly the drift this file has caught before.
-INSERT INTO public.tours (id, title, topology, transit_mode, duration_minutes, status, audiences, interests) VALUES
+INSERT INTO public.tours (id, title, topology, transit_mode, duration_minutes, status, audiences, interests, city_id) VALUES
     ('aaaaaaaa-0000-4000-8000-000000000001',
      'Jerusalem Old City - Historic Morning Walk',
      'in_city',
@@ -56,7 +66,8 @@ INSERT INTO public.tours (id, title, topology, transit_mode, duration_minutes, s
      90,
      'published',
      ARRAY['couple', 'friends', 'solo'],
-     ARRAY['architecture', 'history']);
+     ARRAY['architecture', 'history'],
+     (SELECT id FROM public.cities WHERE slug = 'jerusalem'));
 
 -- --- Waypoints ----------------------------------------------------------------
 -- Mixed anchors and one transition. sort_order drives the Screen 3 timeline.

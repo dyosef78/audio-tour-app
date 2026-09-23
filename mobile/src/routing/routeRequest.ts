@@ -1,6 +1,7 @@
 import { smartSort, type SortablePoi } from '../../../shared/src/smartSorter';
 import type { Waypoint } from '../types/domain';
-import type { DynamicRouteRequest } from './routeDecision';
+import type { RouteCriteria } from '../personalization/options';
+import type { DynamicRouteRequest, RoutePreferences } from './routeDecision';
 
 /**
  * The route-stops wire format, both directions (TASK-901 / TASK-902).
@@ -43,6 +44,17 @@ export function formatLocalTime(epochMs: number, offsetMinutesEast: number): str
  */
 export function deviceLocalTime(now: Date = new Date()): string {
   return formatLocalTime(now.getTime(), -now.getTimezoneOffset());
+}
+
+/**
+ * The onboarding answers route-stops scores with, from the criteria a session
+ * snapshots at start (TASK-1103). Group type and interests only: the time
+ * budget chose the TOUR in Discovery and the city is implied by tour_id, so
+ * neither has a field in the request. Null - and so no `preferences` key -
+ * until onboarding has produced complete criteria.
+ */
+export function routePreferencesOf(criteria: RouteCriteria | null): RoutePreferences | null {
+  return criteria ? { groupType: criteria.groupType, interests: criteria.interests } : null;
 }
 
 /** The JSON body POSTed to route-stops. */

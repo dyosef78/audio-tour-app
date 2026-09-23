@@ -110,6 +110,33 @@ export type Database = {
           },
         ]
       }
+      cities: {
+        Row: {
+          center: unknown
+          country_code: string
+          created_at: string
+          id: string
+          name: string
+          slug: string
+        }
+        Insert: {
+          center: unknown
+          country_code: string
+          created_at?: string
+          id?: string
+          name: string
+          slug: string
+        }
+        Update: {
+          center?: unknown
+          country_code?: string
+          created_at?: string
+          id?: string
+          name?: string
+          slug?: string
+        }
+        Relationships: []
+      }
       geofence_zones: {
         Row: {
           created_at: string
@@ -290,6 +317,7 @@ export type Database = {
       tours: {
         Row: {
           audiences: string[]
+          city_id: string | null
           created_at: string
           duration_minutes: number
           id: string
@@ -304,6 +332,7 @@ export type Database = {
         }
         Insert: {
           audiences?: string[]
+          city_id?: string | null
           created_at?: string
           duration_minutes: number
           id?: string
@@ -318,6 +347,7 @@ export type Database = {
         }
         Update: {
           audiences?: string[]
+          city_id?: string | null
           created_at?: string
           duration_minutes?: number
           id?: string
@@ -330,7 +360,15 @@ export type Database = {
           transit_mode?: string
           updated_at?: string
         }
-        Relationships: []
+        Relationships: [
+          {
+            foreignKeyName: "tours_city_id_fkey"
+            columns: ["city_id"]
+            isOneToOne: false
+            referencedRelation: "cities"
+            referencedColumns: ["id"]
+          },
+        ]
       }
       user_itineraries: {
         Row: {
@@ -567,6 +605,7 @@ export type Database = {
         Args: { p_tour_id: string }
         Returns: {
           audiences: string[]
+          city_id: string | null
           created_at: string
           duration_minutes: number
           id: string
@@ -601,6 +640,30 @@ export type Database = {
         Args: { p_tour_id: string; p_waypoints: Json }
         Returns: Json
       }
+      cms_set_tour_city: {
+        Args: { p_city_id: string; p_tour_id: string }
+        Returns: {
+          audiences: string[]
+          city_id: string | null
+          created_at: string
+          duration_minutes: number
+          id: string
+          interests: string[]
+          route: unknown
+          start_point: unknown
+          status: string
+          title: string
+          topology: string
+          transit_mode: string
+          updated_at: string
+        }
+        SetofOptions: {
+          from: "*"
+          to: "tours"
+          isOneToOne: true
+          isSetofReturn: false
+        }
+      }
       cms_set_tour_route: {
         Args: { p_polyline: string; p_precision: number; p_tour_id: string }
         Returns: Json
@@ -609,6 +672,7 @@ export type Database = {
         Args: { p_status: string; p_tour_id: string }
         Returns: {
           audiences: string[]
+          city_id: string | null
           created_at: string
           duration_minutes: number
           id: string
@@ -640,6 +704,7 @@ export type Database = {
         }
         Returns: {
           audiences: string[]
+          city_id: string | null
           created_at: string
           duration_minutes: number
           id: string

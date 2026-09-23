@@ -1,6 +1,7 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { createClient } from '@supabase/supabase-js';
 import 'react-native-url-polyfill/auto';
+
+import { secureSessionStorage } from '../auth/secureSessionStorage';
 
 /**
  * Supabase client for the mobile app.
@@ -22,12 +23,23 @@ const supabaseAnonKey = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY ?? '';
  */
 export const isSupabaseConfigured = Boolean(supabaseUrl && supabaseAnonKey);
 
+/**
+ * For the rare call that must NOT go through supabase-js's fetch wrapper, which
+ * waits on the auth lock before sending anything (see AccountService). Both
+ * values are public - they are inlined into the bundle regardless.
+ */
+export const supabaseEndpoint = { url: supabaseUrl, anonKey: supabaseAnonKey } as const;
+
 export const supabase = createClient(
   supabaseUrl || 'https://placeholder.supabase.co',
   supabaseAnonKey || 'placeholder-anon-key',
   {
     auth: {
-      storage: AsyncStorage,
+      // Encrypted, keyed from the Keychain / Keystore (TASK-1102). A guest has
+      // no session, so for most users this is never written at all.
+      storage: secureSessionStorage,
+      // On a phone this ticker would otherwise run for as long as the process
+      // does, background included; authStore pauses it with AppState.
       autoRefreshToken: true,
       persistSession: true,
       // No URL-based session detection in a native app.

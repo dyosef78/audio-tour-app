@@ -17,7 +17,7 @@ export default function ChoiceCard({ option, selected, multi, onPress }: Props) 
       onPress={onPress}
       accessibilityRole={multi ? 'checkbox' : 'radio'}
       accessibilityState={{ checked: selected }}
-      accessibilityLabel={`${option.label}. ${option.description}`}
+      accessibilityLabel={option.description ? `${option.label}. ${option.description}` : option.label}
       style={({ pressed }) => [styles.card, selected && styles.cardSelected, pressed && styles.cardPressed]}
     >
       <View style={[styles.icon, selected && styles.iconSelected]}>
@@ -26,7 +26,7 @@ export default function ChoiceCard({ option, selected, multi, onPress }: Props) 
 
       <View style={styles.text}>
         <Text style={styles.label}>{option.label}</Text>
-        <Text style={styles.description}>{option.description}</Text>
+        {option.description !== '' && <Text style={styles.description}>{option.description}</Text>}
       </View>
 
       <View style={[multi ? styles.check : styles.radio, selected && styles.indicatorOn]}>
@@ -53,7 +53,7 @@ const styles = StyleSheet.create({
   glyph: { fontSize: 24 },
   text: { flex: 1 },
   label: { fontSize: 17, fontWeight: '600', color: colors.ink },
-  description: { fontSize: 14, color: colors.inkMuted, marginTop: 2 },
+  description: { fontSize: 14, color: colors.inkSecondary, marginTop: 2 },
   radio: {
     width: 24, height: 24, borderRadius: 12, borderWidth: 2, borderColor: colors.hairline,
     alignItems: 'center', justifyContent: 'center',

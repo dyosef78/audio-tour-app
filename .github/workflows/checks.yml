@@ -41,7 +41,7 @@ jobs:
       - name: Install dependencies (root)
         run: npm ci
 
-      # test:ui and test:telemetry import app modules, which resolve zustand,
+      # test:ui, test:auth and test:telemetry import app modules, which resolve zustand,
       # supabase-js and friends from mobile/node_modules.
       - name: Install dependencies (mobile)
         run: npm ci
@@ -62,6 +62,9 @@ jobs:
 
       - name: App logic tests
         run: npm run test:ui
+
+      - name: Auth storage tests
+        run: npm run test:auth
 
       - name: Telemetry tests
         run: npm run test:telemetry

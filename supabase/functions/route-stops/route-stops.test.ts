@@ -27,6 +27,8 @@ import {
   type SortablePoi,
 } from '@shared/smartSorter.ts';
 
+import onboardingContract from '@shared/contracts/route-stops.onboarding.json' with { type: 'json' };
+
 import { handleRouteStops, type RouteStopsDeps } from './handler.ts';
 import { LEG_TTL_MS, legCoordsKey, type CachedLeg, type LegStore, type NewLeg } from './legCache.ts';
 import { RouteMemoryCache, routeCacheKey } from './routeCache.ts';
@@ -751,4 +753,48 @@ Deno.test('route-stops: a context opts in to scoring; a bad one is a 400', async
   assertEquals(body.waypoint_ids[0], W1);
   assertEquals([...body.waypoint_ids].sort(), [W1, W2, W3]);
   assertEquals(h.calls[0]?.locations, (body.waypoint_ids as string[]).map((id) => STOP_COORDS[id]));
+});
+
+// -----------------------------------------------------------------------------
+// Onboarding contract (TASK-1103)
+//
+// The SAME fixture test:ui builds from a real wizard session. If the app's
+// request shape and this handler ever drift apart, one of the two suites fails.
+
+Deno.test('contract: the onboarding request is accepted, and its preferences decide the order', async () => {
+  const contractBundle = {
+    bundle_version_hash: 'contract',
+    tour_metadata: { tour_id: onboardingContract.request.tour_id, transit_mode: 'walking' },
+    waypoints: onboardingContract.stops.map((s) => ({
+      waypoint_id: s.waypoint_id,
+      sort_order: s.sort_order,
+      poi_type: s.poi_type,
+      coordinates: [s.lon, s.lat],
+      audiences: s.audiences,
+      interests: s.interests,
+    })),
+    route: null,
+  };
+  const loadTour = async (id: string) => (id === onboardingContract.request.tour_id ? contractBundle : null);
+
+  const res = await handleRouteStops(post(onboardingContract.request), harness({ loadTour }).deps);
+  assertEquals(res.status, 200);
+  const body = await res.json();
+  assertEquals(body.sort_strategy, 'scored');
+  assertEquals(body.waypoint_ids, onboardingContract.expected_order);
+
+  // Anything less than the full preferences leaves the authored order - so the
+  // order above needs group_type AND every interest to have been read.
+  const { preferences, ...withoutPreferences } = onboardingContract.request;
+  const partial: [string, unknown][] = [
+    ['no preferences', withoutPreferences],
+    ['group type only', { ...withoutPreferences, preferences: { group_type: preferences.group_type } }],
+    ['interests only', { ...withoutPreferences, preferences: { interests: preferences.interests } }],
+    ['first interest only', { ...withoutPreferences, preferences: { ...preferences, interests: preferences.interests.slice(0, 1) } }],
+  ];
+  for (const [label, request] of partial) {
+    const res2 = await handleRouteStops(post(request), harness({ loadTour }).deps);
+    assertEquals(res2.status, 200, label);
+    assertEquals((await res2.json()).waypoint_ids, onboardingContract.expected_order_without_preferences, label);
+  }
 });
