@@ -15,7 +15,7 @@
 | **Stack** | Supabase (PostgreSQL 15 + PostGIS, Auth, Storage, Edge Functions on Deno) · React Native 0.86 / Expo SDK 57 · TypeScript throughout |
 | **Routing** | Valhalla via Stadia Maps, behind the `route-stops` Edge Function |
 | **Audio** | AAC-LC `.m4a`, mono 48 kHz, 96 kbps (64 kbps for long tracks), EBU R128 −16 LUFS, **≤ 5 MiB per file** |
-| **Status** | Epics 1–11 closed; Epic 11 merged to `main` on 23 Sep 2026. **Epic 12 (Google Sign-In parity) is in progress** on `feat/epic-12-google`: server-side Google grant revocation on deletion, a bounded sign-out, and EAS builds that refuse to start without the Google client IDs (§3.2). Live in production: the `cities` migration and the `delete-account` Edge Function (the Epic 12 version is **not deployed yet**) |
+| **Status** | Epics 1–12 closed and merged to `main`. Epic 12 (Google Sign-In parity) was validated on a physical iPhone through a TestFlight production build on 24 Sep 2026 (§6.5). Live in production: the `cities` migration and the `delete-account` Edge Function, version 7 (Epic 12, deployed 24 Sep) |
 
 ## Contents
 
@@ -170,15 +170,46 @@ CMS admins.
   SHA-1s (EAS keystore **and** Play App Signing key) and the client IDs in
   Supabase's Google "Authorized Client IDs". Until Epic 12 no EAS profile set
   these variables, so no shipped build ever showed the Google button.
+- **Google nonce: the SDK cannot send one.** Supabase checks an ID token's
+  `nonce` claim against a hash of the raw nonce the app passes to
+  `signInWithIdToken`, and production keeps that check on
+  (`skip_nonce_check = false`). The free "Original" API of
+  `@react-native-google-signin/google-signin` (v16) takes **no nonce parameter**:
+  none in its TypeScript types, none in its iOS sources. So a client-side nonce
+  (random value, SHA-256 hash to Google, raw value to Supabase, as Apple does)
+  **cannot be built on this SDK**. Sign-in passed on a device on 24 Sep 2026
+  without the fallback below being reported as used. With the check still on,
+  that implies the SDK's ID tokens currently carry no nonce claim, so Supabase
+  has nothing to compare. If a future SDK or iOS update starts adding one,
+  sign-in will fail with a nonce mismatch. **Approved fallback (PM, 24 Sep): turn on "Skip nonce
+  checks" for Google in the Supabase dashboard, AND set `skip_nonce_check =
+  true` under `[auth.external.google]` in `supabase/config.toml`**, or a
+  `supabase config push` would switch it back. Signature, audience and expiry
+  are still verified; what is lost is replay protection for a stolen ID token
+  during its one-hour life, which is low-value here because being signed in
+  grants nothing (see below). The alternatives both cost a rebuild: the paid
+  Universal Sign In module (`GoogleOneTapSignIn` takes a nonce), or a
+  browser-based OAuth flow.
 - **Sign-out (Epic 12) uses the same teardown as deletion** (`localTeardown.ts`):
   the UI is purged synchronously before the first await, then supabase-js
   `signOut` and the stored-session drop run, each capped at 3 s, and the Google
   SDK's local sign-out runs without being awaited. The old sign-out awaited
   supabase-js with no bound, the same auth-lock hang that froze deletion.
-  Sign-out **tombstones the session** (the JWT `session_id` claim), not the user,
-  so a late `TOKEN_REFRESHED` cannot bring it back but the same person can sign
-  straight back in. Deletion tombstones the user id. An `incomplete` teardown
-  is shown to the user: the session may come back on the next launch.
+  **Tombstones: `session_id` for sign-out, `user_id` for deletion.** A token
+  refresh that already held supabase-js's auth lock still completes after the
+  purge and emits `TOKEN_REFRESHED`; without a tombstone that event would put
+  the old session back on screen. What is tombstoned must match what is gone:
+  - *Deletion* tombstones the **user id**. The account no longer exists, and
+    user ids are never reused, so nothing legitimate can ever carry it again.
+  - *Sign-out* tombstones the **session**, via the JWT `session_id` claim, which
+    stays the same across refreshes of one session and is new for every
+    sign-in. A user-id tombstone here would be a bug: the same person signing
+    straight back in keeps their user id, so the new sign-in would be ignored
+    for the rest of the process. Supabase would hold a live session while the
+    UI said "signed out". `test:auth` signs in again as the same user to pin this.
+  Both tombstones live in memory only. An `incomplete` teardown (the stored
+  session could not be confirmed removed) is shown to the user, because that
+  session may come back on the next launch.
 - **The session is encrypted at rest** (`secureSessionStorage.ts`). An AES-256-GCM
   key in the Keychain/Keystore, `AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY` so a
   locked-phone tour can still read it; the ciphertext is in AsyncStorage. A
@@ -196,12 +227,27 @@ CMS admins.
   revoke their Apple tokens **after** the delete, in the background
   (`EdgeRuntime.waitUntil`), so Apple can never hold an account hostage.
   Revocation is recommended by Apple, not required, and a failed one is logged
-  (`apple_revocation_finished`) but not yet retried (§7.1). **Google (Epic 12)
-  follows the same pattern.** Just before the request the app gets a Google
-  access token (silent restore + `getTokens()`, **capped at 2 s as a whole**).
-  The server checks it with `tokeninfo` (its `sub` must be one of the account's
-  Google identities, and its audience one of `GOOGLE_CLIENT_IDS`), then revokes
-  it in the background, which ends the whole grant. With no token (timeout,
+  (`apple_revocation_finished`) but not yet retried (§7.1). **Google revocation
+  is server-side (Epic 12, "option B"), following the Apple pattern.** A native
+  Google sign-in gives Supabase only an ID token, so the server holds nothing it
+  could revoke. Just before the request the app gets a Google access token
+  (silent restore + `getTokens()`, **capped at 2 s as a whole**, because the
+  cold-start restore is where it would stall) and sends it as
+  `google_access_token`. After the delete, in the background, the server checks
+  the token with Google's `tokeninfo` and then revokes it at
+  `oauth2.googleapis.com/revoke`. Revoking an access token ends the whole grant,
+  refresh tokens included. Both `tokeninfo` checks are required:
+  - its `sub` must be one of the account's Google identities, so one account's
+    deletion cannot revoke another Google account's grant;
+  - its audience (`aud`/`azp`) must be one of **our** client IDs
+    (`GOOGLE_CLIENT_IDS`). Otherwise a token the same person issued to a
+    *different* app would revoke their grant to that app: a confused deputy.
+
+  The app used to call `GoogleSignin.revokeAccess()` itself. That needs a
+  current SDK user, which does not exist after a cold start or when Google is
+  only a linked identity, and its failures were never reported; it was removed.
+  Unlike Apple's single-use authorization code, an access token can be reused
+  for about an hour, so a failed Google revocation could be retried. With no token (timeout,
   no Google session on the device, SDK error) the account is still deleted: the
   app sends `google_token_unavailable: <reason>` and the server logs
   `google_revocation_skipped` with it. Without the `GOOGLE_CLIENT_IDS` secret
@@ -663,13 +709,12 @@ The extension must match the codec because AVFoundation infers the format from i
 - **Manual harnesses** (not in CI, hit a real project): `npm run sim:walk`
   (end-to-end geofence → offline file → audio), `npm run routing:ping`.
 
-### 6.4 Epic 11 — feature-complete, awaiting device QA
+### 6.4 Epic 11 — closed
 
-Branch `feat/epic-11-onboarding` (head `0622216`), CI green. **Not merged to
-`main`**: the on-device pass owns animations, UI scaling at large text sizes,
-the native Apple/Google flows, offline states, and the one path no automated
-test could reach — deleting a real account with live Apple and Google test
-accounts.
+Closed by the PM on 23 Sep 2026 after device QA and merged to `main`
+(`8820fb7`). The device-QA fixes after `0622216` hardened account deletion:
+bounded steps, no `functions.invoke`, the synchronous UI purge and the user
+tombstone (§3.2).
 
 | Task | Built | Live in production? |
 |---|---|---|
@@ -677,6 +722,27 @@ accounts.
 | **TASK-1102** Session & auth | Guest-first: sign-in is optional and grants nothing on the server. The session is encrypted with AES-GCM from `expo-crypto`, keyed from the Keychain/Keystore so a locked-phone tour can still read it (§3.2). | No (branch) |
 | **TASK-1103** Wire contract | `shared/src/contracts/route-stops.onboarding.json` pins the wizard → `route-stops` payload for both sides (§6.3). | n/a (test fixture) |
 | **TASK-1104** Account deletion | Settings → Account → Delete account, and the `delete-account` Edge Function: hard delete, CMS admins refused, Apple token revocation when the secrets are set (§3.2). Telemetry is deliberately **not** purged — it carries a random device id and no user id, so nothing in it is account-linked, and linking it would be the less private design. | **Yes, the function** (18 Sep). Live checks passed: 405/401/400, and a real admin session refused with 403 while keeping its CMS rights. |
+
+### 6.5 Epic 12 — Google Sign-In parity, closed
+
+Kicked off and closed 23–24 Sep 2026. Validated on a physical iPhone through
+a TestFlight production build (PM, 24 Sep): Google sign-in, an immediate
+sign-out to the guest screen, sign-in again, and account deletion showing
+`Google token: sent / revocation: scheduled`, with the token revoked on the
+server.
+
+| Change | Where | Live? |
+|---|---|---|
+| Server-side Google revocation (option B): the app sends a Google access token (2 s cap); the server checks `sub` and audience with `tokeninfo`, then revokes after the delete. No token → deletion still proceeds, flagged `google_token_unavailable`, logged `google_revocation_skipped`. A malformed flag is never a 400. | `googleRevoke.ts`, `handler.ts`, `AccountService.ts`, `accountDeletion.ts` | **Yes**, `delete-account` version 7 (24 Sep); `GOOGLE_CLIENT_IDS` set 23 Sep |
+| Bounded sign-out on the deletion teardown; `session_id` tombstone | `localTeardown.ts`, `sessionTeardown.ts`, `authStore.ts` | Yes (app) |
+| EAS builds fail without both Google client IDs | `app.config.ts` | Yes: the production build passed it |
+
+Credentials live outside the repo, set by the PM: the EAS environment
+variables, the Android OAuth client (the EAS keystore **and** Play App Signing
+SHA-1s), Supabase's Google Authorized Client IDs, and the function secret. The
+OAuth consent screen is in **Testing** mode: only listed test users can sign in,
+so it must be published before release. Nonce: see §3.2; the approved fallback
+was not needed.
 
 ---
 
@@ -694,7 +760,7 @@ needs a PM decision or a task; none should be assumed.
 | **Skip to next stop** for a missed zone | Only the debug manual trigger; a missed zone blocks the remaining stops | Post-MVP backlog |
 | **Proximity-based start** (`preferences.start`) | Not sent; scored routes start at the first authored stop | Post-MVP backlog |
 | **Retry of failed Apple revocations** ("zombie grant") | A revocation that fails after the delete is logged, not retried: the user is gone from Supabase but Apple may still list the app as connected | Post-MVP backlog (PM, 22 Sep 2026). Accepted MVP risk; design in §7.1. |
-| **In-app account deletion** (App Store guideline 5.1.1(v)) | Built (TASK-1104); the `delete-account` Edge Function is **live in production** since 18 Sep 2026, hardened version since 22 Sep. Google revocation (Epic 12) is on `feat/epic-12-google`, not deployed | The four `APPLE_*` secrets are set (22 Sep 2026; `APPLE_CLIENT_ID` verified to be exactly the bundle id). `GOOGLE_CLIENT_IDS` is not set yet. Outstanding before submission: one live deletion of a real Apple and a real Google account during device QA, confirming `apple_revocation_finished` → `revoked` and `google_revocation_finished` → `revoked` in the logs. |
+| **In-app account deletion** (App Store guideline 5.1.1(v)) | Built (TASK-1104, Epic 12). The `delete-account` Edge Function is **live in production**: first deployed 18 Sep 2026, hardened 22 Sep, version 7 with server-side Google revocation since 24 Sep | Secrets set: the four `APPLE_*` (22 Sep; `APPLE_CLIENT_ID` verified to be exactly the bundle id) and `GOOGLE_CLIENT_IDS` (23 Sep). **Google deletion and revocation confirmed on a physical device on 24 Sep** (TestFlight production build; the token was revoked). Apple deletion was part of Epic 11's device QA; a `apple_revocation_finished` → `revoked` log line has not been recorded here. |
 | **Future trip planning** (travel dates, time-simulated routing) | Routing scores the device's current `context.local_time`; onboarding asks for no dates | Post-MVP backlog (PM, Epic 11 kickoff). The server already takes any `local_time`, so the backend gap is small; the work is the dates UI and offline bundles for a trip that is weeks away. |
 | **Precise kids' ages** scoring | One `family_kids` audience tag; no ages collected | Post-MVP backlog (PM, Epic 11 kickoff) |
 | **User-selectable bicycle / car modes** | Walking only in onboarding. `transit_mode` belongs to the tour, and `route-stops` refuses a mismatch (400 `transit_mode_mismatch`) | Post-MVP backlog (PM, Epic 11 kickoff). The engine already has biking/driving profiles, but geofence radii are authored for each tour's own mode, so this is a content change as well as a code change. |
