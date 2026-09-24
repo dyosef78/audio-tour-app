@@ -72,6 +72,8 @@ import { parseLocalTime } from '../../shared/src/smartSorter.ts';
 import { connectivityOf } from '../src/services/network/connectivity.ts';
 import AsyncStorage, { __dump, __setFailReads } from './stubs/async-storage.ts';
 import { players } from './stubs/expo-audio.ts';
+import { __setAppForegrounded, calls as locationCalls, resetCalls as resetLocationCalls } from './stubs/expo-location.ts';
+import { profileFor } from '../src/config/transitProfiles.ts';
 
 // -----------------------------------------------------------------------------
 // Tiny test harness
@@ -1341,6 +1343,87 @@ function engine(stops: Waypoint[]) {
   at(0);
   eq('a stop with no geofence cannot block the stops after it', at(200), ['exit:A', 'enter:B']);
   await service.stop();
+}
+
+heading('Epic 13: Android - one persistent task, pinned to fine');
+
+{
+  const fine = profileFor('walking').fine;
+  const stops = [zonedStop('A', 1, 0), zonedStop('B', 2, 600)];
+  resetLocationCalls();
+
+  const ios = new LocationService('walking', 'ios');
+  ios.loadTour(stops, 'walking');
+  eq('iOS keeps Adaptive GPS: starts coarse, no persistent task', [ios.getTier(), ios.persistentTask], ['coarse', false]);
+
+  const droid = new LocationService('walking', 'android');
+  droid.loadTour(stops, 'walking');
+  const tiers: string[] = [];
+  const entered: string[] = [];
+  droid.setCallbacks({
+    onSamplingChange: (tier) => tiers.push(tier),
+    onGeofence: (e: GeofenceEvent) => e.type === 'enter' && entered.push(e.waypoint.id),
+  });
+  await droid.start();
+  const starts = locationCalls.filter((c) => c.kind === 'background-start');
+  assert(
+    'start() opens the background task, never a watcher, on the fine tier',
+    starts.length === 1 && !locationCalls.some((c) => c.kind === 'watch') &&
+      starts[0].options?.distanceInterval === fine.distanceInterval && starts[0].options?.accuracy === fine.accuracy,
+    JSON.stringify(locationCalls),
+  );
+  eq('the pinned tier is reported once, so the debug overlay is honest', tiers, ['fine']);
+
+  // Pocketed: from here any start with a foreground service throws, as on a device.
+  __setAppForegrounded(false);
+  const before = locationCalls.length;
+  let clock = 2_000_000_000;
+  for (const metres of [-3_000, 0, 300, -3_000, 580, 600]) {
+    clock += 60_000;
+    droid.onFix(northOf(metres), 5, clock);
+  }
+  await droid.settled();
+  eq('walking far -> near -> far in the background touches the task zero times', locationCalls.slice(before), []);
+  eq('the tier never leaves fine', droid.getTier(), 'fine');
+  eq('and every stop still narrates', entered, ['A', 'B']);
+
+  let refused = false;
+  try {
+    await droid.startBackground();
+  } catch {
+    refused = true;
+  }
+  assert('startBackground() on Android is a loud contract violation', refused);
+
+  // Not vacuous: the stub really refuses what the old code did from the background.
+  let stubRefuses = false;
+  const probe = new LocationService('walking', 'android');
+  probe.loadTour(stops, 'walking');
+  try {
+    await probe.start();
+  } catch {
+    stubRefuses = true;
+  }
+  assert('a start while pocketed throws (the Android rule is enforced by the stub)', stubRefuses);
+
+  __setAppForegrounded(true);
+  await droid.stop();
+  await droid.stopBackground();
+  eq('ending the session stops the task', locationCalls.at(-1)?.kind, 'background-stop');
+
+  // A task left by a previous process keeps ITS options; start() must replace it.
+  resetLocationCalls();
+  await ios.startBackground(); // leaves a task running, as a killed process would
+  const again = new LocationService('walking', 'android');
+  again.loadTour(stops, 'walking');
+  await again.start();
+  eq(
+    'a task already running is replaced, not adopted',
+    locationCalls.map((c) => c.kind),
+    ['background-start', 'background-stop', 'background-start'],
+  );
+  await again.stopBackground();
+  resetLocationCalls();
 }
 
 heading('Session store follows the routed order');
