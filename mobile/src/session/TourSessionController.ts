@@ -212,6 +212,7 @@ class TourSessionController {
       waypoints: selection.active,
       transitMode,
       backgroundPermission: permissions.background,
+      notificationPermission: permissions.notifications,
       skippedWaypointIds: selection.skippedIds,
     });
 

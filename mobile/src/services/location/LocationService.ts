@@ -1,6 +1,6 @@
 import * as Location from 'expo-location';
 import * as TaskManager from 'expo-task-manager';
-import { Platform } from 'react-native';
+import { PermissionsAndroid, Platform } from 'react-native';
 
 import { profileFor, type GpsSampling, type TransitProfile } from '../../config/transitProfiles';
 import type { LatLng, TransitMode, Waypoint } from '../../types/domain';
@@ -211,13 +211,26 @@ export class LocationService {
    * Returns what was actually granted so the UI can degrade honestly: without
    * background permission the tour still works with the screen on, which is
    * worth saying rather than silently half-failing.
+   *
+   * Android 13+ (Epic 13): notifications are asked for last, before start()
+   * opens the location foreground service, so its "Audio Tour in progress"
+   * notice is visible. Denied, the service still runs (Android lists it under
+   * Active apps) but the notice is hidden - reported as `notifications: false`
+   * for the UI to say so. Not asked when location was refused: no tour runs.
+   * Below Android 13, and on iOS, the permission does not exist: true.
    */
-  async requestPermissions(): Promise<{ foreground: boolean; background: boolean }> {
+  async requestPermissions(): Promise<{ foreground: boolean; background: boolean; notifications: boolean }> {
     const fg = await Location.requestForegroundPermissionsAsync();
-    if (fg.status !== 'granted') return { foreground: false, background: false };
+    if (fg.status !== 'granted') return { foreground: false, background: false, notifications: false };
 
     const bg = await Location.requestBackgroundPermissionsAsync();
-    return { foreground: true, background: bg.status === 'granted' };
+    return { foreground: true, background: bg.status === 'granted', notifications: await this.requestNotifications() };
+  }
+
+  private async requestNotifications(): Promise<boolean> {
+    if (Platform.OS !== 'android' || Number(Platform.Version) < 33) return true;
+    const result = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS);
+    return result === PermissionsAndroid.RESULTS.GRANTED;
   }
 
   // ---------------------------------------------------------------------------

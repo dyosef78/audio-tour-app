@@ -45,6 +45,7 @@ export default function ActiveTourScreen({ route, navigation }: ActiveTourScreen
   const activeId = useTourSession((s) => s.activeWaypointId);
   const visited = useTourSession((s) => s.visitedWaypointIds);
   const bgGranted = useTourSession((s) => s.backgroundPermission);
+  const notificationsGranted = useTourSession((s) => s.notificationPermission);
   const completed = useTourSession((s) => s.completionPrompted);
   // `mapRoute`, not `route`: that name is the navigation prop above.
   const mapRoute = useTourSession((s) => s.route);
@@ -144,6 +145,12 @@ export default function ActiveTourScreen({ route, navigation }: ActiveTourScreen
         {!bgGranted && (
           <Text style={styles.warn}>
             Background location not granted — narration only triggers while the app is open.
+          </Text>
+        )}
+
+        {!notificationsGranted && (
+          <Text style={styles.warn}>
+            Notifications are off, so Android won’t show that the tour is tracking your location. The tour still runs; to see it, allow notifications for Audio Tour in Settings.
           </Text>
         )}
 

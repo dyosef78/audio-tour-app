@@ -76,6 +76,8 @@ export interface TourSessionState {
 
   /** Whether background location permission was granted, for honest UI. */
   backgroundPermission: boolean;
+  /** Android 13+: false hides the tracking notice (the tour still runs). */
+  notificationPermission: boolean;
   error: string | null;
 }
 
@@ -85,6 +87,7 @@ export interface TourSessionActions {
     waypoints: Waypoint[];
     transitMode: TransitMode;
     backgroundPermission: boolean;
+    notificationPermission?: boolean;
     skippedWaypointIds?: string[];
   }) => void;
   setRoute: (route: RouteDisplay) => void;
@@ -125,6 +128,7 @@ const initial: TourSessionState = {
   visitedWaypointIds: [],
   completionPrompted: false,
   backgroundPermission: false,
+  notificationPermission: true,
   error: null,
 };
 
@@ -134,8 +138,8 @@ export const useTourSession = create<TourSessionState & TourSessionActions>((set
   beginStart: (tourId, tourTitle) =>
     set({ ...initial, status: 'starting', tourId, tourTitle }),
 
-  sessionStarted: ({ waypoints, transitMode, backgroundPermission, skippedWaypointIds = [] }) =>
-    set({ status: 'active', waypoints, transitMode, backgroundPermission, skippedWaypointIds, error: null }),
+  sessionStarted: ({ waypoints, transitMode, backgroundPermission, notificationPermission = true, skippedWaypointIds = [] }) =>
+    set({ status: 'active', waypoints, transitMode, backgroundPermission, notificationPermission, skippedWaypointIds, error: null }),
 
   setRoute: (route) => set({ route }),
 

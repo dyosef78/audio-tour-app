@@ -7,7 +7,14 @@
  * without a device.
  */
 
-export const Platform = { OS: 'ios' as 'ios' | 'android' };
+export const Platform = { OS: 'ios' as 'ios' | 'android', Version: 17 as number | string };
+
+/** Android runtime permissions; only reached on the Android path. */
+export const PermissionsAndroid = {
+  PERMISSIONS: { POST_NOTIFICATIONS: 'android.permission.POST_NOTIFICATIONS' },
+  RESULTS: { GRANTED: 'granted', DENIED: 'denied', NEVER_ASK_AGAIN: 'never_ask_again' },
+  request: async (_permission: string): Promise<string> => 'granted',
+};
 
 type AppStateListener = (status: string) => void;
 
