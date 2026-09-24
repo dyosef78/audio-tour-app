@@ -17,6 +17,8 @@ import {
 } from './appleRevoke.ts';
 import { createGoogleRevoker, googleRevokeConfigFromEnv, type GoogleRevoker } from './googleRevoke.ts';
 import { handleDeleteAccount, type AuthenticatedUser, type DeleteAccountDeps } from './handler.ts';
+import { createLogger } from '../_shared/logger.ts';
+import { createUserRef } from '../_shared/userRef.ts';
 
 const USER = '11111111-2222-4333-8444-555555555555';
 const OTHER = '99999999-2222-4333-8444-555555555555';
@@ -307,6 +309,39 @@ Deno.test('the log never carries an email, name or token', async () => {
   await Promise.all(h.background);
   const text = JSON.stringify(h.logs);
   assert(!text.includes('secret-code') && !text.includes('user-token') && !text.includes('apple-sub'), text);
+});
+
+Deno.test('Epic 13: wired to the real logger, no path ships the raw user id - to the console or to Axiom', async () => {
+  const cases = [
+    harness({ revoker: 'revoked', googleRevoker: 'revoked', user: { id: USER, appleSubjects: ['apple-sub'], googleSubjects: ['google-sub'] }, background: true }),
+    harness({ revoker: 'throw', user: APPLE_USER, background: true }),
+    harness({ admins: [USER] }),
+    harness({ deleteResult: new Error('boom') }),
+    harness({ deleteResult: 'hang' }),
+    harness({ adminCheck: 'hang' }),
+  ];
+  const expected = await createUserRef('test-log-pseudonym-key-0123456789abcdef')(USER);
+  for (const h of cases) {
+    const shipped: string[] = [];
+    const logger = createLogger({
+      service: 'delete-account',
+      userRef: createUserRef('test-log-pseudonym-key-0123456789abcdef'),
+      axiom: { ingestUrl: 'https://axiom.test/v1/ingest/d', token: 't' },
+      runInBackground: null,
+      fetch: (async (_url: string | URL | Request, init?: RequestInit) => {
+        shipped.push(String(init?.body));
+        return new Response('{}');
+      }) as typeof fetch,
+      write: (line) => shipped.push(line),
+    });
+    await handleDeleteAccount(post({ apple_authorization_code: 'c', google_access_token: 't' }), { ...h.deps, log: logger.log });
+    await Promise.all(h.background);
+    await logger.flush();
+    const text = shipped.join(' ');
+    assert(shipped.length > 0, 'something was logged');
+    assert(!text.includes(USER), `raw id shipped: ${text}`);
+    assert(text.includes(expected), 'user lines carry the keyed ref');
+  }
 });
 
 // --- Google revocation (Epic 12): the same rules as Apple ----------------------
