@@ -250,7 +250,19 @@ CMS admins.
   app sends `google_token_unavailable: <reason>` and the server logs
   `google_revocation_skipped` with it. Without the `GOOGLE_CLIENT_IDS` secret
   every Google revocation is skipped as `revocation_not_configured`. Every response and
-  log line carries `X-Request-Id`. Telemetry is not deleted because it is not
+  log line carries `X-Request-Id`. Log lines name the user only as `user_ref`, an
+  HMAC-SHA-256 of the id keyed by the `LOG_PSEUDONYM_KEY` secret, because the logs
+  leave Supabase for Axiom (Epic 13, see below); without the secret they say
+  `user_ref: "unconfigured"`, never the raw id.
+- **Log shipping (Epic 13).** Both functions log through
+  `supabase/functions/_shared/logger.ts`: every line goes to the console AND,
+  batched per tick, to Axiom's ingest API (`AXIOM_TOKEN`, `AXIOM_DATASET`,
+  `AXIOM_DOMAIN`) under `EdgeRuntime.waitUntil`, so the response never waits.
+  Chosen over Supabase's native log drain, a paid add-on (PM, 24 Sep). The
+  logger is the only place `user_id` is turned into `user_ref`. What it cannot
+  capture: an isolate killed by the platform before its batch ships, boot
+  crashes, CPU limits - those exist only in the dashboard's short-lived logs. A
+  failed ingest is written to the console as `axiom_ingest_failed`, never retried. Telemetry is not deleted because it is not
   linked to accounts: events carry a random device id and no user id.
   Downloads and preferences stay on the phone.
 - **The app never sends this request through `supabase.functions.invoke`**
@@ -498,8 +510,18 @@ a registered TaskManager task, swapped on app state so exactly one subscription
 is live. An orphaned background task left by a killed app is stopped on the next
 cold start.
 
-> Background location needs a development build (not Expo Go). On Android,
-> background tracking pauses until the planned foreground service lands.
+**Android (Epic 13): one task, one tier, the whole session.** expo-location only
+starts its location foreground service while the app is in the foreground, and
+stopping the task tears that service down. So both iOS moves - the app-state swap
+and a tier change - would kill tracking once the phone is pocketed. On Android,
+`start()` opens the background task while the user is still on the screen,
+pinned to the **fine** tier, and nothing restarts it until the tour ends. It
+does not need "Allow all the time": a foreground-service task keeps while-in-use
+access. The battery cost is accepted (PM, Epic 13). A start refused because the
+user left the app mid-tap fails the session visibly instead of starting a tour
+that cannot track.
+
+> Background location needs a development build (not Expo Go).
 
 ### 4.3 Local geofencing engine — strictly linear
 
@@ -766,7 +788,7 @@ needs a PM decision or a task; none should be assumed.
 | **Rate limiting** of `route-stops` | Per-IP + global token buckets in Postgres (§3.4) | Live in production since 17 Sep 2026 (TASK-1001). The global 120/min is PM-approved **for now**, to be recalibrated when the Stadia budget is final. |
 | **MP3 fallback** (TASK-301) | Removed: not uploadable, not registrable, refused by the format constraint | AAC-LC `.m4a` only (PM, Epic 10). `transcript_path_for()` / `sidecar.ts` still map `.mp3`; that branch is unreachable. |
 | **"Public CDN"** audio URLs (PRD Screen 2) | Private bucket, 1-hour signed URLs | PRD is out of date. |
-| **Android background tracking** | Pauses in the background | Foreground service planned |
+| **Android background tracking** | One foreground-service task for the whole session, fine tier, no Adaptive GPS (§4.2) | Built in Epic 13; **device QA pending** |
 | **Cloud sync of preferences and itineraries** | Nothing syncs. Preferences and downloads are per device; `user_itineraries` and `sync_pull_itineraries()` exist but no client uses them | Post-MVP backlog (PM, Epic 11 wrap-up). **This is what would give an account user-facing value** - in the MVP it deliberately grants nothing (PM, 18 Sep), which is what the Welcome copy says. |
 
 ### 7.1 Post-MVP backlog

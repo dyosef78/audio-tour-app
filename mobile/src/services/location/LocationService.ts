@@ -1,5 +1,6 @@
 import * as Location from 'expo-location';
 import * as TaskManager from 'expo-task-manager';
+import { Platform } from 'react-native';
 
 import { profileFor, type GpsSampling, type TransitProfile } from '../../config/transitProfiles';
 import type { LatLng, TransitMode, Waypoint } from '../../types/domain';
@@ -30,6 +31,17 @@ import { StopSequence } from './stopSequence';
  * on iOS, gives no polygon support, and hands back enter/exit events we cannot
  * tune for cooldown or hysteresis. Our zones include polygons and per-mode
  * radii, so containment is computed here instead. See the handover report.
+ *
+ * ANDROID (Epic 13) - ONE TASK, ONE TIER, WHOLE SESSION. expo-location refuses
+ * to start its location foreground service unless the app is in the foreground
+ * (LocationModule.kt throws ForegroundServiceStartNotAllowedException), and
+ * stopping the task tears that service down. So on Android both of the iOS
+ * moves are fatal once the phone is pocketed: the foreground->background
+ * handoff starts the task from the background, and an Adaptive GPS tier change
+ * stops and restarts it. Instead, start() opens the background task while the
+ * user is still looking at the screen, on the FINE tier, and nothing touches it
+ * until the session ends. Fixes arrive through the task in the foreground too.
+ * Battery is the accepted cost (PM, Epic 13). iOS is unchanged.
  */
 
 /** Task name registered with TaskManager for background fixes. */
@@ -101,6 +113,13 @@ export class LocationService {
    */
   private trackingMode: 'idle' | 'foreground' | 'background' = 'idle';
 
+  /**
+   * Android: the background task is the only transport, opened once by
+   * start() and pinned to the fine tier (see the header). TourSessionController
+   * reads this to skip the app-state handoff.
+   */
+  readonly persistentTask: boolean;
+
   /** Last fix seen, so a deferred tier change re-decides rather than replays. */
   private lastFix: LatLng | null = null;
   /** Timestamp of the last APPLIED tier change, for the dwell check. */
@@ -109,8 +128,15 @@ export class LocationService {
   /** Serialises watcher restarts so overlapping changes cannot interleave. */
   private applying: Promise<void> = Promise.resolve();
 
-  constructor(mode: TransitMode = 'walking') {
+  /** `platform` is injectable so the Node simulator can drive the Android path. */
+  constructor(mode: TransitMode = 'walking', platform: string = Platform.OS) {
     this.profile = profileFor(mode);
+    this.persistentTask = platform === 'android';
+    this.currentTier = this.initialTier();
+  }
+
+  private initialTier(): 'coarse' | 'fine' {
+    return this.persistentTask ? 'fine' : 'coarse';
   }
 
   // ---------------------------------------------------------------------------
@@ -126,7 +152,7 @@ export class LocationService {
     );
     // Authored order until the routing provider says otherwise (setStopOrder).
     this.sequence = new StopSequence(this.waypoints.map((w) => w.id));
-    this.currentTier = 'coarse';
+    this.currentTier = this.initialTier();
 
     // Adaptive GPS state belongs to the tour that is loaded, not to the service.
     this.clearTierTimer();
@@ -198,8 +224,24 @@ export class LocationService {
   // Foreground tracking
   // ---------------------------------------------------------------------------
 
-  /** Start watching in the foreground at the current sampling tier. */
+  /**
+   * Start watching in the foreground at the current sampling tier.
+   *
+   * Android: opens the persistent background task instead, and MUST be called
+   * while the app is in the foreground - it throws otherwise, loudly, rather
+   * than start a tour that cannot track. A task already registered (a previous
+   * process, another tour's options) is replaced, because a running task keeps
+   * the options it was started with.
+   */
   async start(): Promise<void> {
+    if (this.persistentTask) {
+      this.trackingMode = 'background';
+      const running = await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME);
+      if (running) await Location.stopLocationUpdatesAsync(LOCATION_TASK_NAME);
+      await this.openBackgroundUpdates();
+      this.callbacks.onSamplingChange?.(this.currentTier, this.profile[this.currentTier]);
+      return;
+    }
     this.trackingMode = 'foreground';
     await this.openWatcher();
   }
@@ -246,6 +288,12 @@ export class LocationService {
    * scope before this runs.
    */
   async startBackground(): Promise<void> {
+    // Android opens its task in start(); from here the app may already be in
+    // the background, where the start would throw. A caller reaching this on
+    // Android has bypassed the persistentTask contract - say so.
+    if (this.persistentTask) {
+      throw new Error('startBackground() is not used on Android: start() opens the persistent task');
+    }
     this.trackingMode = 'background';
     const already = await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME);
     if (already) return;
@@ -387,6 +435,10 @@ export class LocationService {
    */
   private applyAdaptiveGps(fix: LatLng, timestamp: number): void {
     this.lastFix = fix;
+
+    // Android: the tier is pinned. A change would restart the task, which is
+    // exactly what cannot be done from the background (see the header).
+    if (this.persistentTask) return;
 
     const tier = this.desiredTier(fix);
 

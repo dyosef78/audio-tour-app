@@ -14,6 +14,9 @@
  *                                     optional; rate limit overrides (TASK-1001, rateLimit.ts).
  *                                     The limiter also needs the service role key; without it
  *                                     requests are not limited
+ *   LOG_PSEUDONYM_KEY, AXIOM_TOKEN, AXIOM_DATASET, AXIOM_DOMAIN
+ *                                     optional; log shipping to Axiom, shared with
+ *                                     delete-account (_shared/logger.ts)
  *
  * `@shared/` resolves through supabase/functions/import_map.json, which
  * supabase/config.toml names for this function.
@@ -26,8 +29,15 @@ import { handleRouteStops, type RouteStopsDeps } from './handler.ts';
 import type { CachedLeg, LegStore } from './legCache.ts';
 import { createRateLimiter, rateLimitPolicyFromEnv, type BucketOutcome, type RateLimiter } from './rateLimit.ts';
 import { RouteMemoryCache } from './routeCache.ts';
+import { loggerFromEnv } from '../_shared/logger.ts';
 
 const env = Deno.env.toObject();
+
+// waitUntil keeps the isolate alive for work that outlives the response: the
+// leg-cache write below, and shipping log lines to Axiom (_shared/logger.ts).
+// Read off globalThis: under `deno test` or a plain Deno it does not exist.
+const edgeRuntime = (globalThis as { EdgeRuntime?: { waitUntil(work: Promise<unknown>): void } }).EdgeRuntime;
+const log = loggerFromEnv('route-stops', env, edgeRuntime ? (work) => edgeRuntime.waitUntil(work) : null).log;
 
 let router: RouteStopsDeps['router'] = null;
 let routerUnavailableReason: string | undefined;
@@ -124,7 +134,7 @@ const legStore: LegStore | null = admin
     }
   : null;
 
-if (!legStore) console.log(JSON.stringify({ event: 'route_legs_cache_disabled', reason: 'SUPABASE_SERVICE_ROLE_KEY missing' }));
+if (!legStore) log({ event: 'route_legs_cache_disabled', reason: 'SUPABASE_SERVICE_ROLE_KEY missing' });
 
 // -----------------------------------------------------------------------------
 // Rate limiting (TASK-1001)
@@ -143,6 +153,7 @@ const rateLimit: RateLimiter | null = admin
       // cannot be reversed to an IP address. Rotating the service role key
       // just starts every client bucket afresh.
       secret: serviceKey as string,
+      log,
       store: async (buckets) => {
         const { data, error } = await admin
           .rpc('consume_rate_limit', {
@@ -163,16 +174,15 @@ const rateLimit: RateLimiter | null = admin
     })
   : null;
 
-if (!rateLimit) console.log(JSON.stringify({ event: 'route_stops_rate_limit_disabled', reason: 'SUPABASE_SERVICE_ROLE_KEY missing' }));
+if (!rateLimit) log({ event: 'route_stops_rate_limit_disabled', reason: 'SUPABASE_SERVICE_ROLE_KEY missing' });
 
 // The response is sent before the cache write finishes. waitUntil keeps the
 // isolate alive for it; without it the write can be cut off mid-flight.
-const edgeRuntime = (globalThis as { EdgeRuntime?: { waitUntil(work: Promise<unknown>): void } }).EdgeRuntime;
 const defer: RouteStopsDeps['defer'] = (work) => edgeRuntime?.waitUntil(work);
 
 // Module scope: shared by every request this isolate serves.
 const cache = new RouteMemoryCache();
 
 Deno.serve((request) =>
-  handleRouteStops(request, { loadTour, router, routerUnavailableReason, cache, legStore, rateLimit, defer }),
+  handleRouteStops(request, { loadTour, router, routerUnavailableReason, cache, legStore, rateLimit, defer, log }),
 );

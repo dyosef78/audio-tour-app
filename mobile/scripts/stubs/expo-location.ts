@@ -58,6 +58,18 @@ export const calls: RecordedCall[] = [];
 export function resetCalls(): void {
   calls.length = 0;
   backgroundRunning = false;
+  appForegrounded = true;
+}
+
+/**
+ * Epic 13: Android's rule, as expo-location enforces it (LocationModule.kt):
+ * a start WITH a foreground service throws unless the app is in the
+ * foreground. Off by default - iOS has no such rule, and the other phases
+ * model iOS - so a test turns it on by "pocketing" the phone.
+ */
+let appForegrounded = true;
+export function __setAppForegrounded(foregrounded: boolean): void {
+  appForegrounded = foregrounded;
 }
 
 /** The sampling options of the most recent watcher, or undefined if none. */
@@ -98,8 +110,11 @@ export const watchPositionAsync = async (
 
 export const startLocationUpdatesAsync = async (
   _task: string,
-  options: LocationOptions,
+  options: LocationOptions & { foregroundService?: unknown },
 ): Promise<void> => {
+  if (!appForegrounded && options.foregroundService) {
+    throw new Error('ForegroundServiceStartNotAllowedException: app is not in the foreground');
+  }
   backgroundRunning = true;
   calls.push({ kind: 'background-start', options });
 };

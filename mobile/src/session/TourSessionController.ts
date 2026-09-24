@@ -101,8 +101,19 @@ class TourSessionController {
    * React 19 StrictMode mounting, unmounting and remounting in development.
    */
   async startSession(tourId: string, tourTitle: string): Promise<void> {
-    this.transition = this.transition.then(() => this.doStart(tourId, tourTitle));
-    return this.transition;
+    return this.enqueue(() => this.doStart(tourId, tourTitle));
+  }
+
+  /**
+   * Run one transition after the previous one. The CALLER gets this run's
+   * outcome, error included; the queue itself continues past a failure. Chaining
+   * onto a rejected promise would silently skip every later start and end for
+   * the life of the process.
+   */
+  private enqueue(run: () => Promise<void>): Promise<void> {
+    const result = this.transition.then(run);
+    this.transition = result.catch(() => undefined);
+    return result;
   }
 
   private async doStart(tourId: string, tourTitle: string): Promise<void> {
@@ -178,7 +189,20 @@ class TourSessionController {
     void telemetry.record('tour_started', { tourId });
 
     await this.audio.configureSession();
-    await service.start();
+    try {
+      await service.start();
+    } catch (err) {
+      // Android can refuse here: its location foreground service only starts
+      // while the app is in the foreground, so switching away mid-start throws
+      // (LocationService header). Release whatever did start, then tell the
+      // user - a tour that cannot track must not look like one that is running.
+      console.error('[TourSession] location tracking could not start:', err);
+      await this.doEnd();
+      useTourSession
+        .getState()
+        .sessionFailed('Location tracking could not start. Keep the app open and try again.');
+      return;
+    }
 
     this.appStateSub = AppState.addEventListener('change', (next) => {
       void this.handleAppStateChange(next);
@@ -497,13 +521,14 @@ class TourSessionController {
    * NOT stop tracking - hands-free playback with the phone pocketed is the
    * product.
    *
-   * ANDROID: startBackground() has no effect while the app is backgrounded
-   * until the deferred unified foreground service lands, so tracking pauses
-   * there. iOS continues via the default background session type.
+   * ANDROID: no handoff at all. The task opened by start() already runs
+   * across foreground and background, and starting one from here would throw -
+   * the app is no longer in the foreground by the time this fires (Epic 13).
    */
   private async handleAppStateChange(next: AppStateStatus): Promise<void> {
     const service = this.location;
     if (!service) return;
+    if (service.persistentTask) return;
     if (useTourSession.getState().status !== 'active') return;
 
     try {
@@ -533,8 +558,7 @@ class TourSessionController {
 
   /** The only way a tour ends. Releases every native resource it owns. */
   async endSession(): Promise<void> {
-    this.transition = this.transition.then(() => this.doEnd());
-    return this.transition;
+    return this.enqueue(() => this.doEnd());
   }
 
   private async doEnd(): Promise<void> {
