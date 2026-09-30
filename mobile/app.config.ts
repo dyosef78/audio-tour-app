@@ -1,4 +1,20 @@
 import type { ConfigContext, ExpoConfig } from 'expo/config';
+import { withInfoPlist, type ConfigPlugin } from 'expo/config-plugins';
+
+/**
+ * Epic 13: expo-task-manager's plugin adds the `fetch` background mode
+ * unconditionally. The app has no background fetch - background location
+ * runs under `location` - and declaring a mode an app does not use invites
+ * an App Review rejection (Guideline 2.5.4). Wraps the whole config, and its
+ * mod runs after expo-task-manager's has added the mode - checked with
+ * `npx expo config --type introspect`, which shows the final Info.plist.
+ */
+const withoutUnusedBackgroundFetch: ConfigPlugin = (config) =>
+  withInfoPlist(config, (mod) => {
+    const modes = mod.modResults.UIBackgroundModes;
+    if (Array.isArray(modes)) mod.modResults.UIBackgroundModes = modes.filter((m: string) => m !== 'fetch');
+    return mod;
+  });
 
 /**
  * Dynamic Expo config (TASK-102).
@@ -126,7 +142,7 @@ export default ({ config }: ConfigContext): ExpoConfig => {
     console.warn(`\n[app.config] Google Sign-In is off in this build: ${googleErrors.join('; ')}.\n`);
   }
 
-  return {
+  return withoutUnusedBackgroundFetch({
     ...config,
     plugins: [...(config.plugins ?? []), ...googlePlugins],
     name: config.name ?? 'Audio Tour',
@@ -138,5 +154,5 @@ export default ({ config }: ConfigContext): ExpoConfig => {
       // than carrying a bogus placeholder into the manifest.
       ...(apiKey ? { config: { googleMaps: { apiKey } } } : {}),
     },
-  };
+  });
 };

@@ -47,8 +47,7 @@
         "expo-audio",
         {
           "enableBackgroundPlayback": true,
-          "recordAudioAndroid": false,
-          "microphonePermission": false
+          "recordAudioAndroid": false
         }
       ],
       [
@@ -56,6 +55,7 @@
         {
           "locationAlwaysAndWhenInUsePermission": "Audio Tour needs background location so narration keeps triggering with your screen locked and the phone in your pocket.",
           "locationWhenInUsePermission": "Audio Tour uses your location to start narration when you reach a stop on the tour.",
+          "locationAlwaysPermission": "Audio Tour needs background location so narration keeps triggering with your screen locked and the phone in your pocket.",
           "isAndroidBackgroundLocationEnabled": true,
           "isAndroidForegroundServiceEnabled": true
         }
