@@ -74,6 +74,13 @@ import AsyncStorage, { __dump, __setFailReads } from './stubs/async-storage.ts';
 import { players } from './stubs/expo-audio.ts';
 import { __setAppForegrounded, calls as locationCalls, resetCalls as resetLocationCalls } from './stubs/expo-location.ts';
 import { profileFor } from '../src/config/transitProfiles.ts';
+import {
+  createCheckpointStore,
+  decideResume,
+  MAX_RESUME_AGE_MS,
+  type CheckpointIO,
+  type SessionCheckpoint,
+} from '../src/session/sessionCheckpoint.ts';
 
 // -----------------------------------------------------------------------------
 // Tiny test harness
@@ -1343,6 +1350,134 @@ function engine(stops: Waypoint[]) {
   at(0);
   eq('a stop with no geofence cannot block the stops after it', at(200), ['exit:A', 'enter:B']);
   await service.stop();
+}
+
+heading('Epic 13: session checkpoint (resume after a process kill)');
+
+{
+  // In-memory files, with a switch to "kill" the process between two steps.
+  const files = new Map<string, string>();
+  let killAfter: 'writeTemp' | 'deleteMain' | null = null;
+  const io: CheckpointIO = {
+    readMain: () => files.get('main') ?? null,
+    readTemp: () => files.get('temp') ?? null,
+    writeTemp: (text) => {
+      files.set('temp', text);
+      if (killAfter === 'writeTemp') throw new Error('killed');
+    },
+    commitTemp: () => {
+      files.delete('main');
+      if (killAfter === 'deleteMain') throw new Error('killed');
+      files.set('main', files.get('temp') as string);
+      files.delete('temp');
+    },
+    clear: () => files.clear(),
+  };
+  const store = createCheckpointStore(io);
+  const cp = (over: Partial<SessionCheckpoint> = {}): SessionCheckpoint => ({
+    v: 1, tourId: 't1', tourTitle: 'Tel Aviv', transitMode: 'walking',
+    activeIds: ['A', 'B', 'C'], skippedIds: ['X'], order: ['A', 'C', 'B'], passed: ['A', 'C'], visited: ['A', 'C'],
+    backgroundPermission: true, notificationPermission: false, startedAt: 1_000, savedAt: 2_000, ...over,
+  });
+
+  eq('nothing saved -> none', store.load(), { kind: 'none' });
+  store.save(cp());
+  eq('round trip: order, and a passed set that is NOT a prefix of it', store.load(), { kind: 'found', checkpoint: cp() });
+  eq('...and only the committed file remains', [...files.keys()], ['main']);
+
+  // Atomicity: a kill at either point leaves one complete copy.
+  killAfter = 'writeTemp';
+  try { store.save(cp({ passed: ['A', 'C', 'B'], savedAt: 3_000 })); } catch { /* the kill */ }
+  eq('killed after the temp write -> the OLD checkpoint loads', (store.load() as { checkpoint: SessionCheckpoint }).checkpoint.savedAt, 2_000);
+  killAfter = 'deleteMain';
+  try { store.save(cp({ passed: ['A', 'C', 'B'], savedAt: 3_000 })); } catch { /* the kill */ }
+  eq('killed between delete and rename -> the NEW checkpoint loads from the temp', (store.load() as { checkpoint: SessionCheckpoint }).checkpoint.savedAt, 3_000);
+  killAfter = null;
+
+  files.set('main', '{"v":1,"tourId":');
+  eq('a torn file is invalid, never "none" (not mistaken for an ended tour)', store.load().kind, 'invalid');
+  for (const [label, bad] of [
+    ['an order that is not the active stops', cp({ order: ['A', 'B'] })],
+    ['a passed stop that is not active', cp({ passed: ['Z'] })],
+    ['an unknown version', { ...cp(), v: 2 }],
+    ['an unknown transit mode', cp({ transitMode: 'flying' as never })],
+  ] as const) {
+    files.set('main', JSON.stringify(bad));
+    assert(`rejects ${label}`, store.load().kind === 'invalid');
+  }
+  let refused = false;
+  try { store.save(cp({ order: ['A'] })); } catch { refused = true; }
+  assert('save() refuses a checkpoint load() would reject', refused);
+  store.clear();
+  eq('clear() removes both files', files.size, 0);
+
+  const found = { kind: 'found' as const, checkpoint: cp({ savedAt: 10_000_000 }) };
+  eq('fresh -> resume', decideResume(found, 10_000_000 + MAX_RESUME_AGE_MS).kind, 'resume');
+  eq('older than the limit -> discard', decideResume(found, 10_000_001 + MAX_RESUME_AGE_MS).kind, 'discard');
+  eq('invalid -> discard (with the reason)', decideResume({ kind: 'invalid', reason: 'not JSON' }, 0), { kind: 'discard', reason: 'unusable checkpoint (not JSON)' });
+  eq('none -> nothing', decideResume({ kind: 'none' }, 0).kind, 'nothing');
+}
+
+{
+  const seq = new StopSequence(['A', 'B', 'C', 'D']);
+  seq.reorder(['A', 'C', 'B', 'D']);
+  seq.reach('A');
+  seq.reach('C');
+  eq('passedIds in visiting order', seq.passedIds(), ['A', 'C']);
+
+  const fresh = new StopSequence(['A', 'B', 'C', 'D']);
+  // B was reached before a reorder moved C ahead of it: {A, B} is NOT a prefix
+  // of A, C, B, D. Replaying reach() would wrongly pass C as well.
+  eq('restore puts back a non-prefix passed set exactly', [fresh.restore(['A', 'C', 'B', 'D'], ['A', 'B']), fresh.next(), fresh.isPassed('C')], [true, 'C', false]);
+  const untouched = new StopSequence(['A', 'B']);
+  eq('restore with an unknown passed stop is refused and changes nothing', [untouched.restore(['B', 'A'], ['Z']), untouched.ids()], [false, ['A', 'B']]);
+}
+
+{
+  const stops = [zonedStop('A', 1, 0), zonedStop('B', 2, 200), zonedStop('C', 3, 400)];
+  const before = new LocationService('walking', 'android');
+  before.loadTour(stops, 'walking');
+  before.setStopOrder(['A', 'C', 'B']);
+  before.markReached('A');
+  const saved = before.progress();
+
+  const after = new LocationService('walking', 'android');
+  after.loadTour(stops, 'walking');
+  eq('LocationService progress survives a round trip', [after.restoreProgress(saved.order, saved.passed), after.nextWaypointId()], [true, 'C']);
+
+  // Android, task still registered (the OS restarted it): ADOPT, touch nothing.
+  resetLocationCalls();
+  const running = new LocationService('walking', 'ios');
+  running.loadTour(stops, 'walking');
+  await running.startBackground(); // stands in for the task the OS restarted
+  __setAppForegrounded(false); // the restarted process is headless: no UI
+  const beforeAdopt = locationCalls.length;
+  const tiers: string[] = [];
+  after.setCallbacks({ onSamplingChange: (t) => tiers.push(t) });
+  await after.resumeTracking();
+  eq('Android resume with the task running: adopted - no stop, no start (a start would throw in the background)', locationCalls.slice(beforeAdopt), []);
+  eq('...and the pinned tier is reported', tiers, ['fine']);
+
+  // Android, no task: a normal start, which only works in the foreground.
+  resetLocationCalls();
+  const cold = new LocationService('walking', 'android');
+  cold.loadTour(stops, 'walking');
+  let threw = false;
+  __setAppForegrounded(false);
+  try { await cold.resumeTracking(); } catch { threw = true; }
+  assert('Android resume with no task, in the background: throws (the caller tears down)', threw);
+  __setAppForegrounded(true);
+  await cold.resumeTracking();
+  eq('...in the foreground: starts the task', locationCalls.map((c) => c.kind), ['background-start']);
+  await cold.stopBackground();
+
+  resetLocationCalls();
+  const ios = new LocationService('walking', 'ios');
+  ios.loadTour(stops, 'walking');
+  await ios.resumeTracking();
+  eq('iOS resume: the foreground watcher, as start() opens it', locationCalls.map((c) => c.kind), ['watch']);
+  await ios.stop();
+  resetLocationCalls();
 }
 
 heading('Epic 13: Android - one persistent task, pinned to fine');

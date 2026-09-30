@@ -54,6 +54,28 @@ export class StopSequence {
    * move on, and re-arming 2 afterwards would put the tour back behind them.
    * Reaching a stop already passed changes nothing.
    */
+  /** The passed stops, in visiting order. For the session checkpoint (Epic 13). */
+  passedIds(): string[] {
+    return this.order.filter((id) => this.passed.has(id));
+  }
+
+  /**
+   * Put back exactly the order and passed set a checkpoint recorded (Epic 13).
+   *
+   * Not reach() in a loop: after a reorder the passed stops need not be a
+   * prefix of the order, and reach() would pass everything before each one.
+   * All-or-nothing: refused (false, nothing changed) unless `order` names
+   * exactly these stops and `passed` only stops among them.
+   */
+  restore(order: readonly string[], passed: readonly string[]): boolean {
+    const known = new Set(this.order);
+    if (!passed.every((id) => known.has(id))) return false;
+    if (!this.reorder(order)) return false;
+    this.passed.clear();
+    for (const id of passed) this.passed.add(id);
+    return true;
+  }
+
   reach(id: string): void {
     const index = this.order.indexOf(id);
     if (index === -1 || this.passed.has(id)) return;

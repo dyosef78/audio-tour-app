@@ -102,6 +102,8 @@ export interface TourSessionActions {
   setPlaybackError: (message: string | null) => void;
   setPlayback: (snapshot: { isPlaying: boolean; positionSeconds: number; durationSeconds: number }) => void;
   markEntered: (waypointId: string) => void;
+  /** Epic 13: the visited stops of a session resumed from its checkpoint. */
+  restoreVisited: (waypointIds: readonly string[]) => void;
   markExited: (waypointId: string) => void;
   startDeepDive: (waypointId: string) => void;
   endDeepDive: () => void;
@@ -171,6 +173,12 @@ export const useTourSession = create<TourSessionState & TourSessionActions>((set
         ? { playbackError: null }
         : { playbackError, isPlaying: false, positionSeconds: 0, durationSeconds: 0 },
     ),
+
+  restoreVisited: (waypointIds) =>
+    set((s) => {
+      const known = new Set(s.waypoints.map((w) => w.id));
+      return { visitedWaypointIds: waypointIds.filter((id) => known.has(id)) };
+    }),
 
   markEntered: (waypointId) =>
     set((s) => {

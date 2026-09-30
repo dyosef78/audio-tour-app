@@ -200,6 +200,21 @@ export class LocationService {
     return this.sequence.ids();
   }
 
+  /** Visiting order and passed stops, for the session checkpoint (Epic 13). */
+  progress(): { order: string[]; passed: string[] } {
+    return { order: [...this.sequence.ids()], passed: this.sequence.passedIds() };
+  }
+
+  /**
+   * Resume where a checkpoint left off (Epic 13). All-or-nothing; false if the
+   * recorded order or passed set do not fit the loaded stops. Zone state
+   * starts clear: a passed stop the user still stands in cannot fire again,
+   * because only the armed stop is ever entered.
+   */
+  restoreProgress(order: readonly string[], passed: readonly string[]): boolean {
+    return this.sequence.restore(order, passed);
+  }
+
   // ---------------------------------------------------------------------------
   // Permissions
   // ---------------------------------------------------------------------------
@@ -292,6 +307,25 @@ export class LocationService {
     await this.settled();
     this.watcher?.remove();
     this.watcher = null;
+  }
+
+  /**
+   * Resume tracking for a session rebuilt from a checkpoint (Epic 13).
+   *
+   * Android: if the tracking task is still registered - the OS restarted it
+   * after killing the process - ADOPT it without touching it. It still runs
+   * with the options start() gave it (fine tier, pinned), and restarting it
+   * from the background would throw ForegroundServiceStartNotAllowedException.
+   * Otherwise start() as normal, which only succeeds in the foreground; the
+   * caller handles the throw.
+   */
+  async resumeTracking(): Promise<void> {
+    if (this.persistentTask && (await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME))) {
+      this.trackingMode = 'background';
+      this.callbacks.onSamplingChange?.(this.currentTier, this.profile[this.currentTier]);
+      return;
+    }
+    await this.start();
   }
 
   /**

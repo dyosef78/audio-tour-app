@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useState } from 'react';
 import { ActivityIndicator, Alert, Pressable, StyleSheet, Text, View } from 'react-native';
 
 import TourMap from '../components/TourMap';
-import { tourSession } from '../session/TourSessionController';
+import { SessionStartError, tourSession } from '../session/TourSessionController';
 import { useTourSession } from '../session/tourSessionStore';
 import type { ActiveTourScreenProps } from '../navigation/types';
 import type { RouteSource } from '../routing/routeDecision';
@@ -54,7 +54,17 @@ export default function ActiveTourScreen({ route, navigation }: ActiveTourScreen
   // Requests a start; a no-op if this tour is already running. Safe under
   // StrictMode's mount/unmount/remount precisely because it is idempotent.
   useEffect(() => {
-    void tourSession.startSession(tourId, title ?? 'Tour');
+    tourSession.startSession(tourId, title ?? 'Tour').catch((err: unknown) => {
+      // Epic 13, Directive 2. A SessionStartError arrives AFTER the controller
+      // tore down and put its message in the store, which renders the error
+      // view below. Anything else is a controller bug: still never leave the
+      // screen on "Starting tour...".
+      if (err instanceof SessionStartError) return;
+      console.error('[ActiveTour] start rejected unexpectedly:', err);
+      if (useTourSession.getState().status === 'starting') {
+        useTourSession.getState().sessionFailed('The tour could not start because of an unexpected error. Go back and try again.');
+      }
+    });
     // Intentionally no cleanup - unmounting a screen must not end the session.
   }, [tourId, title]);
 

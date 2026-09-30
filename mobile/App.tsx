@@ -10,8 +10,9 @@ import { tourSession } from './src/session/TourSessionController';
 
 export default function App() {
   useEffect(() => {
-    // Clears any background location task a force-killed process left running.
-    // Per the PM decision this never resumes a tour - stop and clear, silently.
+    // Resumes a tour a killed process was running (Epic 13 - replaces the old
+    // "never resume" decision), or clears the tracking task it left behind.
+    // Never rejects: failures are logged inside.
     void tourSession.reconcileOnColdStart();
   }, []);
 

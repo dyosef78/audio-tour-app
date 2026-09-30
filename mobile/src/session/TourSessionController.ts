@@ -19,6 +19,8 @@ import { routePreferencesOf } from '../routing/routeRequest';
 import { selectStops } from '../routing/stopSelection';
 import { remoteTranscripts } from '../transcript/TranscriptRepository';
 import { routeManager } from './routing';
+import { decideResume } from './sessionCheckpoint';
+import { sessionCheckpoints } from './sessionCheckpointFile';
 import { useTourSession } from './tourSessionStore';
 import type { AudioTrack, LatLng, TransitMode, Waypoint } from '../types/domain';
 
@@ -35,9 +37,67 @@ import type { AudioTrack, LatLng, TransitMode, Waypoint } from '../types/domain'
  *     component mount.
  *   - A tour ends ONLY on an explicit endSession(). Reaching the final waypoint
  *     sets a prompt flag and nothing more.
- *   - On cold start, orphaned background tasks are stopped silently and never
- *     resumed, so a killed app cannot leave a ghost draining battery.
+ *   - A tour SURVIVES THE PROCESS (Epic 13, P0 - reverses the earlier "never
+ *     resume" decision). Its progress is checkpointed synchronously at every
+ *     change (sessionCheckpoint.ts). When Android restarts the tracking
+ *     service after killing the process, the first batch of fixes rebuilds the
+ *     session from the checkpoint - no UI needed - and tracking continues. An
+ *     app opened by the user does the same. Only a tour with no usable
+ *     checkpoint is stopped, so a killed app still cannot leave a ghost task.
+ *
+ * THE DEAD ZONE (Epic 13, Directive 1.3). Between the kill and the resumed
+ * session, three gaps, in order:
+ *   1. Android restarting the service. START_REDELIVER_INTENT restarts it about
+ *      a second after a first kill, with exponential backoff after repeated
+ *      kills, and an OEM battery manager may delay it or never do it. NO FIXES
+ *      EXIST in this gap: GPS is off. This is the real blind spot.
+ *   2. The JS engine cold-starting headless (bundle load and module init,
+ *      typically 1-3 s). Fixes are recorded but NOT lost: expo-task-manager
+ *      queues events natively until the task observer is ready
+ *      (TaskManagerInternalModule.mEventsQueue), then flushes them.
+ *   3. The resume itself (bundle read, audio session, one native call to adopt
+ *      the task). Fixes arriving meanwhile are held in pendingFixes and
+ *      replayed, in order, once the session exists.
+ * So gaps 2 and 3 only DELAY a narration; nothing is dropped. What is lost is
+ * the ground covered during gap 1. A walker crosses a 20 m zone in about 30 s,
+ * so a restart within seconds is harmless. If the whole armed zone is walked
+ * through during gap 1, that stop is missed and - strict sequencing (Epic 9) -
+ * blocks the stops after it until the manual trigger. A narration that was
+ * playing at the kill is not resumed.
  */
+
+/** Stages of starting a tour that can fail for reasons outside the app. */
+export type StartStage = 'permissions' | 'audio' | 'location' | 'unexpected';
+
+const START_FAILURE_MESSAGE: Record<StartStage, string> = {
+  permissions: 'The system refused the location permission request. Nothing was started. Close and reopen the app, then try again.',
+  audio: 'The audio engine failed to start, so narration could not play. Nothing was started. Close and reopen the app, then try again.',
+  location: 'Location tracking could not start. Keep the app open and try again.',
+  unexpected: 'The tour could not start because of an unexpected error. Nothing was started. Go back and try again.',
+};
+
+/**
+ * Thrown by startSession() after the controller has ALREADY torn down
+ * whatever started and set the store to 'error' with `userMessage` (Epic 13,
+ * Directive 2). The screen catches it; no "Starting tour..." is left behind.
+ */
+export class SessionStartError extends Error {
+  readonly userMessage: string;
+  readonly stage: StartStage;
+  readonly reason: unknown;
+  constructor(stage: StartStage, reason: unknown) {
+    super(`tour start failed at ${stage}: ${reason instanceof Error ? reason.message : String(reason)}`);
+    this.name = 'SessionStartError';
+    this.stage = stage;
+    this.reason = reason;
+    this.userMessage = START_FAILURE_MESSAGE[stage];
+  }
+}
+
+/** Fixes held while a session is being rebuilt; the oldest go first past this. */
+const MAX_PENDING_FIXES = 200;
+
+type ResumeOrigin = 'background_task' | 'cold_start';
 /**
  * Stamped onto every telemetry event.
  *
@@ -58,8 +118,14 @@ class TourSessionController {
   private location: LocationService | null = null;
   private readonly audio = new AudioService();
   private appStateSub: { remove: () => void } | null = null;
-  /** Serialises start/end so overlapping calls cannot interleave teardown. */
+  /** Serialises start/end/resume so overlapping calls cannot interleave teardown. */
   private transition: Promise<void> = Promise.resolve();
+  /** When the running tour was first started; carried into every checkpoint. */
+  private sessionStartedAt = 0;
+  /** Background fixes that arrived with no session in memory (see onBackgroundFixes). */
+  private pendingFixes: { fix: LatLng; timestamp: number }[] = [];
+  /** A background-task resume is queued; later batches only add to pendingFixes. */
+  private resumeQueued = false;
 
   // ---------------------------------------------------------------------------
   // Cold start
@@ -67,14 +133,26 @@ class TourSessionController {
 
   /**
    * Call once at app entry, before any screen renders.
-   * Clears anything a previous process left running.
+   *
+   * Resumes a tour a previous process left running (Epic 13), or, when there is
+   * none worth resuming, clears what it left behind. Queued like every other
+   * transition: if the background task already resumed the tour in this
+   * process, that session is kept as it is.
    */
   async reconcileOnColdStart(): Promise<void> {
-    const stopped = await stopOrphanedLocationUpdates();
-    if (stopped) {
-      console.warn('[TourSession] stopped orphaned background location task from a previous run');
+    try {
+      await this.enqueue(async () => {
+        if (this.location) return;
+        if (await this.doResume('cold_start')) return;
+        const stopped = await stopOrphanedLocationUpdates();
+        if (stopped) {
+          console.warn('[TourSession] stopped orphaned background location task from a previous run');
+        }
+        useTourSession.getState().reset();
+      });
+    } catch (err) {
+      console.error('[TourSession] cold-start reconciliation failed:', err);
     }
-    useTourSession.getState().reset();
 
     // Telemetry starts with the app, not with a tour (TASK-506). The commonest
     // delivery moment is an app opened on hotel WiFi hours AFTER the walk, so a
@@ -101,7 +179,29 @@ class TourSessionController {
    * React 19 StrictMode mounting, unmounting and remounting in development.
    */
   async startSession(tourId: string, tourTitle: string): Promise<void> {
-    return this.enqueue(() => this.doStart(tourId, tourTitle));
+    return this.enqueue(async () => {
+      try {
+        await this.doStart(tourId, tourTitle);
+      } catch (err) {
+        if (err instanceof SessionStartError) throw err;
+        // Anything the guarded stages did not anticipate gets the same
+        // treatment: torn down, reported in the store, rethrown.
+        await this.failStart('unexpected', err);
+      }
+    });
+  }
+
+  /**
+   * Tear down, put the reason in the store, and throw (Epic 13, Directive 2).
+   * The ONE way a start fails with an exception, so every such failure leaves
+   * the same state: no hardware held, no checkpoint, status 'error'.
+   */
+  private async failStart(stage: StartStage, reason: unknown): Promise<never> {
+    const error = new SessionStartError(stage, reason);
+    console.error(`[TourSession] ${error.message}`, reason);
+    await this.doEnd();
+    useTourSession.getState().sessionFailed(error.userMessage);
+    throw error;
   }
 
   /**
@@ -151,16 +251,19 @@ class TourSessionController {
 
     const service = new LocationService(transitMode);
     service.loadTour(selection.active, transitMode);
-    service.setCallbacks({
-      onLocation: (fix, accuracy) => useTourSession.getState().setFix(fix, accuracy),
-      onSamplingChange: (tier) => useTourSession.getState().setSamplingTier(tier),
-      onGeofence: (event) => {
-        void this.handleGeofence(event);
-      },
-    });
+    this.wireLocation(service);
 
-    const permissions = await service.requestPermissions();
+    // Each native stage is guarded (Epic 13, Directive 2): a bridge that throws
+    // must end in failStart - teardown, an error the screen shows, a rethrow -
+    // never in a rejected promise nobody awaits and a spinner that never ends.
+    let permissions: Awaited<ReturnType<LocationService['requestPermissions']>>;
+    try {
+      permissions = await service.requestPermissions();
+    } catch (err) {
+      return this.failStart('permissions', err);
+    }
     if (!permissions.foreground) {
+      // An answer, not a failure: the person said no. Nothing was started.
       useTourSession
         .getState()
         .sessionFailed('Location permission is required to run a tour.');
@@ -168,45 +271,26 @@ class TourSessionController {
     }
 
     this.location = service;
-
-    // Mirror the player's own status into the store so the transport UI is
-    // honest about state we did not initiate - a track ending, or the OS
-    // pausing us for an interruption.
-    this.audio.setOnStatus(({ isPlaying, positionSeconds, durationSeconds }) => {
-      useTourSession.getState().setPlayback({ isPlaying, positionSeconds, durationSeconds });
-    });
-
-    // A decode failure must reach the UI, not just the console. setPlaybackError
-    // resets the transport as well, so the panel cannot keep claiming "playing".
-    this.audio.setOnError((err) => {
-      useTourSession.getState().setPlaybackError(err.message);
-    });
-
-    // Telemetry is attached before the first geofence can fire, and detached in
-    // doEnd(). audio_started is the denominator of the completion KPI, so a
-    // waypoint triggering between start() and this line would skew the rate.
-    this.audio.setTelemetry(telemetry);
+    this.sessionStartedAt = Date.now();
+    this.wireAudio();
     void telemetry.record('tour_started', { tourId });
 
-    await this.audio.configureSession();
+    try {
+      await this.audio.configureSession();
+    } catch (err) {
+      return this.failStart('audio', err);
+    }
     try {
       await service.start();
     } catch (err) {
       // Android can refuse here: its location foreground service only starts
       // while the app is in the foreground, so switching away mid-start throws
-      // (LocationService header). Release whatever did start, then tell the
-      // user - a tour that cannot track must not look like one that is running.
-      console.error('[TourSession] location tracking could not start:', err);
-      await this.doEnd();
-      useTourSession
-        .getState()
-        .sessionFailed('Location tracking could not start. Keep the app open and try again.');
-      return;
+      // (LocationService header). A tour that cannot track must not look like
+      // one that is running.
+      return this.failStart('location', err);
     }
 
-    this.appStateSub = AppState.addEventListener('change', (next) => {
-      void this.handleAppStateChange(next);
-    });
+    this.attachAppState();
 
     useTourSession.getState().sessionStarted({
       waypoints: selection.active,
@@ -230,6 +314,200 @@ class TourSessionController {
       bundleHash: TourBundleRepository.readManifest(tourId)?.bundle_version_hash ?? null,
       onStopOrder: (waypointIds) => this.adoptStopOrder(service, waypointIds),
     });
+
+    // Last: the checkpoint describes a session that has fully started.
+    this.saveCheckpoint();
+  }
+
+  /** The LocationService callbacks, identical for a fresh start and a resume. */
+  private wireLocation(service: LocationService): void {
+    service.setCallbacks({
+      onLocation: (fix, accuracy) => useTourSession.getState().setFix(fix, accuracy),
+      onSamplingChange: (tier) => useTourSession.getState().setSamplingTier(tier),
+      onGeofence: (event) => {
+        void this.handleGeofence(event);
+      },
+    });
+  }
+
+  /** The AudioService hooks, identical for a fresh start and a resume. */
+  private wireAudio(): void {
+    // Mirror the player's own status into the store so the transport UI is
+    // honest about state we did not initiate - a track ending, or the OS
+    // pausing us for an interruption.
+    this.audio.setOnStatus(({ isPlaying, positionSeconds, durationSeconds }) => {
+      useTourSession.getState().setPlayback({ isPlaying, positionSeconds, durationSeconds });
+    });
+
+    // A decode failure must reach the UI, not just the console. setPlaybackError
+    // resets the transport as well, so the panel cannot keep claiming "playing".
+    this.audio.setOnError((err) => {
+      useTourSession.getState().setPlaybackError(err.message);
+    });
+
+    // Telemetry is attached before the first geofence can fire, and detached in
+    // doEnd(). audio_started is the denominator of the completion KPI, so a
+    // waypoint triggering between start() and this line would skew the rate.
+    this.audio.setTelemetry(telemetry);
+  }
+
+  private attachAppState(): void {
+    this.appStateSub?.remove();
+    this.appStateSub = AppState.addEventListener('change', (next) => {
+      void this.handleAppStateChange(next);
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Checkpoint and resume (Epic 13)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Record the running tour, synchronously, so a killed process can resume it.
+   *
+   * Never throws: a disk that refuses the write must not stop the narration
+   * the user is standing in. It is reported as an error instead, because the
+   * consequence - this tour will not survive a kill - is real.
+   */
+  private saveCheckpoint(): void {
+    const service = this.location;
+    const s = useTourSession.getState();
+    if (!service || !s.tourId || !s.transitMode) return;
+    const { order, passed } = service.progress();
+    try {
+      sessionCheckpoints.save({
+        v: 1,
+        tourId: s.tourId,
+        tourTitle: s.tourTitle ?? 'Tour',
+        transitMode: s.transitMode,
+        activeIds: s.waypoints.map((w) => w.id),
+        skippedIds: [...s.skippedWaypointIds],
+        order,
+        passed,
+        visited: [...s.visitedWaypointIds],
+        backgroundPermission: s.backgroundPermission,
+        notificationPermission: s.notificationPermission,
+        startedAt: this.sessionStartedAt,
+        savedAt: Date.now(),
+      });
+    } catch (err) {
+      console.error('[TourSession] checkpoint NOT written - this tour cannot resume after a process kill:', err);
+    }
+  }
+
+  private clearCheckpoint(): void {
+    try {
+      sessionCheckpoints.clear();
+    } catch (err) {
+      // Reported, not thrown: teardown must finish. The age limit in
+      // decideResume stops a stale checkpoint resuming forever.
+      console.error('[TourSession] checkpoint could not be deleted; an ended tour may resume on the next launch:', err);
+    }
+  }
+
+  /**
+   * Rebuild the session a previous process was running. True when a session
+   * is running afterwards. Never throws: every failure is logged, torn down
+   * and reported as false, so the caller can stop an orphaned task.
+   *
+   * A background-task resume that fails KEEPS the checkpoint, so opening the
+   * app can try once more in the foreground; a cold-start resume that fails
+   * deletes it, so a broken checkpoint cannot fail every launch.
+   */
+  private async doResume(origin: ResumeOrigin): Promise<boolean> {
+    if (this.location) return true;
+
+    const decision = decideResume(sessionCheckpoints.load(), Date.now());
+    if (decision.kind === 'nothing') return false;
+    const discard = (reason: string): false => {
+      console.warn(`[TourSession] saved tour not resumed (${origin}): ${reason}`);
+      this.clearCheckpoint();
+      return false;
+    };
+    if (decision.kind === 'discard') return discard(decision.reason);
+    const cp = decision.checkpoint;
+
+    const waypoints = TourBundleRepository.loadWaypoints(cp.tourId);
+    if (!waypoints) return discard('the tour is no longer downloaded');
+    const byId = new Map(waypoints.map((w) => [w.id, w]));
+    const active = cp.activeIds.map((id) => byId.get(id));
+    if (!active.every((w): w is Waypoint => w !== undefined)) {
+      return discard('the downloaded tour no longer has every stop (updated since?)');
+    }
+
+    const service = new LocationService(cp.transitMode);
+    service.loadTour(active, cp.transitMode);
+    if (!service.restoreProgress(cp.order, cp.passed)) return discard('saved progress does not fit the stops');
+
+    useTourSession.getState().beginStart(cp.tourId, cp.tourTitle);
+    this.wireLocation(service);
+    this.location = service;
+    this.sessionStartedAt = cp.startedAt;
+    this.wireAudio();
+
+    const fail = async (stage: 'audio' | 'location', err: unknown): Promise<false> => {
+      console.error(`[TourSession] resume (${origin}) failed at ${stage}:`, err);
+      await this.doEnd({ keepCheckpoint: origin === 'background_task' });
+      return false;
+    };
+    try {
+      await this.audio.configureSession();
+    } catch (err) {
+      return fail('audio', err);
+    }
+    try {
+      await service.resumeTracking();
+    } catch (err) {
+      return fail('location', err);
+    }
+    if (!service.persistentTask) this.attachAppState();
+
+    const store = useTourSession.getState();
+    store.sessionStarted({
+      waypoints: active,
+      transitMode: cp.transitMode,
+      backgroundPermission: cp.backgroundPermission,
+      notificationPermission: cp.notificationPermission,
+      skippedWaypointIds: cp.skippedIds,
+    });
+    store.setStopOrder(cp.order);
+    store.restoreVisited(cp.visited);
+    // Offline route only: a live fetch could adopt a DIFFERENT order than the
+    // one the walk has been following. The bundled line, or straight joins.
+    const staticRoute = this.loadStaticRoute(cp.tourId, active, cp.transitMode);
+    store.setRoute(staticRoute ? { source: 'static', points: staticRoute } : { source: 'straight', points: null });
+
+    this.saveCheckpoint();
+    console.warn(
+      `[TourSession] resumed tour ${cp.tourId} (${origin}): ${cp.passed.length}/${cp.activeIds.length} stops passed, next ${service.nextWaypointId() ?? 'none'}`,
+    );
+    return true;
+  }
+
+  /**
+   * A batch of background fixes found no session in memory: Android restarted
+   * the tracking service in a new process. Rebuild the session and replay the
+   * held fixes; with nothing to rebuild, stop the task - it is a zombie.
+   *
+   * pendingFixes is drained and resumeQueued cleared in ONE synchronous block
+   * at the end, so a batch arriving at any await in between is either held
+   * (and replayed here) or finds the session - never lost between the two.
+   */
+  private async resumeFromBackgroundTask(): Promise<void> {
+    let resumed = this.location !== null;
+    try {
+      if (!resumed) resumed = await this.doResume('background_task');
+      if (!resumed) {
+        const stopped = await stopOrphanedLocationUpdates();
+        console.warn(`[TourSession] background fixes with no tour to resume; tracking task ${stopped ? 'stopped' : 'was not running'}`);
+      }
+    } finally {
+      const pending = this.pendingFixes;
+      this.pendingFixes = [];
+      this.resumeQueued = false;
+      const service = this.location;
+      if (service) for (const p of pending) service.onFix(p.fix, null, p.timestamp);
+    }
   }
 
   /**
@@ -248,6 +526,7 @@ class TourSessionController {
       return;
     }
     useTourSession.getState().setStopOrder(waypointIds);
+    this.saveCheckpoint();
     if (before !== waypointIds.join(',')) {
       console.log(`[TourSession] narration follows the routed order; next stop ${service.nextWaypointId() ?? 'none'}`);
     }
@@ -278,6 +557,9 @@ class TourSessionController {
 
     if (event.type === 'enter') {
       useTourSession.getState().markEntered(waypoint.id);
+      // Synchronously, before any await: the stop is passed in the engine NOW,
+      // and a kill during the narration below must not replay it on resume.
+      this.saveCheckpoint();
 
       // Re-entering the stop whose Deep Dive is playing must not restart the
       // short narration over it: the listener is plainly still at that stop.
@@ -546,11 +828,28 @@ class TourSessionController {
     }
   }
 
-  /** Background task fixes, delivered outside React entirely. */
+  /**
+   * Background task fixes, delivered outside React entirely.
+   *
+   * With no session in memory these are held and a resume is queued (Epic 13):
+   * Android restarted the tracking service in a fresh process. See
+   * resumeFromBackgroundTask for why nothing falls between the two.
+   */
   onBackgroundFixes(fixes: LatLng[], timestamp: number): void {
     const service = this.location;
-    if (!service) return;
-    for (const fix of fixes) service.onFix(fix, null, timestamp);
+    if (service) {
+      for (const fix of fixes) service.onFix(fix, null, timestamp);
+      return;
+    }
+    for (const fix of fixes) this.pendingFixes.push({ fix, timestamp });
+    if (this.pendingFixes.length > MAX_PENDING_FIXES) {
+      this.pendingFixes.splice(0, this.pendingFixes.length - MAX_PENDING_FIXES);
+    }
+    if (this.resumeQueued) return;
+    this.resumeQueued = true;
+    this.enqueue(() => this.resumeFromBackgroundTask()).catch((err) => {
+      console.error('[TourSession] background resume failed:', err);
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -562,7 +861,15 @@ class TourSessionController {
     return this.enqueue(() => this.doEnd());
   }
 
-  private async doEnd(): Promise<void> {
+  /**
+   * `keepCheckpoint`: tear down this process's session but leave the tour
+   * resumable - only for a background resume that failed (doResume).
+   */
+  private async doEnd(options: { keepCheckpoint?: boolean } = {}): Promise<void> {
+    // FIRST, synchronously: a kill anywhere in the awaits below must not let a
+    // tour the user ended come back on the next launch.
+    if (!options.keepCheckpoint) this.clearCheckpoint();
+
     this.appStateSub?.remove();
     this.appStateSub = null;
 
@@ -606,3 +913,7 @@ export const tourSession = new TourSessionController();
 registerBackgroundLocationTask((fixes, timestamp) => {
   tourSession.onBackgroundFixes(fixes, timestamp);
 });
+// This is the entry point Android's restarted tracking service reaches: the OS
+// re-runs index.ts headless, which imports this module, which registers the
+// task above. The UI never mounts, so this handler - not App - resumes the
+// tour (onBackgroundFixes -> resumeFromBackgroundTask).
