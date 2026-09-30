@@ -149,6 +149,28 @@ Deno.test('no valid user session -> 401, nothing deleted', async () => {
   }
 });
 
+Deno.test('Epic 13: a genuine token whose user is gone -> 200 already_gone, proven by GoTrue, nothing called', async () => {
+  const h = harness();
+  h.deps.authenticate = () => Promise.resolve({ outcome: 'account_gone' });
+  const res = await handleDeleteAccount(post({ apple_authorization_code: 'c' }), h.deps);
+  assertEquals(res.status, 200);
+  const body = await res.json();
+  assertEquals([body.deleted, body.already_gone, body.apple_revocation_reason, body.google_revocation_reason], [true, true, 'account_already_deleted', 'account_already_deleted']);
+  assertEquals(h.calls, [], 'no admin check, no delete, no revocation');
+  assertEquals(h.logs.map((l) => l.event), ['account_already_gone']);
+});
+
+Deno.test('Epic 13: every rejected authentication is a logged 401 that deletes nothing', async () => {
+  for (const auth of [{ outcome: 'rejected' as const, reason: 'gotrue_bad_jwt' }, null]) {
+    const h = harness();
+    h.deps.authenticate = () => Promise.resolve(auth);
+    const res = await handleDeleteAccount(post(), h.deps);
+    assertEquals(res.status, 401);
+    assertEquals(h.deleted, []);
+    assertEquals(h.logs.find((l) => l.event === 'delete_account_unauthenticated')?.reason, auth ? 'gotrue_bad_jwt' : 'unspecified');
+  }
+});
+
 Deno.test('an authentication backend that throws is a 401, not a 500 or a deletion', async () => {
   const h = harness();
   h.deps.authenticate = () => Promise.reject(new Error('GoTrue down'));

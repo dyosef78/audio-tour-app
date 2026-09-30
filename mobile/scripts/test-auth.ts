@@ -566,9 +566,21 @@ for (const [label, apple, code] of APPLE_FAILURES) {
   assert('...and the session is dropped directly', h.calls.includes('drop'));
 }
 {
+  // Epic 13 field QA: a 401 signed a live account out as if deleted.
   const h = deletionHarness({ provider: 'google', invoke: { status: 401, data: null } });
-  await settle(h.deps);
-  eq('401 (session already dead): the same full teardown', h.calls.slice(2), ['purge', 'signOut', 'drop']);
+  eq('401: NOT deleted - session_expired, with the evidence', (await settle(h.deps)).outcome, { kind: 'failed', reason: 'session_expired', detail: 'http_401' });
+  assert('...and the session is NOT torn down', !h.calls.includes('purge') && !h.calls.includes('signOut') && !h.calls.includes('drop'), h.calls.join(','));
+}
+{
+  const h = deletionHarness({ provider: 'google', invoke: { noToken: true } });
+  eq('no access token: nothing sent counts as a failure, never a deletion', (await settle(h.deps)).outcome, { kind: 'failed', reason: 'session_expired', detail: 'no_token' });
+  assert('...and the device stays signed in', !h.calls.includes('purge') && !h.calls.includes('signOut'));
+}
+{
+  // A retry after a lost answer: the SERVER proves the earlier deletion.
+  const h = deletionHarness({ provider: 'google', invoke: { status: 200, data: { deleted: true, already_gone: true, google_revocation_reason: 'account_already_deleted' } } });
+  const { outcome } = await settle(h.deps);
+  eq('200 already_gone -> deleted, and only then torn down', [outcome.kind, h.calls.slice(-3)], ['deleted', ['purge', 'signOut', 'drop']]);
 }
 {
   const h = deletionHarness({ provider: 'apple', invoke: { status: 200, data: { deleted: true } } });
@@ -605,11 +617,7 @@ for (const [label, apple, code] of APPLE_FAILURES) {
 }
 {
   const h = deletionHarness({ provider: 'google', invoke: { status: 401, data: null }, drop: 'throw' });
-  eq(
-    '401 with a failed storage drop -> session_expired, carrying the teardown result',
-    (await settle(h.deps)).outcome,
-    { kind: 'failed', reason: 'session_expired', detail: 'local teardown incomplete' },
-  );
+  eq('401 never reaches the storage drop at all', [(await settle(h.deps)).outcome, h.calls.includes('drop')], [{ kind: 'failed', reason: 'session_expired', detail: 'http_401' }, false]);
 }
 
 heading('Account-route guard (auth-driven navigation)');
@@ -706,15 +714,15 @@ for (const [label, googleToken, reason] of TOKEN_FAILURES) {
 {
   const h = deletionHarness({ provider: 'google', invoke: { status: 401, data: null }, signOut: 'hang' });
   const { outcome, ms } = await settle(h.deps);
-  eq('HANG: 401 then a stalled sign-out -> session_expired, promptly, and the stall is REPORTED', outcome, { kind: 'failed', reason: 'session_expired', detail: 'local teardown forced' });
-  assert('...bounded', ms < FAST.signOutMs * 2 + 150, `${ms} ms`);
+  eq('HANG: a stalled sign-out cannot touch a 401 - it is never called', outcome, { kind: 'failed', reason: 'session_expired', detail: 'http_401' });
+  assert('...and it answers at once', ms < 150, `${ms} ms`);
 }
 
 // --- Every server answer maps to an outcome ------------------------------------
 const cases: [string, InvokeResult | 'throw', DeleteAccountOutcome][] = [
   ['offline', { networkError: 'Network request failed' }, { kind: 'failed', reason: 'offline' }],
   ['403 admin', { status: 403, data: null }, { kind: 'failed', reason: 'admin_account' }],
-  ['401 dead session', { status: 401, data: null }, { kind: 'failed', reason: 'session_expired' }],
+  ['401 dead session', { status: 401, data: null }, { kind: 'failed', reason: 'session_expired', detail: 'http_401' }],
   ['503 try_again (nothing deleted)', { status: 503, data: null }, { kind: 'failed', reason: 'server' }],
   ['504 deletion_unconfirmed', { status: 504, data: null }, { kind: 'failed', reason: 'timeout' }],
   ['500', { status: 500, data: null }, { kind: 'failed', reason: 'server' }],
@@ -726,8 +734,9 @@ const cases: [string, InvokeResult | 'throw', DeleteAccountOutcome][] = [
 for (const [label, invoke, expected] of cases) {
   const h = deletionHarness({ provider: 'google', invoke });
   eq(`${label} -> ${expected.kind === 'failed' ? expected.reason : expected.kind}`, (await settle(h.deps)).outcome, expected);
-  if (expected.kind === 'failed' && expected.reason !== 'session_expired') {
-    assert('...and the device stays signed in', !h.calls.includes('signOut'));
+  if (expected.kind === 'failed') {
+    // Every failure, 401 included (Epic 13): only a confirmed deletion signs out.
+    assert('...and the device stays signed in', !h.calls.includes('signOut') && !h.calls.includes('purge'));
   }
 }
 

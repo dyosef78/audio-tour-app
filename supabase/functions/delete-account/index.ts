@@ -45,13 +45,18 @@ const admin = supabaseUrl && serviceKey ? createClient(supabaseUrl, serviceKey, 
 const authenticate: DeleteAccountDeps['authenticate'] = async (request) => {
   const header = request.headers.get('Authorization') ?? '';
   const token = header.startsWith('Bearer ') ? header.slice('Bearer '.length).trim() : '';
-  if (!supabaseUrl || !anonKey || token === '' || token === anonKey) return null;
+  if (!supabaseUrl || !anonKey) return { outcome: 'rejected', reason: 'not_configured' };
+  if (token === '') return { outcome: 'rejected', reason: 'no_bearer_token' };
+  if (token === anonKey) return { outcome: 'rejected', reason: 'anon_key_not_a_session' };
 
   // getUser(jwt) asks GoTrue, so a revoked session or an already deleted user
-  // is refused here - not just a token with a valid signature.
+  // is refused here - not just a token with a valid signature. GoTrue checks
+  // the signature BEFORE looking the user up, so user_not_found can only come
+  // from a token we issued: its account is gone, which is proof of deletion.
   const client = createClient(supabaseUrl, anonKey, clientOptions);
   const { data, error } = await client.auth.getUser(token);
-  if (error || !data.user) return null;
+  if (error?.code === 'user_not_found') return { outcome: 'account_gone' };
+  if (error || !data.user) return { outcome: 'rejected', reason: `gotrue_${error?.code ?? error?.status ?? 'no_user'}` };
 
   const subjectsFor = (provider: string): string[] =>
     (data.user.identities ?? [])

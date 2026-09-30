@@ -19,8 +19,15 @@
  *          "google_revocation": "scheduled" | "not_attempted",
  *          "google_revocation_reason": "scheduled" | "no_token_in_request"
  *                                      | "revocation_not_configured" | "no_google_identity_on_account" }
+ *        With `"already_gone": true` when the token is genuine but its user no
+ *        longer exists (GoTrue user_not_found): the PROOF a lost answer's
+ *        deletion happened, so a retry is answered from the server's state, not
+ *        the app's guess. Both revocation reasons are then "account_already_deleted".
  *   400  malformed body
- *   401  not_signed_in          no valid user session (the anon key is not one)
+ *   401  not_signed_in          no valid user session (the anon key is not one).
+ *                               NOTHING was deleted - never read it as "already gone"
+ *                               (Epic 13 field QA: the app did, and signed a live
+ *                               account out as if deleted)
  *   403  admin_account          CMS administrators are removed by the team, not from the app
  *   405  not POST
  *   500  delete_failed          nothing was deleted; safe to retry
@@ -67,6 +74,13 @@
 import type { AppleRevoker } from './appleRevoke.ts';
 import type { GoogleRevoker } from './googleRevoke.ts';
 
+/**
+ * What authentication concluded. `account_gone`: GoTrue accepted the token's
+ * signature but its user does not exist - deleted. `rejected`: no usable
+ * session; `reason` is logged. A bare null is a rejection with no reason.
+ */
+export type AuthOutcome = AuthenticatedUser | { outcome: 'account_gone' } | { outcome: 'rejected'; reason: string } | null;
+
 export interface AuthenticatedUser {
   id: string;
   /** Apple `sub` values from the user's Apple identities; empty for other providers. */
@@ -92,7 +106,7 @@ export const DEFAULT_DEADLINES: StepDeadlines = {
 
 export interface DeleteAccountDeps {
   /** The user the request's bearer token belongs to, or null if it is not a valid user session. */
-  authenticate: (request: Request) => Promise<AuthenticatedUser | null>;
+  authenticate: (request: Request) => Promise<AuthOutcome>;
   isCmsAdmin: ((userId: string) => Promise<boolean>) | null;
   deleteUser: ((userId: string) => Promise<'deleted' | 'not_found'>) | null;
   appleRevoker: AppleRevoker | null;
@@ -164,18 +178,41 @@ export async function handleDeleteAccount(request: Request, deps: DeleteAccountD
   }
 
   // 1. Who is asking.
-  let user: AuthenticatedUser | null;
+  let auth: AuthOutcome;
   try {
-    user = await withDeadline(deps.authenticate(request), deadlines.authenticateMs, 'authenticate');
+    auth = await withDeadline(deps.authenticate(request), deadlines.authenticateMs, 'authenticate');
   } catch (cause) {
     if (cause instanceof StepTimeout) {
       log({ event: 'delete_account_step_timeout', step: cause.step });
       return fail(503, 'try_again', 'We could not verify your sign-in in time. Nothing was deleted; please try again.');
     }
     log({ event: 'delete_account_auth_failed', message: String(cause) });
-    user = null;
+    auth = { outcome: 'rejected', reason: 'authenticate_threw' };
   }
-  if (!user) return fail(401, 'not_signed_in', 'Sign in to delete your account.');
+  if (auth !== null && 'outcome' in auth && auth.outcome === 'account_gone') {
+    // Idempotency, proven rather than assumed: this is a retry after an answer
+    // that never reached the phone. Nothing left to delete or revoke.
+    log({ event: 'account_already_gone' });
+    return json(
+      200,
+      {
+        deleted: true,
+        already_gone: true,
+        apple_revocation: 'not_attempted',
+        apple_revocation_reason: 'account_already_deleted',
+        google_revocation: 'not_attempted',
+        google_revocation_reason: 'account_already_deleted',
+      },
+      idHeader,
+    );
+  }
+  if (auth === null || 'outcome' in auth) {
+    // Logged: a 401 used to leave no line at all, which is why the Epic 13
+    // "silent deletion" could not be traced from the server side.
+    log({ event: 'delete_account_unauthenticated', reason: auth === null ? 'unspecified' : auth.reason });
+    return fail(401, 'not_signed_in', 'Sign in to delete your account. Nothing was deleted.');
+  }
+  const user: AuthenticatedUser = auth;
   const parsed = await parseBody(request);
   if (!parsed.ok) return fail(400, 'invalid_request', parsed.message);
   // Both halves of each revocation decision on one line: whether the account

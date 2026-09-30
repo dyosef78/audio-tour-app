@@ -14,9 +14,9 @@ const FAILURE: Record<DeletionFailureReason, { title: string; message: string }>
     message: 'Connect to the internet and try again. Nothing has been deleted.',
   },
   session_expired: {
-    title: 'Signed out',
+    title: 'Account not deleted',
     message:
-      "Your sign-in had expired, so you've been signed out. If you'd already deleted your account, it's gone. Otherwise, sign in again from Settings and retry.",
+      "We couldn't verify your sign-in, so your account has NOT been deleted. Sign out from Settings, sign in again, then retry.",
   },
   admin_account: {
     title: "Can't delete this account",

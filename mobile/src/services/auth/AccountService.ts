@@ -159,7 +159,9 @@ async function accessTokenForRequest(): Promise<string | null> {
 async function invokeDelete(body: Record<string, unknown>, signal: AbortSignal): Promise<InvokeResult> {
   if (!isSupabaseConfigured) return { networkError: 'Supabase is not configured' };
   const token = await accessTokenForRequest();
-  if (!token) return { status: 401, data: null };
+  // Not a fake 401: no request goes out, and the flow must not read this as
+  // anything the server said (Epic 13 field QA).
+  if (!token) return { noToken: true };
 
   try {
     const response = await fetch(`${supabaseEndpoint.url}/functions/v1/${DELETE_FUNCTION}`, {

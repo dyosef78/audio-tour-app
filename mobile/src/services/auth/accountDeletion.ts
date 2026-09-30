@@ -30,6 +30,14 @@ export type { LocalTeardown } from './localTeardown';
  *   4. Only then is this device signed out (localTeardown.ts): UI purged
  *      synchronously first, supabase-js and storage each within `signOutMs`.
  *
+ * THE SESSION IS DESTROYED ONLY ON THE SERVER'S WORD (Epic 13 field QA). The
+ * one trigger is HTTP 200 with `deleted: true` - including `already_gone`,
+ * which the server now PROVES (GoTrue user_not_found) instead of this app
+ * guessing it. A 401 used to tear the session down as "most often already
+ * deleted": a tester's live account was signed out as if deleted while it
+ * survived in auth.users. A 401, and having no token to send at all, now
+ * leave the device signed in and say plainly that nothing was deleted.
+ *
  * INVARIANT: runAccountDeletion always settles, in bounded time, and never
  * rejects. Worst case after the Apple sheet: googleTokenMs + requestMs +
  * 2 x signOutMs (18 s; the last 3 s is a local-storage drop that is normally
@@ -55,7 +63,11 @@ export const DELETION_TIMEOUTS = {
 export type DeletionFailureReason =
   /** Never reached the server; nothing changed. */
   | 'offline'
-  /** The server did not accept the session; the device is now signed out. */
+  /**
+   * The server could not verify this sign-in (401), or the app had no access
+   * token to send. NOTHING was deleted and the device is still signed in: the
+   * person signs out and in again, then retries.
+   */
   | 'session_expired'
   /** A CMS administrator; removed by the team instead. */
   | 'admin_account'
@@ -140,7 +152,8 @@ export interface DeletionOptions {
   skipAppleConfirmation?: boolean;
 }
 
-export type InvokeResult = { status: number; data: unknown } | { networkError: string };
+/** `noToken`: no access token could be found, so no request was sent. */
+export type InvokeResult = { status: number; data: unknown } | { networkError: string } | { noToken: true };
 
 export interface AccountDeletionDeps extends TeardownSteps {
   /**
@@ -240,16 +253,17 @@ async function deletionFlow(
     log(`delete-account unreachable: ${result.networkError}`);
     return { kind: 'failed', reason: 'offline' };
   }
+  if ('noToken' in result) {
+    log('no access token to send; nothing sent, device stays signed in');
+    return { kind: 'failed', reason: 'session_expired', detail: 'no_token' };
+  }
 
   switch (result.status) {
     case 401:
-      // Most often: the account is already gone (a retry after a lost answer).
-      {
-        const teardown = await tearDownLocalSession(deps, timeouts, log);
-        return teardown === 'clean'
-          ? { kind: 'failed', reason: 'session_expired' }
-          : { kind: 'failed', reason: 'session_expired', detail: `local teardown ${teardown}` };
-      }
+      // NOT "already gone": the server could not verify the session, so it
+      // deleted nothing. A real earlier deletion comes back as 200 already_gone.
+      log('delete-account refused the session (401); nothing deleted, device stays signed in');
+      return { kind: 'failed', reason: 'session_expired', detail: 'http_401' };
     case 403:
       return { kind: 'failed', reason: 'admin_account' };
     case 504:

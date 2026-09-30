@@ -47,7 +47,39 @@ export function googleSignInConfigErrors(env: Record<string, string | undefined>
   return errors;
 }
 
+/**
+ * Epic 13 (PM directive, after the Android field crash of 30 Sep): an Android
+ * EAS build without the Maps key must FAIL. Without it the manifest carries no
+ * `com.google.android.geo.API_KEY`, and the Google Maps SDK throws
+ * IllegalStateException("API key not found") on the main thread the moment
+ * TourMap mounts - a native crash on every "Start Tour", not a blank map.
+ *
+ * Android only: iOS uses Apple Maps and never reads the key. Same scope as the
+ * Sign-In guard - EAS workers only, so `expo start`, prebuild and CI still run.
+ */
+export function mapsConfigErrors(env: Record<string, string | undefined>): string[] {
+  const value = env.GOOGLE_MAPS_API_KEY?.trim() ?? '';
+  if (value === '') return ['GOOGLE_MAPS_API_KEY is not set'];
+  // Every Google API key starts "AIza"; anything else is a pasted wrong value.
+  if (!value.startsWith('AIza')) return ['GOOGLE_MAPS_API_KEY does not look like a Google API key (expected "AIza...")'];
+  return [];
+}
+
 export default ({ config }: ConfigContext): ExpoConfig => {
+  if (process.env.EAS_BUILD === 'true' && process.env.EAS_BUILD_PLATFORM === 'android') {
+    const errors = mapsConfigErrors(process.env);
+    if (errors.length > 0) {
+      throw new Error(
+        '\n[app.config] EAS build refused: the Google Maps key is missing.\n' +
+          errors.map((e) => `  - ${e}\n`).join('') +
+          '  Without it every Android build crashes natively when a tour starts.\n' +
+          "  Set GOOGLE_MAPS_API_KEY as a SENSITIVE EAS environment variable for this build profile's\n" +
+          '  environment. Never put it in eas.json or app.json: both are committed to git.\n' +
+          `  Profile: ${process.env.EAS_BUILD_PROFILE ?? 'unknown'}.\n`,
+      );
+    }
+  }
+
   if (process.env.EAS_BUILD === 'true') {
     const errors = googleSignInConfigErrors(process.env);
     if (errors.length > 0) {
@@ -66,11 +98,12 @@ export default ({ config }: ConfigContext): ExpoConfig => {
   if (!apiKey) {
     // Warn rather than throw: this config is evaluated by `expo start`,
     // `expo config` and prebuild alike, and an iOS-only or Expo Go developer
-    // has no need of the key. Throwing would block them for nothing.
+    // has no need of the key. Throwing would block them for nothing. EAS
+    // Android builds never get here without it (mapsConfigErrors above).
     console.warn(
       '\n[app.config] GOOGLE_MAPS_API_KEY is not set.\n' +
-        '  Android builds will render a blank map. Add it to mobile/.env\n' +
-        '  (gitignored) or supply it as an EAS environment variable.\n' +
+        '  A local Android build will CRASH when a tour starts (the Maps SDK throws\n' +
+        '  "API key not found"). Add it to mobile/.env (gitignored).\n' +
         '  iOS is unaffected - it uses Apple Maps, which needs no key.\n',
     );
   }
