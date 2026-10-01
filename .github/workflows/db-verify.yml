@@ -80,6 +80,7 @@ jobs:
           eval "$(supabase status -o env)"
           export SUPABASE_URL="${API_URL:?supabase status did not report API_URL}"
           export SUPABASE_ANON_KEY="${ANON_KEY:?supabase status did not report ANON_KEY}"
+          export SUPABASE_SERVICE_ROLE_KEY="${SERVICE_ROLE_KEY:?supabase status did not report SERVICE_ROLE_KEY}"
           node backend/scripts/verify-bundle.ts
 
       # Generated types are committed, and a schema change that does not

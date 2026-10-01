@@ -18,7 +18,7 @@
  * checking as anon proves the mobile client can actually see it, which is the
  * thing that was broken twice.
  *
- * Usage:
+ * Usage (needs SUPABASE_ANON_KEY and SUPABASE_SERVICE_ROLE_KEY):
  *   supabase db reset
  *   node --env-file-if-exists=.env backend/scripts/verify-bundle.ts
  *
@@ -41,7 +41,18 @@ if (!ANON) {
   process.exit(1);
 }
 
+// service_role is used for ONE probe only - proving cms_upsert_tour still
+// resolves now that anon cannot see it (section 3). Every content check stays
+// on the anon client.
+const SERVICE = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+if (!SERVICE) {
+  console.error('SUPABASE_SERVICE_ROLE_KEY is not set. `supabase status` prints it (service_role key).');
+  process.exit(1);
+}
+
 const supabase = createClient(URL, ANON);
+const service = createClient(URL, SERVICE, { auth: { persistSession: false, autoRefreshToken: false } });
 
 let failures = 0;
 
@@ -308,23 +319,43 @@ async function main(): Promise<void> {
     'RLS is not denying writes - an insert succeeded',
   );
 
-  // 42501 specifically, not just "an error". TASK-603 dropped and recreated
-  // this function with new parameters; a leftover overload would ALSO error
-  // (PGRST203, ambiguous candidates) and pass a looser check while every real
-  // CMS call was broken.
-  const { error: rpcError } = await supabase.rpc('cms_upsert_tour', {
+  // Since 20261002120000 anon holds no EXECUTE on any cms_* function, so the
+  // refusal must come from the GRANT, before the body runs. PostgREST can
+  // report that two ways - the function hidden (PGRST202 / HTTP 404) or
+  // Postgres' "permission denied for function" (42501) - and both are
+  // accepted. What must NOT come back is the admin GUARD's 42501 ("Not
+  // authorised: CMS administrator required"): that means anon reached the
+  // function body, i.e. its grant is open again.
+  const probeArgs = {
     p_tour_id: null,
     p_title: 'ci probe',
     p_topology: 'in_city',
     p_transit_mode: 'walking',
     p_duration_minutes: 5,
     p_interests: ['history'],
-  });
+  };
+  const { error: rpcError, status: rpcStatus } = await supabase.rpc('cms_upsert_tour', probeArgs);
+  const hidden = rpcError?.code === 'PGRST202' || rpcStatus === 404;
+  const denied = rpcError?.code === '42501' && /permission denied for function/i.test(rpcError.message);
 
   check(
-    'anon calling cms_upsert_tour is refused as unauthorised (42501)',
-    rpcError?.code === '42501',
-    rpcError ? `${rpcError.code}: ${rpcError.message}` : 'the call SUCCEEDED as anon',
+    'anon calling cms_upsert_tour is refused at the GRANT layer, not by the admin guard',
+    hidden || denied,
+    rpcError ? `HTTP ${rpcStatus} ${rpcError.code}: ${rpcError.message}` : 'the call SUCCEEDED as anon',
+  );
+  console.log(`        (PostgREST answered HTTP ${rpcStatus} ${rpcError?.code ?? '-'}: ${rpcError?.message ?? ''})`);
+
+  // PGRST202 alone proves nothing: it is also what a dropped or re-signatured
+  // function returns. So prove the function still resolves - with exactly these
+  // arguments, and without an ambiguous overload (PGRST203, which TASK-603's
+  // DROP + CREATE once risked) - by calling it as service_role, which holds
+  // EXECUTE but is no CMS admin: it must reach the guard.
+  const { error: svcError } = await service.rpc('cms_upsert_tour', probeArgs);
+
+  check(
+    'cms_upsert_tour still resolves with these arguments and reaches the admin guard (service_role)',
+    svcError?.code === '42501' && /Not authorised/.test(svcError.message),
+    svcError ? `${svcError.code}: ${svcError.message}` : 'the call SUCCEEDED as service_role',
   );
 
   // --- Summary -------------------------------------------------------------

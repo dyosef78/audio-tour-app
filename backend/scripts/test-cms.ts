@@ -473,5 +473,59 @@ heading('TASK-1104: nothing in the schema can block deleting a user');
   }
 }
 
+// -----------------------------------------------------------------------------
+heading('Epic 15: no CMS function is executable by anon');
+// -----------------------------------------------------------------------------
+// Supabase grants EXECUTE on every new public function to anon BY NAME, so
+// `REVOKE ... FROM PUBLIC` alone leaves it open - which is how every cms_* RPC
+// shipped until 20261002120000. Replays the migrations in order and tracks, per
+// function, whether anon's grant is open at the end:
+//   * a fresh CREATE (first definition, or after a DROP) opens it - unless the
+//     default-privileges REVOKE has already run, after which functions are
+//     born closed;
+//   * CREATE OR REPLACE of an existing function keeps its ACL;
+//   * a REVOKE ... ON FUNCTION that names anon closes it.
+// The migration's own DO-block self-check proves the same thing on a real
+// database; this catches it at PR time, before anything is applied.
+{
+  const SEALED = (name: string): boolean => /^cms_\w+$/.test(name) || name === 'assert_cms_admin' || name === 'is_cms_admin';
+  const stream = migrationFiles.map((file) => read(file).replace(/--[^\n]*/g, '')).join('\n');
+
+  const closedByDefault = stream.search(
+    /ALTER\s+DEFAULT\s+PRIVILEGES\s+FOR\s+ROLE\s+postgres\s+IN\s+SCHEMA\s+public\s+REVOKE\s+EXECUTE\s+ON\s+FUNCTIONS\s+FROM\s+anon/i,
+  );
+  const events = [
+    ...stream.matchAll(/\b(CREATE\s+OR\s+REPLACE\s+FUNCTION|CREATE\s+FUNCTION|DROP\s+FUNCTION(?:\s+IF\s+EXISTS)?)\s+public\.(\w+)/gi),
+    ...stream.matchAll(/\bREVOKE\s+[^;]*?\s+ON\s+FUNCTION\s+public\.(\w+)\s*\([^)]*\)\s+FROM\s+([^;]+);/gi),
+  ].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+
+  const state = new Map<string, { exists: boolean; anonOpen: boolean }>();
+  for (const m of events) {
+    const at = m.index ?? 0;
+    if (/^REVOKE/i.test(m[0])) {
+      const s = state.get(m[1] as string);
+      if (s && /\banon\b/i.test(m[2] as string)) s.anonOpen = false;
+      continue;
+    }
+    const verb = (m[1] as string).toUpperCase().replace(/\s+/g, ' ');
+    const name = m[2] as string;
+    const s = state.get(name) ?? { exists: false, anonOpen: false };
+    if (verb.startsWith('DROP')) {
+      s.exists = false;
+    } else if (verb === 'CREATE FUNCTION' || !s.exists) {
+      s.exists = true;
+      s.anonOpen = closedByDefault < 0 || at < closedByDefault;
+    }
+    state.set(name, s);
+  }
+
+  const sealed = [...state].filter(([name, s]) => SEALED(name) && s.exists);
+  assert('the check is not vacuous: CMS functions were found', sealed.length >= 12, `${sealed.length} found`);
+  assert('default privileges close functions created from now on', closedByDefault >= 0);
+  for (const [name, s] of sealed) {
+    assert(`${name}: anon holds no EXECUTE`, !s.anonOpen, 'created without a later REVOKE ... FROM anon');
+  }
+}
+
 console.log(`\n${checks - failures}/${checks} checks passed`);
 if (failures > 0) process.exit(1);
