@@ -63,6 +63,10 @@ jobs:
       - name: App logic tests
         run: npm run test:ui
 
+      # Epic 15: swept geofence test and bearing math. Pure - no stubs.
+      - name: Engine geometry tests
+        run: npm run test:engine
+
       - name: Auth storage tests
         run: npm run test:auth
 
