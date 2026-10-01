@@ -535,5 +535,25 @@ heading('Epic 15: no CMS function is executable by anon');
   }
 }
 
+// -----------------------------------------------------------------------------
+heading('Telemetry vocabulary: database == app');
+// -----------------------------------------------------------------------------
+// A type the server refuses is accepted by the device's offline queue and then
+// fails every sync - taking the valid events in its batch with it. The LAST
+// migration that defines telemetry_events_event_type_check is the truth.
+{
+  const definitions = migrationFiles
+    .map((file) => /ADD CONSTRAINT telemetry_events_event_type_check CHECK \(event_type IN \(([\s\S]*?)\)\);/.exec(read(file).replace(/--[^\n]*/g, '')))
+    .filter((m): m is RegExpExecArray => m !== null);
+  const latest = definitions.at(-1)?.[1] ?? '';
+  const db = [...latest.matchAll(/'([a-z_]+)'/g)].map((m) => m[1] as string).sort();
+  const typesSource = readFileSync(new URL('../../mobile/src/services/telemetry/types.ts', import.meta.url), 'utf8');
+  const union = /export type TelemetryEventType =([\s\S]*?);/.exec(typesSource.replace(/\/\*[\s\S]*?\*\//g, ''))?.[1] ?? '';
+  const app = [...union.matchAll(/'([a-z_]+)'/g)].map((m) => m[1] as string).sort();
+  assert('event_type_check found in the migrations', db.length >= 9, `${db.length} types`);
+  assert('TelemetryEventType found in the app', app.length >= 9, `${app.length} types`);
+  eq('telemetry_events_event_type_check == TelemetryEventType', db, app);
+}
+
 console.log(`\n${checks - failures}/${checks} checks passed`);
 if (failures > 0) process.exit(1);

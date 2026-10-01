@@ -24,7 +24,19 @@ export type TelemetryEventType =
   | 'audio_skipped'
   | 'audio_stopped'
   /** Added by migration 20260828140000 (TASK-507). */
-  | 'audio_paused';
+  | 'audio_paused'
+  /**
+   * Added by migration 20261003120000 (Epic 15). Do not SEND these from a
+   * build that can reach a database without that migration: the batch they
+   * are in fails on every sync.
+   */
+  | 'trigger_reanchored'
+  | 'trigger_rejected_bearing'
+  | 'trigger_expired'
+  | 'trigger_missed'
+  | 'audio_watchdog'
+  | 'tour_suspended'
+  | 'tour_resumed';
 
 /**
  * One row of public.telemetry_events, as the client posts it.
