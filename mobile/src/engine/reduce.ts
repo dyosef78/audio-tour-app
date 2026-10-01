@@ -600,6 +600,16 @@ export function cursorOf(s: EngineState, chapterId: string): number {
 }
 
 /**
+ * Every stop of every chapter is settled: it fired, or the cursor of its
+ * chapter moved past it. The end-of-tour prompt's condition - "visited every
+ * stop" can never become true once loose sequencing lets a stop be skipped.
+ */
+export function allStopsResolved(s: EngineState): boolean {
+  const cursors = new Map(s.tour.chapters.map((c) => [c.id, cursorOf(s, c.id)]));
+  return s.tour.stops.every((st) => st.id in s.progress.fired || st.index < (cursors.get(st.chapterId) ?? -1));
+}
+
+/**
  * The chapter's stops the visitor will not hear unless they ask - the
  * post-chapter recap list. At or behind the cursor, never started, and not
  * still waiting or on air: skipped by a re-anchor, or fired and then expired

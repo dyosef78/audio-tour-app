@@ -135,9 +135,14 @@ export class AudioActor {
     this.deps.sink({ type: 'AUDIO_INTERRUPTED', token: c.token, at: this.deps.now(), by: 'user' });
   }
 
+  /**
+   * The listener's play button: resumes their own pause, and also an OS
+   * interruption that never resumed by itself - a tap is the clearest signal
+   * there is that they want to hear it.
+   */
   resumeByUser(): void {
     const c = this.current;
-    if (c === null || !c.userPaused) return;
+    if (c === null || (!c.userPaused && !c.osPaused)) return;
     c.userPaused = false;
     c.osPaused = false;
     this.deps.player.resume();

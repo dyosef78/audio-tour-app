@@ -108,6 +108,27 @@ export interface TourSessionActions {
   startDeepDive: (waypointId: string) => void;
   endDeepDive: () => void;
   dismissCompletionPrompt: () => void;
+  /**
+   * Epic 15: the engine's state, projected for the screens. The engine is the
+   * source of truth; this replaces markEntered / markExited / startDeepDive /
+   * endDeepDive for engine sessions.
+   */
+  applyEngineView: (view: EngineView) => void;
+  /**
+   * The stop whose card the player shows. Set when its narration or Deep Dive
+   * goes on air; cleared only when the listener leaves it (walking zone exit)
+   * or dismisses it - a finished narration keeps its card, with its Deep Dive
+   * and replay buttons, as before Epic 15.
+   */
+  setOnAir: (waypointId: string | null, deepDive: boolean) => void;
+  /** Raise the end-of-tour prompt once - on the transition to "every stop resolved". */
+  promptCompletion: () => void;
+}
+
+/** What the screens need from the engine's state (EngineRunner publish). */
+export interface EngineView {
+  /** Stops whose narration actually started, in the order they did. */
+  visitedWaypointIds: string[];
 }
 
 const initial: TourSessionState = {
@@ -215,6 +236,26 @@ export const useTourSession = create<TourSessionState & TourSessionActions>((set
   endDeepDive: () => set({ deepDiveWaypointId: null }),
 
   dismissCompletionPrompt: () => set({ completionPrompted: false }),
+
+  applyEngineView: ({ visitedWaypointIds }) =>
+    set((s) =>
+      // Same array when unchanged, so the map does not re-render every heartbeat.
+      s.visitedWaypointIds.length === visitedWaypointIds.length &&
+      s.visitedWaypointIds.every((id, i) => id === visitedWaypointIds[i])
+        ? {}
+        : { visitedWaypointIds },
+    ),
+
+  setOnAir: (waypointId, deepDive) =>
+    set((s) => ({
+      activeWaypointId: waypointId,
+      deepDiveWaypointId: waypointId !== null && deepDive ? waypointId : null,
+      // A new stop on air clears a stale error from the previous one.
+      playbackError: waypointId !== null && waypointId !== s.activeWaypointId ? null : s.playbackError,
+      ...(waypointId === null ? { isPlaying: false, positionSeconds: 0, durationSeconds: 0 } : {}),
+    })),
+
+  promptCompletion: () => set({ completionPrompted: true }),
 }));
 
 /** Selectors, so subscribers only re-render on the slice they actually read. */

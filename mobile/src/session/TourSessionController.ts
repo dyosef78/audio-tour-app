@@ -1,13 +1,17 @@
 import Constants from 'expo-constants';
-import { AppState, type AppStateStatus } from 'react-native';
+import { AppState, Platform, type AppStateStatus } from 'react-native';
 
+import { engineTourFromManifest } from '../engine/fromManifest';
+import { allStopsResolved, createEngineState, freshProgress, progressProblem } from '../engine/reduce';
+import type { Effect, EngineState, EngineTour, Progress, TrackKind } from '../engine/types';
+import { AudioActor } from '../services/audio/AudioActor';
 import { AudioService } from '../services/audio/AudioService';
+import { interruptionModeFor } from '../services/audio/sessionMode';
 import { TourBundleRepository } from '../services/bundle/TourBundleRepository';
 import {
   LocationService,
   registerBackgroundLocationTask,
   stopOrphanedLocationUpdates,
-  type GeofenceEvent,
 } from '../services/location/LocationService';
 import { telemetry } from '../services/telemetry/TelemetryService';
 import { networkMonitor } from '../services/network/NetworkMonitor';
@@ -15,12 +19,12 @@ import { signedAudioUrls } from '../services/supabase/client';
 import { routeCriteria } from '../personalization/options';
 import { usePreferences } from '../personalization/preferencesStore';
 import { decodeRoute } from '../routing/routeGeometry';
-import { routePreferencesOf } from '../routing/routeRequest';
 import { selectStops } from '../routing/stopSelection';
 import { remoteTranscripts } from '../transcript/TranscriptRepository';
+import { EngineRunner, type EngineRunnerPorts } from './EngineRunner';
+import { decideSnapshotResume, type TourProgressSnapshot } from './progressRepository';
 import { routeManager } from './routing';
-import { decideResume } from './sessionCheckpoint';
-import { sessionCheckpoints } from './sessionCheckpointFile';
+import { tourProgress } from './sessionCheckpointFile';
 import { useTourSession } from './tourSessionStore';
 import type { GpsFix } from '../engine/types';
 import type { AudioTrack, LatLng, TransitMode, Waypoint } from '../types/domain';
@@ -29,42 +33,43 @@ import type { AudioTrack, LatLng, TransitMode, Waypoint } from '../types/domain'
  * TourSessionController - the single owner of the running tour.
  *
  * The rule from the approved TASK-202 proposal: screens observe, they never own.
- * This module holds the one LocationService and the one AudioService, and
- * exposes exactly two lifecycle transitions. Nothing else may start or stop the
+ * This module holds the one LocationService, the one AudioService and - since
+ * Epic 15 - the one loose-sequence engine. Nothing else may start or stop the
  * GPS.
+ *
+ * EPIC 15: THE CONTROLLER IS A SHELL AROUND A PURE ENGINE.
+ *
+ *   LocationService (engine mode) --GpsFix--+
+ *   AudioActor (audio callbacks) ----------+--> EngineRunner.dispatch --> reduce()
+ *   1 Hz heartbeat, the listener's taps ---+          |
+ *                                                     v   (one drain, fixed order)
+ *                       persist (TourProgressRepository, sync) -> publish (store)
+ *                       -> effects: AudioActor PLAY/STOP/RESUME, transit mode,
+ *                          telemetry
+ *
+ * Every decision - which stop fires, what plays, what waits, what expires - is
+ * engine/reduce.ts. This file adapts: it starts and ends sessions, maps the
+ * bundle into the engine's tour, resolves audio files, and projects the
+ * engine's state into the store. The event loop's ordering and failure rules
+ * live in EngineRunner.
  *
  * Lifecycle decisions, per PM:
  *   - The session survives navigating back to Discovery. It is not tied to any
  *     component mount.
- *   - A tour ends ONLY on an explicit endSession(). Reaching the final waypoint
- *     sets a prompt flag and nothing more.
- *   - A tour SURVIVES THE PROCESS (Epic 13, P0 - reverses the earlier "never
- *     resume" decision). Its progress is checkpointed synchronously at every
- *     change (sessionCheckpoint.ts). When Android restarts the tracking
- *     service after killing the process, the first batch of fixes rebuilds the
- *     session from the checkpoint - no UI needed - and tracking continues. An
- *     app opened by the user does the same. Only a tour with no usable
- *     checkpoint is stopped, so a killed app still cannot leave a ghost task.
+ *   - A tour ends ONLY on an explicit endSession(). Every stop being settled
+ *     raises a prompt and nothing more.
+ *   - A tour SURVIVES THE PROCESS (Epic 13). The engine's progress is persisted
+ *     synchronously, before any audio effect, at every change. When Android
+ *     restarts the tracking service after killing the process, the first batch
+ *     of fixes rebuilds the session from it - no UI needed. An app opened by
+ *     the user does the same.
+ *   - Navigation is the navigation app's job (Epic 15, decision 5): the map
+ *     shows the bundled route; nothing on the device routes or reorders.
  *
- * THE DEAD ZONE (Epic 13, Directive 1.3). Between the kill and the resumed
- * session, three gaps, in order:
- *   1. Android restarting the service. START_REDELIVER_INTENT restarts it about
- *      a second after a first kill, with exponential backoff after repeated
- *      kills, and an OEM battery manager may delay it or never do it. NO FIXES
- *      EXIST in this gap: GPS is off. This is the real blind spot.
- *   2. The JS engine cold-starting headless (bundle load and module init,
- *      typically 1-3 s). Fixes are recorded but NOT lost: expo-task-manager
- *      queues events natively until the task observer is ready
- *      (TaskManagerInternalModule.mEventsQueue), then flushes them.
- *   3. The resume itself (bundle read, audio session, one native call to adopt
- *      the task). Fixes arriving meanwhile are held in pendingFixes and
- *      replayed, in order, once the session exists.
- * So gaps 2 and 3 only DELAY a narration; nothing is dropped. What is lost is
- * the ground covered during gap 1. A walker crosses a 20 m zone in about 30 s,
- * so a restart within seconds is harmless. If the whole armed zone is walked
- * through during gap 1, that stop is missed and - strict sequencing (Epic 9) -
- * blocks the stops after it until the manual trigger. A narration that was
- * playing at the kill is not resumed.
+ * THE DEAD ZONE (Epic 13, Directive 1.3) is unchanged: fixes during the
+ * service restart do not exist; fixes during JS boot and the resume are queued
+ * and replayed. What is new is what a gap COSTS: a stop walked through during
+ * it no longer blocks the tour - the window and re-anchor carry on past it.
  */
 
 /** Stages of starting a tour that can fail for reasons outside the app. */
@@ -99,6 +104,7 @@ export class SessionStartError extends Error {
 const MAX_PENDING_FIXES = 200;
 
 type ResumeOrigin = 'background_task' | 'cold_start';
+
 /**
  * Stamped onto every telemetry event.
  *
@@ -115,14 +121,27 @@ const APP_VERSION: string = (() => {
   }
 })();
 
+/** Everything about the running session that is not engine state. */
+interface SessionMeta {
+  tourId: string;
+  tourTitle: string;
+  activeIds: string[];
+  skippedIds: string[];
+  backgroundPermission: boolean;
+  notificationPermission: boolean;
+  startedAt: number;
+  waypointsById: Map<string, Waypoint>;
+}
+
 class TourSessionController {
   private location: LocationService | null = null;
   private readonly audio = new AudioService();
+  private actor: AudioActor | null = null;
+  private runner: EngineRunner | null = null;
+  private session: SessionMeta | null = null;
   private appStateSub: { remove: () => void } | null = null;
   /** Serialises start/end/resume so overlapping calls cannot interleave teardown. */
   private transition: Promise<void> = Promise.resolve();
-  /** When the running tour was first started; carried into every checkpoint. */
-  private sessionStartedAt = 0;
   /** Background fixes that arrived with no session in memory (see onBackgroundFixes). */
   private pendingFixes: GpsFix[] = [];
   /** A background-task resume is queued; later batches only add to pendingFixes. */
@@ -155,15 +174,9 @@ class TourSessionController {
       console.error('[TourSession] cold-start reconciliation failed:', err);
     }
 
-    // Telemetry starts with the app, not with a tour (TASK-506). The commonest
-    // delivery moment is an app opened on hotel WiFi hours AFTER the walk, so a
-    // queue that only drained during a session would strand exactly the events
-    // a dead-zone tour produced. start() flushes immediately and then listens
-    // for foreground transitions.
-    //
-    // Attached to the network BEFORE start() (TASK-605): a queue must drain the
-    // moment signal returns mid-walk, not when a backoff that has grown to 15
-    // minutes happens to expire.
+    // Telemetry starts with the app, not with a tour (TASK-506), and is
+    // attached to the network first so a queue drains the moment signal
+    // returns mid-walk (TASK-605).
     telemetry.attachNetwork(networkMonitor);
     void telemetry.start(APP_VERSION);
   }
@@ -207,9 +220,7 @@ class TourSessionController {
 
   /**
    * Run one transition after the previous one. The CALLER gets this run's
-   * outcome, error included; the queue itself continues past a failure. Chaining
-   * onto a rejected promise would silently skip every later start and end for
-   * the life of the process.
+   * outcome, error included; the queue itself continues past a failure.
    */
   private enqueue(run: () => Promise<void>): Promise<void> {
     const result = this.transition.then(run);
@@ -233,30 +244,31 @@ class TourSessionController {
     useTourSession.getState().beginStart(tourId, tourTitle);
 
     const waypoints = TourBundleRepository.loadWaypoints(tourId);
-    const transitMode = TourBundleRepository.loadTransitMode(tourId);
-
-    if (!waypoints || !transitMode) {
-      useTourSession
-        .getState()
-        .sessionFailed('This tour is not downloaded. Download it before starting.');
+    const manifest = TourBundleRepository.readManifest(tourId);
+    if (!waypoints || !manifest) {
+      useTourSession.getState().sessionFailed('This tour is not downloaded. Download it before starting.');
       return;
     }
 
-    // TASK-604: onboarding preferences decide which stops this session RUNS.
-    // Snapshotted here - editing preferences mid-walk does not reshuffle a tour
-    // already under way. Skipped stops leave the geofence engine as well as the
-    // map: a hidden pin whose narration still fired as you walked past it along
-    // the route would be the worst of both.
-    const criteria = routeCriteria(usePreferences.getState());
-    const selection = selectStops(waypoints, criteria);
+    // TASK-604: onboarding preferences decide which stops this session RUNS,
+    // snapshotted here - editing preferences mid-walk reshuffles nothing.
+    const selection = selectStops(waypoints, routeCriteria(usePreferences.getState()));
 
-    const service = new LocationService(transitMode);
-    service.loadTour(selection.active, transitMode);
-    this.wireLocation(service);
+    // A manifest the engine cannot represent faithfully (a newer server's
+    // mode, a malformed zone) is refused, not approximated.
+    let tour: EngineTour;
+    try {
+      tour = engineTourFromManifest(manifest, selection.active.map((w) => w.id));
+    } catch (err) {
+      return this.failStart('unexpected', err);
+    }
+    const firstChapter = tour.chapters[0];
+    if (!firstChapter) return this.failStart('unexpected', new Error('the tour has no chapters'));
+
+    const service = new LocationService(firstChapter.transitMode, Platform.OS, { engineMode: true });
 
     // Each native stage is guarded (Epic 13, Directive 2): a bridge that throws
-    // must end in failStart - teardown, an error the screen shows, a rethrow -
-    // never in a rejected promise nobody awaits and a spinner that never ends.
+    // must end in failStart - teardown, an error the screen shows, a rethrow.
     let permissions: Awaited<ReturnType<LocationService['requestPermissions']>>;
     try {
       permissions = await service.requestPermissions();
@@ -265,29 +277,37 @@ class TourSessionController {
     }
     if (!permissions.foreground) {
       // An answer, not a failure: the person said no. Nothing was started.
-      useTourSession
-        .getState()
-        .sessionFailed('Location permission is required to run a tour.');
+      useTourSession.getState().sessionFailed('Location permission is required to run a tour.');
       return;
     }
 
     this.location = service;
-    this.sessionStartedAt = Date.now();
-    this.wireAudio();
+    const meta: SessionMeta = {
+      tourId,
+      tourTitle,
+      activeIds: selection.active.map((w) => w.id),
+      skippedIds: selection.skippedIds,
+      backgroundPermission: permissions.background,
+      notificationPermission: permissions.notifications,
+      startedAt: Date.now(),
+      waypointsById: new Map(selection.active.map((w) => [w.id, w])),
+    };
     void telemetry.record('tour_started', { tourId });
 
     try {
-      await this.audio.configureSession();
+      await this.audio.configureSession(interruptionModeFor(Platform.OS, firstChapter.transitMode));
     } catch (err) {
       return this.failStart('audio', err);
     }
+
+    // The engine exists before tracking starts, so no fix can arrive unheard.
+    const runner = this.openEngine(meta, createEngineState(tour, freshProgress(tour, firstChapter.id)));
+
     try {
       await service.start();
     } catch (err) {
       // Android can refuse here: its location foreground service only starts
-      // while the app is in the foreground, so switching away mid-start throws
-      // (LocationService header). A tour that cannot track must not look like
-      // one that is running.
+      // while the app is in the foreground (LocationService header).
       return this.failStart('location', err);
     }
 
@@ -295,102 +315,170 @@ class TourSessionController {
 
     useTourSession.getState().sessionStarted({
       waypoints: selection.active,
-      transitMode,
+      transitMode: firstChapter.transitMode,
       backgroundPermission: permissions.background,
       notificationPermission: permissions.notifications,
       skippedWaypointIds: selection.skippedIds,
     });
+    this.publishStaticRoute(tourId, selection.active, firstChapter.transitMode);
 
-    // Publishes the best route available offline synchronously, in the same
-    // tick as sessionStarted, so the first map frame already has it; then
-    // upgrades to a live route - the Smart Sorter's order - if and when it can.
-    // The same preference snapshot that selected the stops scores their order
-    // (TASK-903): editing preferences mid-walk reshuffles nothing.
-    void routeManager.start({
-      tourId,
-      transitMode,
-      stops: selection.active,
-      preferences: routePreferencesOf(criteria),
-      staticRoute: this.loadStaticRoute(tourId, selection.active, transitMode),
-      bundleHash: TourBundleRepository.readManifest(tourId)?.bundle_version_hash ?? null,
-      onStopOrder: (waypointIds) => this.adoptStopOrder(service, waypointIds),
-    });
-
-    // Last: the checkpoint describes a session that has fully started.
-    this.saveCheckpoint();
-  }
-
-  /** The LocationService callbacks, identical for a fresh start and a resume. */
-  private wireLocation(service: LocationService): void {
-    service.setCallbacks({
-      onLocation: (fix, accuracy) => useTourSession.getState().setFix(fix, accuracy),
-      onSamplingChange: (tier) => useTourSession.getState().setSamplingTier(tier),
-      onGeofence: (event) => {
-        void this.handleGeofence(event);
-      },
-    });
-  }
-
-  /** The AudioService hooks, identical for a fresh start and a resume. */
-  private wireAudio(): void {
-    // Mirror the player's own status into the store so the transport UI is
-    // honest about state we did not initiate - a track ending, or the OS
-    // pausing us for an interruption.
-    this.audio.setOnStatus(({ isPlaying, positionSeconds, durationSeconds }) => {
-      useTourSession.getState().setPlayback({ isPlaying, positionSeconds, durationSeconds });
-    });
-
-    // A decode failure must reach the UI, not just the console. setPlaybackError
-    // resets the transport as well, so the panel cannot keep claiming "playing".
-    this.audio.setOnError((err) => {
-      useTourSession.getState().setPlaybackError(err.message);
-    });
-
-    // Telemetry is attached before the first geofence can fire, and detached in
-    // doEnd(). audio_started is the denominator of the completion KPI, so a
-    // waypoint triggering between start() and this line would skew the rate.
-    this.audio.setTelemetry(telemetry);
-  }
-
-  private attachAppState(): void {
-    this.appStateSub?.remove();
-    this.appStateSub = AppState.addEventListener('change', (next) => {
-      void this.handleAppStateChange(next);
-    });
+    runner.start();
+    // The checkpoint describes a session that has fully started.
+    this.persistNow();
   }
 
   // ---------------------------------------------------------------------------
-  // Checkpoint and resume (Epic 13)
+  // The engine
   // ---------------------------------------------------------------------------
 
   /**
-   * Record the running tour, synchronously, so a killed process can resume it.
-   *
-   * Never throws: a disk that refuses the write must not stop the narration
-   * the user is standing in. It is reported as an error instead, because the
-   * consequence - this tour will not survive a kill - is real.
+   * Build the runner and the audio actor around an engine state, and route
+   * fixes into it. Does not start the heartbeat - start()/doResume do, once
+   * tracking is up.
    */
-  private saveCheckpoint(): void {
-    const service = this.location;
-    const s = useTourSession.getState();
-    if (!service || !s.tourId || !s.transitMode) return;
-    const { order, passed } = service.progress();
+  private openEngine(meta: SessionMeta, initial: EngineState): EngineRunner {
+    const ports: EngineRunnerPorts = {
+      persist: (progress) => tourProgress.save(this.snapshot(meta, progress)),
+      audio: (fx) => this.runAudioEffect(fx),
+      applyTransitMode: (mode) => {
+        void this.applyTransitMode(mode);
+      },
+      telemetry: (fx) => this.recordEngineTelemetry(meta.tourId, fx),
+      publish: (next, prev) => this.publish(next, prev),
+      now: () => Date.now(),
+      setInterval: (fn, ms) => setInterval(fn, ms),
+      clearInterval: (handle) => clearInterval(handle as ReturnType<typeof setInterval>),
+      reportError: (context, error, detail) => console.error(`[Engine] ${context} failed (${detail}):`, error),
+    };
+    const runner = new EngineRunner(initial, ports);
+
+    const actor = new AudioActor({
+      player: this.audio,
+      source: { resolve: (stopId, track) => this.resolvePlayable(meta, stopId, track) },
+      sink: (event) => runner.dispatch(event),
+      now: () => Date.now(),
+      onSnapshot: ({ isPlaying, positionSeconds, durationSeconds }) =>
+        useTourSession.getState().setPlayback({ isPlaying, positionSeconds, durationSeconds }),
+      onError: (err) => useTourSession.getState().setPlaybackError(err.message),
+      reportError: (err, detail) => console.error(`[AudioActor] ${detail} failed:`, err),
+    });
+
+    // audio_started is the denominator of the completion KPI: telemetry is
+    // attached before the first stop can fire, and detached in doEnd().
+    this.audio.setTelemetry(telemetry);
+
+    this.location?.setCallbacks({
+      onLocation: (fix, accuracy) => useTourSession.getState().setFix(fix, accuracy),
+      onSamplingChange: (tier) => useTourSession.getState().setSamplingTier(tier),
+      onGpsFix: (fix) => runner.fixes([fix]),
+    });
+
+    this.runner = runner;
+    this.actor = actor;
+    this.session = meta;
+    useTourSession.getState().applyEngineView({ visitedWaypointIds: Object.keys(initial.progress.played) });
+    return runner;
+  }
+
+  /**
+   * Audio effects go to the actor; the card the player shows follows them. A
+   * PLAY puts its stop on air; a zone exit or the listener's skip takes it
+   * off. Displacement (the next PLAY replaces it) and failures (the error
+   * shows on the card) leave it alone.
+   */
+  private runAudioEffect(fx: Extract<Effect, { type: 'PLAY' | 'STOP' | 'RESUME' }>): void {
+    const actor = this.actor;
+    if (actor === null) throw new Error(`audio effect ${fx.type} with no audio actor`);
+    if (fx.type === 'PLAY') useTourSession.getState().setOnAir(fx.stopId, fx.track === 'deep_dive');
+    if (fx.type === 'STOP' && (fx.reason === 'zone_exit' || fx.reason === 'user_skip')) {
+      useTourSession.getState().setOnAir(null, false);
+    }
+    actor.execute(fx);
+  }
+
+  /** The engine's state, projected for the screens. Once per drain. */
+  private publish(next: EngineState, prev: EngineState): void {
+    if (next.progress.played !== prev.progress.played) {
+      useTourSession.getState().applyEngineView({ visitedWaypointIds: Object.keys(next.progress.played) });
+    }
+    if (next.progress.fired !== prev.progress.fired && allStopsResolved(next) && !allStopsResolved(prev)) {
+      useTourSession.getState().promptCompletion();
+    }
+  }
+
+  /**
+   * Engine telemetry. trigger_fired goes to the server as geofence_entered -
+   * a type telemetry_events already accepts - with the engine's detail in
+   * meta. The other kinds are LOGGED ONLY: telemetry_events_event_type_check
+   * does not list them, and batches are all-or-nothing, so sending one would
+   * also lose the valid events beside it. A migration extending the check
+   * comes first.
+   */
+  private recordEngineTelemetry(tourId: string, fx: Extract<Effect, { type: 'TELEMETRY' }>): void {
+    if (fx.kind === 'trigger_fired') {
+      void telemetry.record('geofence_entered', { tourId, waypointId: fx.stopId, meta: { ...fx.detail } });
+      return;
+    }
+    console.info(`[Engine] ${fx.kind}${fx.stopId ? ` ${fx.stopId}` : ''}`, fx.detail);
+  }
+
+  /** A chapter's mode: tracking sampling and the audio session. Reported, never thrown. */
+  private async applyTransitMode(mode: TransitMode): Promise<void> {
     try {
-      sessionCheckpoints.save({
-        v: 1,
-        tourId: s.tourId,
-        tourTitle: s.tourTitle ?? 'Tour',
-        transitMode: s.transitMode,
-        activeIds: s.waypoints.map((w) => w.id),
-        skippedIds: [...s.skippedWaypointIds],
-        order,
-        passed,
-        visited: [...s.visitedWaypointIds],
-        backgroundPermission: s.backgroundPermission,
-        notificationPermission: s.notificationPermission,
-        startedAt: this.sessionStartedAt,
-        savedAt: Date.now(),
-      });
+      await this.audio.configureSession(interruptionModeFor(Platform.OS, mode));
+    } catch (err) {
+      console.error(`[TourSession] audio session not switched to ${mode}:`, err);
+    }
+    try {
+      await this.location?.retune(mode);
+    } catch (err) {
+      console.error(`[TourSession] tracking not retuned for ${mode} - sampling stays on the previous chapter's:`, err);
+    }
+  }
+
+  private async resolvePlayable(
+    meta: SessionMeta,
+    stopId: string,
+    track: TrackKind,
+  ): Promise<{ track: AudioTrack; uri: string; waypoint: Waypoint } | null> {
+    const waypoint = meta.waypointsById.get(stopId);
+    if (!waypoint) return null;
+    const audioTrack = track === 'deep_dive' ? waypoint.deepDive ?? null : waypoint.audio;
+    if (!audioTrack) return null;
+    const uri = await this.playableUri(audioTrack);
+    return uri === null ? null : { track: audioTrack, uri, waypoint };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Persistence and resume
+  // ---------------------------------------------------------------------------
+
+  private snapshot(meta: SessionMeta, progress: Progress): TourProgressSnapshot {
+    return {
+      v: 2,
+      tourId: meta.tourId,
+      tourTitle: meta.tourTitle,
+      activeIds: meta.activeIds,
+      skippedIds: meta.skippedIds,
+      backgroundPermission: meta.backgroundPermission,
+      notificationPermission: meta.notificationPermission,
+      startedAt: meta.startedAt,
+      savedAt: Date.now(),
+      progress,
+    };
+  }
+
+  /**
+   * Write the checkpoint now, outside a drain (start, resume). Never throws:
+   * a disk that refuses must not stop a tour - reported instead, because the
+   * consequence (no resume after a kill) is real.
+   */
+  private persistNow(): void {
+    const runner = this.runner;
+    const meta = this.session;
+    if (!runner || !meta) return;
+    try {
+      tourProgress.save(this.snapshot(meta, runner.state.progress));
     } catch (err) {
       console.error('[TourSession] checkpoint NOT written - this tour cannot resume after a process kill:', err);
     }
@@ -398,10 +486,10 @@ class TourSessionController {
 
   private clearCheckpoint(): void {
     try {
-      sessionCheckpoints.clear();
+      tourProgress.clear();
     } catch (err) {
-      // Reported, not thrown: teardown must finish. The age limit in
-      // decideResume stops a stale checkpoint resuming forever.
+      // Reported, not thrown: teardown must finish. The age limit stops a
+      // stale checkpoint resuming forever.
       console.error('[TourSession] checkpoint could not be deleted; an ended tour may resume on the next launch:', err);
     }
   }
@@ -418,7 +506,7 @@ class TourSessionController {
   private async doResume(origin: ResumeOrigin): Promise<boolean> {
     if (this.location) return true;
 
-    const decision = decideResume(sessionCheckpoints.load(), Date.now());
+    const decision = decideSnapshotResume(tourProgress.load(), Date.now());
     if (decision.kind === 'nothing') return false;
     const discard = (reason: string): false => {
       console.warn(`[TourSession] saved tour not resumed (${origin}): ${reason}`);
@@ -426,25 +514,41 @@ class TourSessionController {
       return false;
     };
     if (decision.kind === 'discard') return discard(decision.reason);
-    const cp = decision.checkpoint;
+    const snap = decision.snapshot;
 
-    const waypoints = TourBundleRepository.loadWaypoints(cp.tourId);
-    if (!waypoints) return discard('the tour is no longer downloaded');
+    const waypoints = TourBundleRepository.loadWaypoints(snap.tourId);
+    const manifest = TourBundleRepository.readManifest(snap.tourId);
+    if (!waypoints || !manifest) return discard('the tour is no longer downloaded');
     const byId = new Map(waypoints.map((w) => [w.id, w]));
-    const active = cp.activeIds.map((id) => byId.get(id));
+    const active = snap.activeIds.map((id) => byId.get(id));
     if (!active.every((w): w is Waypoint => w !== undefined)) {
       return discard('the downloaded tour no longer has every stop (updated since?)');
     }
 
-    const service = new LocationService(cp.transitMode);
-    service.loadTour(active, cp.transitMode);
-    if (!service.restoreProgress(cp.order, cp.passed)) return discard('saved progress does not fit the stops');
+    let tour: EngineTour;
+    try {
+      tour = engineTourFromManifest(manifest, snap.activeIds);
+    } catch (err) {
+      return discard(`the downloaded tour cannot run (${err instanceof Error ? err.message : String(err)})`);
+    }
+    const problem = progressProblem(tour, snap.progress);
+    if (problem !== null) return discard(`saved progress does not fit the tour (${problem})`);
+    const chapter = tour.chapters.find((c) => c.id === snap.progress.chapterId);
+    if (!chapter) return discard(`unknown chapter ${snap.progress.chapterId}`);
 
-    useTourSession.getState().beginStart(cp.tourId, cp.tourTitle);
-    this.wireLocation(service);
+    useTourSession.getState().beginStart(snap.tourId, snap.tourTitle);
+    const service = new LocationService(chapter.transitMode, Platform.OS, { engineMode: true });
     this.location = service;
-    this.sessionStartedAt = cp.startedAt;
-    this.wireAudio();
+    const meta: SessionMeta = {
+      tourId: snap.tourId,
+      tourTitle: snap.tourTitle,
+      activeIds: snap.activeIds,
+      skippedIds: snap.skippedIds,
+      backgroundPermission: snap.backgroundPermission,
+      notificationPermission: snap.notificationPermission,
+      startedAt: snap.startedAt,
+      waypointsById: new Map(active.map((w) => [w.id, w])),
+    };
 
     const fail = async (stage: 'audio' | 'location', err: unknown): Promise<false> => {
       console.error(`[TourSession] resume (${origin}) failed at ${stage}:`, err);
@@ -452,10 +556,11 @@ class TourSessionController {
       return false;
     };
     try {
-      await this.audio.configureSession();
+      await this.audio.configureSession(interruptionModeFor(Platform.OS, chapter.transitMode));
     } catch (err) {
       return fail('audio', err);
     }
+    const runner = this.openEngine(meta, createEngineState(tour, snap.progress));
     try {
       await service.resumeTracking();
     } catch (err) {
@@ -463,24 +568,20 @@ class TourSessionController {
     }
     if (!service.persistentTask) this.attachAppState();
 
-    const store = useTourSession.getState();
-    store.sessionStarted({
+    useTourSession.getState().sessionStarted({
       waypoints: active,
-      transitMode: cp.transitMode,
-      backgroundPermission: cp.backgroundPermission,
-      notificationPermission: cp.notificationPermission,
-      skippedWaypointIds: cp.skippedIds,
+      transitMode: chapter.transitMode,
+      backgroundPermission: snap.backgroundPermission,
+      notificationPermission: snap.notificationPermission,
+      skippedWaypointIds: snap.skippedIds,
     });
-    store.setStopOrder(cp.order);
-    store.restoreVisited(cp.visited);
-    // Offline route only: a live fetch could adopt a DIFFERENT order than the
-    // one the walk has been following. The bundled line, or straight joins.
-    const staticRoute = this.loadStaticRoute(cp.tourId, active, cp.transitMode);
-    store.setRoute(staticRoute ? { source: 'static', points: staticRoute } : { source: 'straight', points: null });
+    this.publishStaticRoute(snap.tourId, active, chapter.transitMode);
 
-    this.saveCheckpoint();
+    // SESSION_STARTED replays a restored queue - what fired but had not been heard.
+    runner.start();
+    this.persistNow();
     console.warn(
-      `[TourSession] resumed tour ${cp.tourId} (${origin}): ${cp.passed.length}/${cp.activeIds.length} stops passed, next ${service.nextWaypointId() ?? 'none'}`,
+      `[TourSession] resumed tour ${snap.tourId} (${origin}): ${Object.keys(snap.progress.played).length}/${snap.activeIds.length} stops heard, ${snap.progress.queue.length} waiting`,
     );
     return true;
   }
@@ -511,31 +612,21 @@ class TourSessionController {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Map and audio sources
+  // ---------------------------------------------------------------------------
+
   /**
-   * Narrate in the order the live route visits the stops (TASK-902).
-   *
-   * The engine and the store move together or not at all, so the player's
-   * "stop N of M" always counts in the order the geofences fire. Guarded on the
-   * service: RouteManager already drops a late answer from an ended session,
-   * and this makes a restarted one safe as well.
+   * The bundled route, validated against the stops this session runs. Epic 15
+   * (decision 5): nothing on the device routes or reorders any more - the
+   * navigation app routes, and stops run in their authored chapter order.
    */
-  private adoptStopOrder(service: LocationService, waypointIds: string[]): void {
-    if (this.location !== service) return;
-    const before = service.stopOrder().join(',');
-    if (!service.setStopOrder(waypointIds)) {
-      console.warn('[TourSession] visiting order rejected by the geofence engine; keeping the current order');
-      return;
-    }
-    useTourSession.getState().setStopOrder(waypointIds);
-    this.saveCheckpoint();
-    if (before !== waypointIds.join(',')) {
-      console.log(`[TourSession] narration follows the routed order; next stop ${service.nextWaypointId() ?? 'none'}`);
-    }
+  private publishStaticRoute(tourId: string, stops: Waypoint[], transitMode: TransitMode): void {
+    const route = this.loadStaticRoute(tourId, stops, transitMode);
+    useTourSession.getState().setRoute(route ? { source: 'static', points: route } : { source: 'straight', points: null });
   }
 
   /**
-   * The bundle's route, validated against the stops this session runs.
-   *
    * A route that fails validation is logged and dropped: dashed straight lines
    * are honest about being approximate; a confident line that misses the stops
    * is not.
@@ -549,97 +640,17 @@ class TourSessionController {
     return null;
   }
 
-  // ---------------------------------------------------------------------------
-  // Geofence -> audio
-  // ---------------------------------------------------------------------------
-
-  private async handleGeofence(event: GeofenceEvent): Promise<void> {
-    const { waypoint } = event;
-
-    if (event.type === 'enter') {
-      useTourSession.getState().markEntered(waypoint.id);
-      // Synchronously, before any await: the stop is passed in the engine NOW,
-      // and a kill during the narration below must not replay it on resume.
-      this.saveCheckpoint();
-
-      // Re-entering the stop whose Deep Dive is playing must not restart the
-      // short narration over it: the listener is plainly still at that stop.
-      // markEntered() keeps deepDiveWaypointId for exactly this case.
-      if (useTourSession.getState().deepDiveWaypointId === waypoint.id) return;
-
-      const track = waypoint.audio;
-      if (!track) return;
-      const uri = await this.playableUri(track);
-      if (!uri) return;
-      // Streaming takes a round trip to sign; if the listener left the stop
-      // meanwhile, starting its narration now would play it in the wrong place.
-      if (useTourSession.getState().activeWaypointId !== waypoint.id) return;
-
-      try {
-        await this.audio.play(track, uri, waypoint);
-        // Report playing immediately rather than waiting for the first
-        // playbackStatusUpdate. Otherwise the transport button shows "paused"
-        // for the gap between tapping and the first event - and stays wrong if
-        // that event is delayed. The status feed corrects this either way.
-        //
-        // Guarded: play() reports an unsupported format or a failed create
-        // through onError and then RETURNS normally. Claiming "playing" after
-        // that overwrote the error state setPlaybackError had just reset.
-        if (this.audio.playingTrackId !== track.id) return;
-        const s = useTourSession.getState();
-        s.setPlayback({
-          isPlaying: true,
-          positionSeconds: 0,
-          durationSeconds: track.durationSeconds ?? 0,
-        });
-      } catch (err) {
-        // A missing or unplayable file must not kill the tour - the user keeps
-        // walking and the next waypoint still triggers.
-        console.warn(`[TourSession] playback failed for ${waypoint.name}:`, err);
-        useTourSession
-          .getState()
-          .setPlaybackError(err instanceof Error ? err.message : 'Could not play this track.');
-      }
-      return;
-    }
-
-    useTourSession.getState().markExited(waypoint.id);
-
-    // Only silence the track THIS waypoint owns.
-    //
-    // fadeOutAndStop() used to be unconditional, which made an exit stop
-    // whatever happened to be playing. That is wrong whenever one fix both
-    // enters a zone and exits another - and with exit hysteresis, that is
-    // reachable on the shipped test tour: the entry radii (20 m + 25 m = 45 m)
-    // clear the 58.7 m gap, but the EXIT radii (x1.6, so 32 m + 40 m = 72 m) do
-    // not. evaluateGeofences() walked waypoints in sort order, so arriving at
-    // stop 1 from stop 2 emitted enter(1) then exit(2), and exit(2) cut off the
-    // narration enter(1) had just started. The user stands at Jaffa Gate in
-    // silence. Since TASK-902 exits are emitted before the entry, but this check
-    // stays: it is what makes the event ORDER irrelevant here. Phase E of
-    // npm run sim:walk.
-    const exiting = waypoint.audio;
-    if (exiting && this.audio.playingTrackId === exiting.id) {
-      // Zone exit fades out rather than cutting (PRD Screen 4).
-      await this.audio.fadeOutAndStop();
-    }
-  }
-
   /**
    * What to hand the player (TASK-605, Hybrid Offline-First).
    *
-   * The bundled file, whenever it is on disk - which is the normal case and
-   * costs nothing. If it is NOT (storage cleared by the OS or the user, or the
-   * download removed while a tour was open) and the device is online, a signed
-   * stream of the same object instead: before this, that stop simply played
-   * silence with full signal available.
+   * The bundled file, whenever it is on disk - the normal case, and fast. If
+   * it is NOT and the device is online, a signed stream of the same object.
+   * NOTE (Epic 15): signing plus loading must fit inside the engine's 5 s
+   * PLAY timeout, or the stop is abandoned as failed - the case to watch on a
+   * slow network.
    *
    * Offline with no file, the local path is returned unchanged so AudioService
    * fails loudly exactly as it did before, rather than silently.
-   *
-   * A streamed track's transcript is fetched alongside it (TASK-1003), so the
-   * karaoke text survives the fallback too. Not awaited: playback must not
-   * wait on an accessibility extra, and the view shows "loading" meanwhile.
    */
   private async playableUri(track: AudioTrack): Promise<string | null> {
     const local = track.localUri ?? null;
@@ -660,84 +671,56 @@ class TourSessionController {
   }
 
   // ---------------------------------------------------------------------------
-  // Manual trigger - for testing without walking to Jerusalem
+  // The listener's controls - all become engine events
   // ---------------------------------------------------------------------------
 
   /**
-   * Fire a waypoint's narration by hand, bypassing the distance check.
-   *
-   * Deliberately synthesises the exact event a real zone entry would produce and
-   * pushes it through the SAME handler, rather than calling the audio service
-   * directly. Everything downstream of the event runs for real: visit tracking,
-   * the completion prompt, local-file resolution, lock-screen metadata and the
-   * playback status feed.
-   *
-   * What it skips, precisely: this never reaches LocationService, so the
-   * distance test, the re-trigger cooldown and the exit hysteresis are all
-   * bypassed. Repeat taps therefore replay immediately rather than being
-   * suppressed by the cooldown - convenient for testing, but it means this is
-   * not a test of the debounce logic. LocationService's zone state is
-   * untouched.
-   *
-   * It DOES advance the visiting order (TASK-902): the stop, and any stop
-   * scheduled before it that was not reached, count as passed, so the engine
-   * arms the stop after it. Without that, a stop triggered by hand would still
-   * be armed and would narrate a second time on arrival, and a stop whose zone
-   * was missed would block the rest of the tour. Replaying a stop already
-   * passed (playNarration) leaves the order alone.
+   * Play a stop's narration now: the debug trigger, and "replay". Must be a
+   * stop of the active chapter (anything else is reported by the engine as a
+   * caller bug). Firing it moves the window past any stop before it.
    */
   async triggerWaypoint(waypointId: string): Promise<void> {
-    const waypoint = useTourSession.getState().waypoints.find((w) => w.id === waypointId);
-    if (!waypoint) return;
-
-    this.location?.markReached(waypointId);
-
-    await this.handleGeofence({
-      type: 'enter',
-      waypoint,
-      at: waypoint.coordinate,
-      timestamp: Date.now(),
-    });
+    this.runner?.dispatch({ type: 'MANUAL_TRIGGER', stopId: waypointId, at: Date.now() });
   }
 
-  /**
-   * Stop a stop's audio as a zone exit would, with the same fade-out.
-   *
-   * A Deep Dive deliberately survives a zone exit, so the synthetic exit alone
-   * would leave one playing behind a dismissed player. Stop means stop.
-   */
+  /** Leave a Deep Dive and replay the stop's own narration. */
+  async playNarration(waypointId: string): Promise<void> {
+    await this.triggerWaypoint(waypointId);
+  }
+
+  /** Play a stop's Deep Dive in place of whatever is on air (TASK-602). */
+  async playDeepDive(waypointId: string): Promise<void> {
+    this.runner?.dispatch({ type: 'DEEP_DIVE_REQUESTED', stopId: waypointId, at: Date.now() });
+  }
+
+  /** The listener dismissed the stop's card: stop it; the next waiting stop follows. */
   async releaseWaypoint(waypointId: string): Promise<void> {
-    const waypoint = useTourSession.getState().waypoints.find((w) => w.id === waypointId);
-    if (!waypoint) return;
-
-    const store = useTourSession.getState();
-    if (store.deepDiveWaypointId === waypointId) {
-      store.endDeepDive();
-      await this.audio.stop('audio_stopped');
+    if (useTourSession.getState().activeWaypointId !== waypointId) return;
+    const runner = this.runner;
+    if (runner && runner.state.audio.kind !== 'idle') {
+      runner.dispatch({ type: 'USER_SKIP', at: Date.now() });
+    } else {
+      // Nothing on air (a finished narration's card): just take the card down.
+      useTourSession.getState().setOnAir(null, false);
     }
-
-    await this.handleGeofence({
-      type: 'exit',
-      waypoint,
-      at: waypoint.coordinate,
-      timestamp: Date.now(),
-    });
   }
 
-  /** Transport control for the on-screen player. */
+  /** Manual chapter advance (PM: manual only for MVP). For the chapter UI. */
+  selectChapter(chapterId: string): void {
+    this.runner?.dispatch({ type: 'CHAPTER_SELECTED', chapterId, at: Date.now() });
+  }
+
+  /** Transport control for the on-screen player. Reported to the engine as by:user. */
   togglePlayPause(): void {
+    const actor = this.actor;
+    if (actor === null) return;
+    const s = useTourSession.getState();
     if (this.audio.isPlaying) {
-      this.audio.pause();
-      const s = useTourSession.getState();
+      actor.pauseByUser();
       s.setPlayback({ isPlaying: false, positionSeconds: s.positionSeconds, durationSeconds: s.durationSeconds });
     } else {
-      this.audio.resume();
-      const s = useTourSession.getState();
-      s.setPlayback({
-        isPlaying: true,
-        positionSeconds: s.positionSeconds,
-        durationSeconds: s.durationSeconds,
-      });
+      actor.resumeByUser();
+      s.setPlayback({ isPlaying: true, positionSeconds: s.positionSeconds, durationSeconds: s.durationSeconds });
     }
   }
 
@@ -753,61 +736,26 @@ class TourSessionController {
     await this.seekTo(useTourSession.getState().positionSeconds - seconds);
   }
 
-  /**
-   * Play a stop's Deep Dive in place of its narration (TASK-602).
-   *
-   * Goes through the same AudioService.play() as narration, so the Deep Dive is
-   * a real audio_started/completed/skipped event stream. That is a KPI problem
-   * the handover flags: nothing in the event distinguishes the two kinds.
-   */
-  async playDeepDive(waypointId: string): Promise<void> {
-    const waypoint = useTourSession.getState().waypoints.find((w) => w.id === waypointId);
-    const track = waypoint?.deepDive;
-    if (!waypoint || !track) return;
-    const uri = await this.playableUri(track);
-    if (!uri) return;
-
-    // Before play(), not after: a synchronous failure inside play() reports
-    // through setPlaybackError, and startDeepDive would clear that error.
-    useTourSession.getState().startDeepDive(waypoint.id);
-
-    try {
-      await this.audio.play(track, uri, waypoint);
-      if (this.audio.playingTrackId !== track.id) return;
-      useTourSession.getState().setPlayback({
-        isPlaying: true,
-        positionSeconds: 0,
-        durationSeconds: track.durationSeconds ?? 0,
-      });
-    } catch (err) {
-      console.warn(`[TourSession] deep dive failed for ${waypoint.name}:`, err);
-      useTourSession
-        .getState()
-        .setPlaybackError(err instanceof Error ? err.message : 'Could not play the Deep Dive.');
-    }
-  }
-
-  /** Leave a Deep Dive and replay the stop's own narration. */
-  async playNarration(waypointId: string): Promise<void> {
-    useTourSession.getState().endDeepDive();
-    await this.triggerWaypoint(waypointId);
-  }
-
   // ---------------------------------------------------------------------------
-  // App state - exactly one location subscription at a time
+  // App state - iOS hands tracking between the foreground watcher and the task
   // ---------------------------------------------------------------------------
 
+  private attachAppState(): void {
+    this.appStateSub?.remove();
+    this.appStateSub = AppState.addEventListener('change', (next) => {
+      void this.handleAppStateChange(next);
+    });
+  }
+
   /**
-   * Swap the foreground watcher for the background task and back.
-   *
-   * Running both would double GPS wake-ups and deliver every fix twice, which
-   * the debounce would mask rather than fix. Backgrounding deliberately does
-   * NOT stop tracking - hands-free playback with the phone pocketed is the
-   * product.
+   * Swap the foreground watcher for the background task and back (iOS).
+   * Running both would double GPS wake-ups and deliver every fix twice - the
+   * engine's monotonic-time guard would drop the duplicates, but the wake-ups
+   * would still cost battery.
    *
    * ANDROID: no handoff at all. The task opened by start() already runs
-   * across foreground and background, and starting one from here would throw -
-   * the app is no longer in the foreground by the time this fires (Epic 13).
+   * across foreground and background, and starting one from here would throw
+   * (Epic 13).
    */
   private async handleAppStateChange(next: AppStateStatus): Promise<void> {
     const service = this.location;
@@ -874,9 +822,16 @@ class TourSessionController {
     this.appStateSub?.remove();
     this.appStateSub = null;
 
+    // The engine stops before anything native: no heartbeat, no further
+    // effects, and late callbacks from the player or the GPS are ignored.
+    this.runner?.stop();
+    this.runner = null;
+    const actor = this.actor;
+    this.actor = null;
+    this.session = null;
+
     const service = this.location;
     this.location = null;
-
     if (service) {
       // Both, unconditionally: whichever was not running is a cheap no-op, and
       // guessing wrong is how a watcher survives the session that owned it.
@@ -885,14 +840,12 @@ class TourSessionController {
     }
 
     // createAudioPlayer holds native resources until remove(); stop() does that.
-    // 'audio_stopped' so a tour ended mid-narration is recorded as a drop-off
-    // rather than vanishing from the funnel.
-    await this.audio.stop('audio_stopped');
+    // 'audio_stopped' so a tour ended mid-narration is recorded as a drop-off.
+    if (actor) await actor.dispose();
+    else await this.audio.stop('audio_stopped');
     this.audio.setTelemetry(null);
-    this.audio.setOnStatus(null);
-    this.audio.setOnError(null);
 
-    // Aborts any route request and ignores its late answer.
+    // Aborts any route request a pre-Epic-15 path left in flight.
     routeManager.stop();
 
     useTourSession.getState().reset();

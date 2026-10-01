@@ -388,6 +388,11 @@ await (async () => {
   assert('a user pause is reported as by:user, and its silence is not an os interruption', a.kinds().endsWith('AUDIO_INTERRUPTED:1:user') && a.p.calls.includes('pause'));
   a.actor.resumeByUser();
   assert('user resume: resumed', a.kinds().endsWith('AUDIO_RESUMED:1') && a.p.calls.includes('resume'));
+  a.p.emit({ isPlaying: false, positionSeconds: 5 });
+  assert('a second OS interruption', a.kinds().endsWith('AUDIO_INTERRUPTED:1:os'));
+  const resumesBefore = a.p.calls.filter((c) => c === 'resume').length;
+  a.actor.resumeByUser();
+  assert('the play button also resumes an OS interruption that never ended', a.kinds().endsWith('AUDIO_RESUMED:1') && a.p.calls.filter((c) => c === 'resume').length === resumesBefore + 1);
   a.p.emit({ isPlaying: false, positionSeconds: 60, didJustFinish: true });
   assert('track finishes: AUDIO_ENDED with its token', a.kinds().endsWith('AUDIO_ENDED:1'));
   const n = a.events.length;

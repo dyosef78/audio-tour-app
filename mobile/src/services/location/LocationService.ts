@@ -134,15 +134,42 @@ export class LocationService {
   /** Serialises watcher restarts so overlapping changes cannot interleave. */
   private applying: Promise<void> = Promise.resolve();
 
+  /**
+   * ENGINE MODE (Epic 15). The loose-sequence engine owns every trigger
+   * decision, so this service only TRANSPORTS fixes:
+   *   - no geofence evaluation and no Adaptive GPS here (onGpsFix forwards);
+   *   - the fine tier, pinned, on both platforms (architecture plan,
+   *     Approach A: no restart in the background, ever);
+   *   - distanceInterval 0, so a fix arrives every timeInterval even standing
+   *     still. That stream is the engine's clock in the background, where
+   *     React Native pauses JS timers on Android.
+   * Chapter changes call retune() - from an in-app tap, so in the foreground.
+   */
+  readonly engineMode: boolean;
+
   /** `platform` is injectable so the Node simulator can drive the Android path. */
-  constructor(mode: TransitMode = 'walking', platform: string = Platform.OS) {
+  constructor(mode: TransitMode = 'walking', platform: string = Platform.OS, options: { engineMode?: boolean } = {}) {
     this.profile = profileFor(mode);
     this.persistentTask = platform === 'android';
+    this.engineMode = options.engineMode ?? false;
     this.currentTier = this.initialTier();
   }
 
   private initialTier(): 'coarse' | 'fine' {
-    return this.persistentTask ? 'fine' : 'coarse';
+    return this.persistentTask || this.engineMode ? 'fine' : 'coarse';
+  }
+
+  /**
+   * A new chapter's transit mode (engine mode only): adopt its sampling and
+   * reopen whichever transport is live. On Android that restarts the
+   * persistent task, which only works in the foreground - the caller is a
+   * chapter tap, so it is; if not, this throws and the caller reports it.
+   */
+  async retune(mode: TransitMode): Promise<void> {
+    if (!this.engineMode) throw new Error('retune() is for engine mode; legacy sessions run one mode');
+    this.profile = profileFor(mode);
+    this.applying = this.applying.then(() => this.restartTracking());
+    await this.applying;
   }
 
   // ---------------------------------------------------------------------------
@@ -388,6 +415,7 @@ export class LocationService {
   onGpsFix(fix: GpsFix): void {
     this.callbacks.onLocation?.(fix.coordinate, fix.accuracyM);
     this.callbacks.onGpsFix?.(fix);
+    if (this.engineMode) return; // the engine decides; this service only transports
     this.evaluateGeofences(fix.coordinate, fix.timestamp);
     this.applyAdaptiveGps(fix.coordinate, fix.timestamp);
   }
@@ -625,7 +653,10 @@ export class LocationService {
     return {
       accuracy: s.accuracy,
       timeInterval: s.timeInterval,
-      distanceInterval: s.distanceInterval,
+      // Engine mode: every timeInterval, moving or not - the background clock
+      // (see engineMode). The engine's swept test does not need a distance
+      // filter to avoid redundant work: a stationary fix is a zero-length sweep.
+      distanceInterval: this.engineMode ? 0 : s.distanceInterval,
     };
   }
 

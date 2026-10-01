@@ -1,5 +1,6 @@
 import { File, Paths } from 'expo-file-system';
 
+import { createProgressRepository } from './progressRepository';
 import { createCheckpointStore, type CheckpointIO } from './sessionCheckpoint';
 
 /**
@@ -17,7 +18,7 @@ const read = (name: string): string | null => {
   return f.exists ? f.textSync() : null;
 };
 
-const fileIO: CheckpointIO = {
+export const checkpointFileIO: CheckpointIO = {
   readMain: () => read(MAIN),
   readTemp: () => read(TEMP),
   writeTemp(text) {
@@ -36,4 +37,12 @@ const fileIO: CheckpointIO = {
   },
 };
 
-export const sessionCheckpoints = createCheckpointStore(fileIO);
+/** Epic 13 (v1) store - kept only so its pure tests keep running; no session writes it. */
+export const sessionCheckpoints = createCheckpointStore(checkpointFileIO);
+
+/**
+ * Epic 15 (v2): the engine's progress, same two files, same atomic
+ * temp+rename. A v1 file left by an older build reads as invalid and is
+ * discarded with its reason logged.
+ */
+export const tourProgress = createProgressRepository(checkpointFileIO);
