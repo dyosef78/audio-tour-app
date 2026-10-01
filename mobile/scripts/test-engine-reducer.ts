@@ -89,17 +89,28 @@ interface Run {
   state: EngineState;
   effects: Effect[];
   persists: number;
+  /** A well-behaved player: every PLAY is confirmed by AUDIO_STARTED at once. */
+  autoAudio: boolean;
 }
-function start(tour: EngineTour, chapterId: string): Run {
-  return { state: createEngineState(tour, freshProgress(tour, chapterId)), effects: [], persists: 0 };
+function start(tour: EngineTour, chapterId: string, autoAudio = true): Run {
+  return { state: createEngineState(tour, freshProgress(tour, chapterId)), effects: [], persists: 0, autoAudio };
+}
+function restore(tour: EngineTour, progress: Parameters<typeof createEngineState>[1], autoAudio = true): Run {
+  return { state: createEngineState(tour, progress), effects: [], persists: 0, autoAudio };
 }
 function send(run: Run, event: EngineEvent): Run {
   const r = reduce(run.state, event);
-  return {
+  let next: Run = {
+    ...run,
     state: r.state,
     effects: [...run.effects, ...r.effects],
     persists: run.persists + (r.state.progress !== run.state.progress ? 1 : 0),
   };
+  if (run.autoAudio) {
+    const now = event.type === 'FIX_BATCH' ? event.receivedAt : event.at;
+    for (const e of r.effects) if (e.type === 'PLAY') next = send(next, { type: 'AUDIO_STARTED', token: e.token, at: now });
+  }
+  return next;
 }
 const batch = (fixes: GpsFix[], receivedAt?: number): EngineEvent => ({
   type: 'FIX_BATCH',
@@ -128,13 +139,13 @@ heading('Window: stops fire in sequence; busy narration queues (driving)');
   r = feed(r, drive(0, 1200, 0, T0, 27.8));
   assert('s0 fired and was put on air', fired(r).join() === 's0' && plays(r).length === 1 && plays(r)[0]?.stopId === 's0');
   const t0 = plays(r)[0]?.token ?? -1;
-  r = send(r, { type: 'AUDIO_STARTED', token: t0, at: T0 + 37_000 });
   assert('AUDIO_STARTED records s0 as played', 's0' in r.state.progress.played && r.state.audio.kind === 'playing');
   r = feed(r, drive(1200, 2200, 0, T0 + 44_000, 27.8));
   assert('s1 fired while s0 plays: QUEUED, not played over it', fired(r).join() === 's0,s1' && r.state.progress.queue.length === 1 && plays(r).length === 1);
   r = send(r, { type: 'AUDIO_ENDED', token: t0, at: T0 + 80_000 });
   assert('s0 ends: s1 goes on air with a NEW token', plays(r).length === 2 && plays(r)[1]?.stopId === 's1' && plays(r)[1]?.token !== t0);
-  assert('progress written on fire and on start only - never per fix', r.persists <= 4, `${r.persists} writes`);
+  // ~80 fixes, 5 writes: fire s0, start s0, fire s1, dequeue s1, start s1.
+  assert('progress written only when it changes - 5 writes over ~80 fixes', r.persists === 5, `${r.persists} writes`);
 }
 
 // -----------------------------------------------------------------------------
@@ -351,18 +362,19 @@ heading('Interruptions (iOS doNotMix) and the watchdog');
     stops: [0, 1].map((i) => stop(`s${i}`, 'drive', i, 1000 * (i + 1), 0, 150)),
   };
   const timeout = MODE_CONFIG.driving.interruptionTimeoutMs;
-  let r = start(tour, 'drive');
-  r = feed(r, drive(0, 1100, 0, T0, 27.8));
+  let r = start(tour, 'drive', false);
+  // Stop feeding as s0 fires, so the prompt lands inside the 5 s PLAY window.
+  r = feed(r, drive(0, 880, 0, T0, 27.8));
   const tok = plays(r)[0]?.token ?? -1;
-  r = send(r, { type: 'AUDIO_INTERRUPTED', token: tok, at: T0 + 39_000, by: 'os' });
-  assert('Google Maps prompt: interrupted', r.state.audio.kind === 'interrupted');
-  r = send(r, { type: 'AUDIO_STARTED', token: tok, at: T0 + 39_500 });
+  r = send(r, { type: 'AUDIO_INTERRUPTED', token: tok, at: T0 + 32_500, by: 'os' });
+  assert('Google Maps prompt while the player loads: interrupted', r.state.audio.kind === 'interrupted');
+  r = send(r, { type: 'AUDIO_STARTED', token: tok, at: T0 + 33_000 });
   assert('STARTED after the interruption still records played, stays interrupted', 's0' in r.state.progress.played && r.state.audio.kind === 'interrupted');
-  r = send(r, { type: 'AUDIO_RESUMED', token: tok, at: T0 + 44_000 });
+  r = send(r, { type: 'AUDIO_RESUMED', token: tok, at: T0 + 36_000 });
   assert('prompt over: playing again (same narration, same token)', r.state.audio.kind === 'playing' && r.state.audio.token === tok);
 
   r = send(r, { type: 'AUDIO_INTERRUPTED', token: tok, at: T0 + 50_000, by: 'os' });
-  r = feed(r, drive(1100, 2050, 0, T0 + 51_000, 27.8));
+  r = feed(r, drive(900, 2050, 0, T0 + 51_000, 27.8));
   assert('s1 fires during the interruption: queued, not played over the paused s0', r.state.progress.queue.length === 1 && plays(r).length === 1);
   r = send(r, { type: 'TICK', at: T0 + 50_000 + timeout });
   assert('watchdog at the timeout: ONE resume request', r.effects.filter((e) => e.type === 'RESUME').length === 1);
@@ -392,19 +404,19 @@ heading('Persistence identity, restore, chapters, manual trigger');
   assert('18 fixes that change nothing: SAME progress object (no write)', r.state.progress === p0 && r.persists === 0);
 
   r = feed(r, drive(500, 2100, 0, T0 + 20_000, 27.8));
-  assert('d0 on air, d1 queued', r.state.audio.kind === 'starting' && r.state.progress.queue.length === 1);
+  assert('d0 on air, d1 queued', r.state.audio.kind === 'playing' && r.state.progress.queue.length === 1);
   r = send(r, { type: 'CHAPTER_SELECTED', chapterId: 'walk', at: T0 + 80_000 });
-  assert('chapter switch: waiting d1 expires, tracking retuned to walking', r.state.progress.queue.length === 0 && r.effects.some((e) => e.type === 'RETUNE_TRACKING' && e.transitMode === 'walking'));
-  assert('...and the narration on air is NOT cut', r.state.audio.kind === 'starting' && !r.effects.some((e) => e.type === 'STOP'));
+  assert('chapter switch: waiting d1 expires, transit mode applied (walking)', r.state.progress.queue.length === 0 && r.effects.some((e) => e.type === 'APPLY_TRANSIT_MODE' && e.transitMode === 'walking'));
+  assert('...and the narration on air is NOT cut', r.state.audio.kind === 'playing' && !r.effects.some((e) => e.type === 'STOP'));
   throws('unknown chapter throws', () => reduce(r.state, { type: 'CHAPTER_SELECTED', chapterId: 'nope', at: T0 }));
   throws('manual trigger of another chapter\'s stop throws', () => reduce(r.state, { type: 'MANUAL_TRIGGER', stopId: 'd1', at: T0 }));
 
   // Restore: a checkpoint with d1 still waiting, written 30 s ago.
   const saved = { chapterId: 'drive', fired: { d0: T0, d1: T0 + 30_000 }, played: { d0: T0 + 1000 }, queue: [{ stopId: 'd1', firedAt: T0 + 30_000, firedWhere: at(2000, 0), expiresAt: T0 + 90_000 }] };
-  let back = { state: createEngineState(tour, saved), effects: [] as Effect[], persists: 0 };
+  let back = restore(tour, saved);
   back = send(back, { type: 'SESSION_STARTED', at: T0 + 60_000 });
   assert('resume within the TTL: the waiting stop plays', plays(back).some((p) => p.stopId === 'd1'));
-  let late = { state: createEngineState(tour, saved), effects: [] as Effect[], persists: 0 };
+  let late = restore(tour, saved);
   late = send(late, { type: 'SESSION_STARTED', at: T0 + 120_000 });
   assert('resume after the TTL: expired, not played', plays(late).length === 0 && tel(late, 'trigger_expired').length === 1);
   assert('progressProblem: queued-but-played is refused', progressProblem(tour, { ...saved, played: { d0: 1, d1: 2 } }) !== null);
@@ -412,9 +424,66 @@ heading('Persistence identity, restore, chapters, manual trigger');
   throws('createEngineState refuses a progress that does not fit the tour', () => createEngineState(tour, { ...saved, chapterId: 'gone' }));
 
   // Manual trigger of a stop already waiting: plays now, never again later.
-  let m = { state: createEngineState(tour, saved), effects: [] as Effect[], persists: 0 };
+  let m = restore(tour, saved);
   m = send(m, { type: 'MANUAL_TRIGGER', stopId: 'd1', at: T0 + 40_000 });
   assert('manual trigger of a queued stop: on air, and removed from the queue', plays(m).at(-1)?.stopId === 'd1' && m.state.progress.queue.length === 0);
+}
+
+// -----------------------------------------------------------------------------
+heading('Heartbeat: the PLAY timeout backstop and clock-only expiry');
+// -----------------------------------------------------------------------------
+{
+  const tour: EngineTour = {
+    chapters: [chapter('drive', 'driving')],
+    stops: [0, 1].map((i) => stop(`s${i}`, 'drive', i, 1000 * (i + 1), 0, 150)),
+  };
+  // s0 fires; keep driving into s1 so it queues behind a PLAY that never answers.
+  let r = start(tour, 'drive', false);
+  r = feed(r, [fix(800, 0, T0, { speedMps: 27.8, headingDeg: 90 }), fix(850, 0, T0 + 1000, { speedMps: 27.8, headingDeg: 90 })]);
+  r = feed(r, [fix(870, 0, T0 + 1700, { speedMps: 27.8, headingDeg: 90 }), fix(1860, 0, T0 + 1900, { speedMps: 27.8, headingDeg: 90 })]);
+  r = feed(r, [fix(1880, 0, T0 + 2600, { speedMps: 27.8, headingDeg: 90 })]);
+  const t0 = plays(r)[0]?.token ?? -1;
+  // When the PLAY was issued, read from the state rather than assumed.
+  const issued = r.state.audio.kind === 'starting' ? r.state.audio.since : Number.NaN;
+  assert('s0 PLAY issued, s1 waiting', r.state.audio.kind === 'starting' && r.state.progress.queue.length === 1, `${r.state.audio.kind} q=${r.state.progress.queue.length}`);
+  r = send(r, { type: 'TICK', at: issued + 4_999 });
+  assert('4.999 s: still waiting for the player', r.state.audio.kind === 'starting' && !r.effects.some((e) => e.type === 'STOP'));
+  r = send(r, { type: 'TICK', at: issued + 5_000 });
+  const stopped = r.effects.find((e) => e.type === 'STOP' && e.token === t0);
+  assert('5 s: s0 abandoned - STOP for its token, so a late player is torn down', stopped !== undefined);
+  assert('...the slot is freed and s1 goes on air', plays(r).at(-1)?.stopId === 's1' && r.state.audio.kind === 'starting');
+  assert('...reported as play_timeout', tel(r, 'audio_watchdog').some((e) => e.type === 'TELEMETRY' && e.detail.action === 'play_timeout'));
+  const afterTimeout = r.state;
+  r = send(r, { type: 'AUDIO_STARTED', token: t0, at: issued + 6_000 });
+  assert('a LATE AUDIO_STARTED for s0 is ignored (dead token)', r.state === afterTimeout && !('s0' in r.state.progress.played));
+  assert('recap lists s0 (fired, never heard)', missedStops(r.state, 'drive').map((s) => s.id).join() === 's0');
+}
+{
+  // Parked: no fixes at all. Only the heartbeat expires the waiting stop.
+  const tour: EngineTour = {
+    chapters: [chapter('drive', 'driving')],
+    stops: [0, 1].map((i) => stop(`s${i}`, 'drive', i, 1000 * (i + 1), 0, 150)),
+  };
+  let r = start(tour, 'drive');
+  r = feed(r, drive(0, 2050, 0, T0, 27.8));
+  assert('s0 playing, s1 waiting', r.state.audio.kind === 'playing' && r.state.progress.queue.length === 1);
+  const expiresAt = r.state.progress.queue[0]?.expiresAt ?? 0;
+  r = send(r, { type: 'TICK', at: expiresAt - 1 });
+  assert('parked, 1 ms before the TTL: s1 still waiting', r.state.progress.queue.length === 1);
+  r = send(r, { type: 'TICK', at: expiresAt });
+  assert('parked, at the TTL: s1 expired by the heartbeat alone', r.state.progress.queue.length === 0 && tel(r, 'trigger_expired').length === 1);
+  const quiet = r.state.progress;
+  r = send(r, { type: 'TICK', at: expiresAt + 1000 });
+  assert('a TICK that changes nothing writes nothing (same progress)', r.state.progress === quiet);
+}
+{
+  // FIX_BATCH is a heartbeat too: the play timeout fires on a fix, no TICK needed.
+  const tour: EngineTour = { chapters: [chapter('drive', 'driving')], stops: [stop('s0', 'drive', 0, 1000, 0, 150)] };
+  let r = start(tour, 'drive', false);
+  r = feed(r, drive(0, 900, 0, T0, 27.8));
+  const t0 = plays(r)[0]?.token ?? -1;
+  r = feed(r, drive(900, 1200, 0, T0 + 33_000, 27.8));
+  assert('Android background (no TICKs): the fix stream alone times out the PLAY', r.effects.some((e) => e.type === 'STOP' && e.token === t0));
 }
 
 console.log(`\n${checks - failures}/${checks} checks passed`);

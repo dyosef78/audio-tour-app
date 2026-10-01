@@ -92,6 +92,15 @@ export const MODE_CONFIG: Readonly<Record<TransitMode, ModeConfig>> = {
   },
 };
 
+/**
+ * A PLAY that has not produced AUDIO_STARTED (or AUDIO_FAILED) within this
+ * long is abandoned by the reducer itself (PM, Epic 15): the narration slot
+ * must never depend on a native callback arriving. Covers resolving a local
+ * file or signing a stream and loading it. Tunable - a slow network's signed
+ * stream is the case that would trip it first.
+ */
+export const PLAY_TIMEOUT_MS = 5_000;
+
 /** A fix stamped more than this in the future (a skewed device clock) is refused. */
 export const MAX_FUTURE_SKEW_MS = 5_000;
 

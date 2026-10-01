@@ -1,7 +1,7 @@
 import type { LatLng } from '../types/domain.ts';
 import { estimateCourse, evaluateApproach, type Course, type CourseFix } from './geo/bearing.ts';
 import { planarDistanceMeters } from './geo/sweep.ts';
-import { MAX_FIX_AGE_MS, MAX_FUTURE_SKEW_MS, MODE_CONFIG, type ModeConfig } from './config.ts';
+import { MAX_FIX_AGE_MS, MAX_FUTURE_SKEW_MS, MODE_CONFIG, PLAY_TIMEOUT_MS, type ModeConfig } from './config.ts';
 import type {
   AudioState,
   Effect,
@@ -55,10 +55,12 @@ import { distanceToZoneM, insideZone, sweepZone } from './zone.ts';
  * Window stops always win over re-anchor on the same fix. Re-anchor never
  * crosses a chapter (chapter advance is manual - PM, Epic 15).
  *
- * TIME: queue expiry compares fix timestamps (and, for audio events and
- * TICKs, the shell's Date.now()). Both are epoch ms; ingestion refuses fixes
- * skewed into the future or older than MAX_FIX_AGE_MS, which bounds the
- * disagreement.
+ * TIME: ONE clock for every timeout - the shell's Date.now() carried by each
+ * event (TICK.at, FIX_BATCH.receivedAt, AUDIO_*.at). A fix's own timestamp
+ * orders fixes and measures speed, nothing else. advanceClock() runs the
+ * PLAY timeout, the interruption watchdog and queue expiry, on every TICK
+ * (the 1 Hz heartbeat) AND every FIX_BATCH (the only heartbeat on Android in
+ * the background, where JS timers are paused).
  */
 
 // -----------------------------------------------------------------------------
@@ -127,7 +129,8 @@ export function reduce(state: EngineState, event: EngineEvent): ReduceResult {
       s = startNextIfIdle(s, event.at, effects);
       break;
     case 'FIX_BATCH':
-      for (const fix of ingest(event.fixes, event.receivedAt, s.lastFix)) s = stepFix(s, fix, effects);
+      s = advanceClock(s, event.receivedAt, effects);
+      for (const fix of ingest(event.fixes, event.receivedAt, s.lastFix)) s = stepFix(s, fix, event.receivedAt, effects);
       break;
     case 'AUDIO_STARTED':
       // Also when an interruption arrived while the player was still loading:
@@ -172,8 +175,7 @@ export function reduce(state: EngineState, event: EngineEvent): ReduceResult {
       }
       break;
     case 'TICK':
-      s = watchdog(s, event.at, effects);
-      s = { ...s, progress: pruneQueue(s, event.at, null, effects) };
+      s = advanceClock(s, event.at, effects);
       break;
     case 'CHAPTER_SELECTED':
       s = selectChapter(s, event.chapterId, effects);
@@ -218,7 +220,7 @@ export function ingest(fixes: readonly GpsFix[], receivedAt: number, lastFix: Gp
   return out;
 }
 
-function stepFix(state: EngineState, fix: GpsFix, effects: Effect[]): EngineState {
+function stepFix(state: EngineState, fix: GpsFix, now: number, effects: Effect[]): EngineState {
   const chapter = activeChapter(state);
   const mode = MODE_CONFIG[chapter.transitMode];
 
@@ -232,9 +234,8 @@ function stepFix(state: EngineState, fix: GpsFix, effects: Effect[]): EngineStat
   const course = estimateCourse(sweepable && prev ? courseFix(prev) : null, courseFix(fix));
 
   let s: EngineState = state;
-  s = watchdog(s, fix.timestamp, effects);
-  s = walkingExit(s, prev, fix, mode, effects);
-  s = { ...s, progress: pruneQueue(s, fix.timestamp, fix, effects) };
+  s = walkingExit(s, prev, fix, now, mode, effects);
+  s = { ...s, progress: pruneQueue(s, now, fix, effects) };
 
   const cursor = cursorOf(s, chapter.id);
   const k = chapter.sequencePolicy === 'strict' ? 1 : chapter.lookaheadStops;
@@ -260,7 +261,7 @@ function stepFix(state: EngineState, fix: GpsFix, effects: Effect[]): EngineStat
 
   if (windowHit !== null) {
     s = { ...s, reanchor: null, lastFix: fix };
-    return fire(s, windowHit, fix, 'window', mode, effects);
+    return fire(s, windowHit, fix, now, 'window', mode, effects);
   }
 
   // --- beyond: re-anchor evidence -----------------------------------------
@@ -297,7 +298,7 @@ function stepFix(state: EngineState, fix: GpsFix, effects: Effect[]): EngineStat
     for (const st of skipped) effects.push(telemetry('trigger_missed', st.id, { reason: 'reanchor_skipped', to: target.index }));
     effects.push(telemetry('trigger_reanchored', target.id, { from: cursor, to: target.index, skipped: skipped.length }));
     s = { ...s, reanchor: null };
-    return fire(s, target, fix, 'reanchor', mode, effects);
+    return fire(s, target, fix, now, 'reanchor', mode, effects);
   }
   return s;
 }
@@ -348,14 +349,14 @@ function reportBearing(
  * outside - so a stop fired by a swept segment that ended beyond the zone is
  * not cut the instant it starts.
  */
-function walkingExit(s: EngineState, prev: GpsFix | null, fix: GpsFix, mode: ModeConfig, effects: Effect[]): EngineState {
+function walkingExit(s: EngineState, prev: GpsFix | null, fix: GpsFix, now: number, mode: ModeConfig, effects: Effect[]): EngineState {
   if (!mode.exitStopsNarration || s.audio.kind === 'idle' || prev === null) return s;
   const stop = s.tour.stops.find((st) => st.id === audioStopId(s.audio));
   if (!stop) return s;
   const wasInside = insideZone(prev.coordinate, stop.zone, mode.exitHysteresisFactor);
   if (!wasInside || insideZone(fix.coordinate, stop.zone, mode.exitHysteresisFactor)) return s;
   effects.push({ type: 'STOP', token: audioToken(s.audio), fade: true });
-  return startNextIfIdle({ ...s, audio: { kind: 'idle' } }, fix.timestamp, effects);
+  return startNextIfIdle({ ...s, audio: { kind: 'idle' } }, now, effects);
 }
 
 // -----------------------------------------------------------------------------
@@ -366,6 +367,7 @@ function fire(
   s: EngineState,
   stop: EngineStop,
   fix: GpsFix,
+  now: number,
   reason: 'window' | 'reanchor',
   mode: ModeConfig,
   effects: Effect[],
@@ -373,12 +375,12 @@ function fire(
   effects.push(telemetry('trigger_fired', stop.id, { index: stop.index, reason }));
   const item: QueueItem = {
     stopId: stop.id,
-    firedAt: fix.timestamp,
+    firedAt: now,
     firedWhere: fix.coordinate,
-    expiresAt: fix.timestamp + mode.queueTtlMs,
+    expiresAt: now + mode.queueTtlMs,
   };
-  const progress: Progress = { ...s.progress, fired: { ...s.progress.fired, [stop.id]: fix.timestamp } };
-  return enqueue({ ...s, progress }, item, mode.whileBusy, mode.maxQueue, fix.timestamp, effects);
+  const progress: Progress = { ...s.progress, fired: { ...s.progress.fired, [stop.id]: now } };
+  return enqueue({ ...s, progress }, item, mode.whileBusy, mode.maxQueue, now, effects);
 }
 
 /** Put a fired stop in line, or straight on air. */
@@ -446,6 +448,32 @@ function pruneQueue(s: EngineState, now: number, at: GpsFix | null, effects: Eff
 }
 
 /**
+ * Everything that depends only on the clock, in a fixed order: a stuck PLAY
+ * first (it holds the slot), then a stuck interruption, then queue expiry.
+ */
+function advanceClock(s: EngineState, now: number, effects: Effect[]): EngineState {
+  let next = playTimeout(s, now, effects);
+  next = watchdog(next, now, effects);
+  const progress = pruneQueue(next, now, next.lastFix, effects);
+  return progress === next.progress ? next : { ...next, progress };
+}
+
+/**
+ * The reducer-side backstop (PM, Epic 15): a PLAY with no AUDIO_STARTED or
+ * AUDIO_FAILED after PLAY_TIMEOUT_MS is treated as failed. The STOP for its
+ * token is what makes this safe: if the player does start late, the audio
+ * shell tears it down instead of letting it talk over the next narration -
+ * and its late AUDIO_STARTED carries a dead token, so the reducer ignores it.
+ */
+function playTimeout(s: EngineState, now: number, effects: Effect[]): EngineState {
+  const a = s.audio;
+  if (a.kind !== 'starting' || now - a.since < PLAY_TIMEOUT_MS) return s;
+  effects.push({ type: 'STOP', token: a.token, fade: false });
+  effects.push(telemetry('audio_watchdog', a.stopId, { action: 'play_timeout', heldMs: now - a.since }));
+  return startNextIfIdle({ ...s, audio: { kind: 'idle' } }, now, effects);
+}
+
+/**
  * An OS interruption that never ends would hold the narration slot forever:
  * the queue behind it would expire stop by stop. After the timeout, ask the
  * player to resume once; after twice the timeout, give the narration up and
@@ -481,7 +509,7 @@ function selectChapter(s: EngineState, chapterId: string, effects: Effect[]): En
   const chapter = chapterOrThrow(s.tour, chapterId);
   if (chapterId === s.progress.chapterId) return s;
   for (const q of s.progress.queue) effects.push(telemetry('trigger_expired', q.stopId, { reason: 'chapter_left' }));
-  effects.push({ type: 'RETUNE_TRACKING', transitMode: chapter.transitMode });
+  effects.push({ type: 'APPLY_TRANSIT_MODE', transitMode: chapter.transitMode });
   // lastFix is kept: the next segment is judged against the NEW mode's sweep
   // bounds, so a walking-to-driving switch cannot bridge an implausible gap.
   return {

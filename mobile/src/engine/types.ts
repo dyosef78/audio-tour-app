@@ -79,10 +79,15 @@ export interface EngineTour {
 // State
 // -----------------------------------------------------------------------------
 
-/** A stop that fired and is waiting for the narration slot. */
+/**
+ * A stop that fired and is waiting for the narration slot.
+ *
+ * Times here and everywhere in the state are the SHELL's clock (Date.now()
+ * at the event), never a fix's own timestamp: one clock for every timeout.
+ * Fix timestamps are used only to order fixes and measure speed.
+ */
 export interface QueueItem {
   stopId: string;
-  /** Fix time at which it fired. */
   firedAt: number;
   /** Where it fired, for the distance expiry. */
   firedWhere: LatLng;
@@ -159,9 +164,11 @@ export type EngineEvent =
   | { type: 'AUDIO_INTERRUPTED'; token: number; at: number; by: 'os' | 'user' }
   | { type: 'AUDIO_RESUMED'; token: number; at: number }
   /**
-   * Clock only. The shell sends it every few seconds WHILE audio is
-   * interrupted, so the interruption watchdog runs even when no fixes arrive
-   * (a parked car: distanceInterval suppresses them).
+   * Clock only: the shell's 1 Hz heartbeat (PM, Epic 15). Drives the PLAY
+   * timeout, the interruption watchdog and queue expiry when no fix arrives.
+   * FIX_BATCH runs the same clock checks at its receivedAt, because on
+   * Android JS timers are paused in the background and the fix stream is the
+   * only heartbeat there.
    */
   | { type: 'TICK'; at: number }
   /** Manual chapter advance (PM: manual only for MVP). */
@@ -187,8 +194,12 @@ export type Effect =
   | { type: 'STOP'; token: number; fade: boolean }
   /** Ask the player to resume after an interruption that never ended. */
   | { type: 'RESUME'; token: number }
-  /** Chapter switched: tracking must use this mode's sampling (Android restarts the task). */
-  | { type: 'RETUNE_TRACKING'; transitMode: TransitMode }
+  /**
+   * The chapter's mode changed: tracking must use its sampling (Android
+   * restarts the task, so this only ever runs from an in-app tap) and the
+   * audio session its interruption mode (driving: duckOthers on Android).
+   */
+  | { type: 'APPLY_TRANSIT_MODE'; transitMode: TransitMode }
   | { type: 'TELEMETRY'; kind: TelemetryKind; stopId: string | null; detail: Readonly<Record<string, string | number>> };
 
 export interface ReduceResult {
