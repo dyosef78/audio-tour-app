@@ -486,5 +486,42 @@ heading('Heartbeat: the PLAY timeout backstop and clock-only expiry');
   assert('Android background (no TICKs): the fix stream alone times out the PLAY', r.effects.some((e) => e.type === 'STOP' && e.token === t0));
 }
 
+// -----------------------------------------------------------------------------
+heading('Deep Dive and user skip');
+// -----------------------------------------------------------------------------
+{
+  const tour: EngineTour = {
+    chapters: [chapter('walk', 'walking')],
+    stops: [stop('a', 'walk', 0, 50, 0, 20), stop('b', 'walk', 1, 300, 0, 20)],
+  };
+  let r = start(tour, 'walk');
+  r = feed(r, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((i) => fix(i * 5, 0, T0 + i * 4000, { accuracyM: 5 })));
+  const narration = plays(r)[0];
+  assert('a narrates', narration?.stopId === 'a' && narration.track === 'narration');
+  r = send(r, { type: 'DEEP_DIVE_REQUESTED', stopId: 'a', at: T0 + 45_000 });
+  const dd = plays(r).at(-1);
+  assert('Deep Dive displaces the narration (STOP preempted) and goes on air', dd?.track === 'deep_dive' && r.effects.some((e) => e.type === 'STOP' && e.token === narration?.token && e.reason === 'preempted'));
+  assert('a Deep Dive marks nothing new as played', Object.keys(r.state.progress.played).join() === 'a');
+  r = feed(r, [fix(120, 0, T0 + 60_000, { accuracyM: 5 }), fix(150, 0, T0 + 70_000, { accuracyM: 5 })]);
+  assert('walking away from a: the Deep Dive is NOT faded (it survives the zone exit)', !r.effects.some((e) => e.type === 'STOP' && e.token === dd?.token));
+  r = feed(r, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30].map((i) => fix(160 + i * 5, 0, T0 + 80_000 + i * 4000, { accuracyM: 5 })));
+  assert('...but reaching a DIFFERENT stop displaces it (walking preempts)', r.effects.some((e) => e.type === 'STOP' && e.token === dd?.token && e.reason === 'preempted') && plays(r).at(-1)?.stopId === 'b');
+  throws('a Deep Dive for a stop outside the active chapter throws', () => reduce(r.state, { type: 'DEEP_DIVE_REQUESTED', stopId: 'nope', at: T0 }));
+}
+{
+  // Driving: the listener skips; the waiting stop follows.
+  const tour: EngineTour = {
+    chapters: [chapter('drive', 'driving')],
+    stops: [0, 1].map((i) => stop(`s${i}`, 'drive', i, 1000 * (i + 1), 0, 150)),
+  };
+  let r = start(tour, 'drive');
+  r = feed(r, drive(0, 2050, 0, T0, 27.8));
+  const first = plays(r)[0];
+  r = send(r, { type: 'USER_SKIP', at: T0 + 76_000 });
+  assert('user skip: STOP reason user_skip, and the waiting s1 goes on air', r.effects.some((e) => e.type === 'STOP' && e.token === first?.token && e.reason === 'user_skip') && plays(r).at(-1)?.stopId === 's1');
+  const idle = start(tour, 'drive');
+  assert('user skip with nothing on air: nothing happens', reduce(idle.state, { type: 'USER_SKIP', at: T0 }).effects.length === 0);
+}
+
 console.log(`\n${checks - failures}/${checks} checks passed`);
 if (failures > 0) process.exit(1);

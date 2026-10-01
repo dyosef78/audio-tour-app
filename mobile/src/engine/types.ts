@@ -113,16 +113,20 @@ export interface Progress {
   queue: readonly QueueItem[];
 }
 
+/** What is on air: a stop's narration, or the Deep Dive a listener asked for (TASK-602). */
+export type TrackKind = 'narration' | 'deep_dive';
+
 export type AudioState =
   | { kind: 'idle' }
   /** PLAY issued; waiting for AUDIO_STARTED. */
-  | { kind: 'starting'; token: number; stopId: string; since: number }
-  | { kind: 'playing'; token: number; stopId: string; since: number }
+  | { kind: 'starting'; token: number; stopId: string; track: TrackKind; since: number }
+  | { kind: 'playing'; token: number; stopId: string; track: TrackKind; since: number }
   /** Paused by the OS (an iOS doNotMix interruption) or by the user. */
   | {
       kind: 'interrupted';
       token: number;
       stopId: string;
+      track: TrackKind;
       since: number;
       by: 'os' | 'user';
       /** The watchdog already asked the player to resume once. */
@@ -173,8 +177,16 @@ export type EngineEvent =
   | { type: 'TICK'; at: number }
   /** Manual chapter advance (PM: manual only for MVP). */
   | { type: 'CHAPTER_SELECTED'; chapterId: string; at: number }
-  /** "Play this stop now" - debug trigger and the future skip-to control. */
-  | { type: 'MANUAL_TRIGGER'; stopId: string; at: number };
+  /** "Play this stop now" - debug trigger, replaying a stop, the future skip-to control. */
+  | { type: 'MANUAL_TRIGGER'; stopId: string; at: number }
+  /**
+   * The listener asked for a stop's Deep Dive. Displaces whatever is on air;
+   * survives leaving the zone; displaced only by a different stop (TASK-602,
+   * Epic 6 PM decision).
+   */
+  | { type: 'DEEP_DIVE_REQUESTED'; stopId: string; at: number }
+  /** The listener stopped what is playing. The next waiting stop, if any, follows. */
+  | { type: 'USER_SKIP'; at: number };
 
 // -----------------------------------------------------------------------------
 // Effects (out of the reducer, executed by the shell after persisting)
@@ -189,9 +201,13 @@ export type TelemetryKind =
   | 'audio_watchdog';
 
 export type Effect =
-  | { type: 'PLAY'; token: number; stopId: string }
-  /** Stop the narration `token` owns. fade: the walking zone-exit fade-out. */
-  | { type: 'STOP'; token: number; fade: boolean }
+  | { type: 'PLAY'; token: number; stopId: string; track: TrackKind }
+  /**
+   * Stop what `token` owns. fade: the walking zone-exit fade-out. reason
+   * decides the telemetry verdict: a skip (displaced, or the listener's tap)
+   * is not a drop-off (walked away) and neither is a failure (timed out).
+   */
+  | { type: 'STOP'; token: number; fade: boolean; reason: StopReason }
   /** Ask the player to resume after an interruption that never ended. */
   | { type: 'RESUME'; token: number }
   /**
@@ -201,6 +217,8 @@ export type Effect =
    */
   | { type: 'APPLY_TRANSIT_MODE'; transitMode: TransitMode }
   | { type: 'TELEMETRY'; kind: TelemetryKind; stopId: string | null; detail: Readonly<Record<string, string | number>> };
+
+export type StopReason = 'zone_exit' | 'preempted' | 'user_skip' | 'play_timeout' | 'interruption_gave_up';
 
 export interface ReduceResult {
   state: EngineState;

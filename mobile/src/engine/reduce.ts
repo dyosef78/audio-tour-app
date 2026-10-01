@@ -14,6 +14,7 @@ import type {
   Progress,
   QueueItem,
   ReduceResult,
+  TrackKind,
 } from './types.ts';
 import { distanceToZoneM, insideZone, sweepZone } from './zone.ts';
 
@@ -136,11 +137,15 @@ export function reduce(state: EngineState, event: EngineEvent): ReduceResult {
       // Also when an interruption arrived while the player was still loading:
       // the narration did start, so it is played, and it stays interrupted.
       if (s.audio.kind !== 'idle' && s.audio.token === event.token) {
-        const { stopId } = s.audio;
-        const played = stopId in s.progress.played ? s.progress.played : { ...s.progress.played, [stopId]: event.at };
+        const { stopId, track } = s.audio;
+        // A Deep Dive is extra listening, not the stop's narration: it marks nothing played.
+        const played =
+          track === 'deep_dive' || stopId in s.progress.played
+            ? s.progress.played
+            : { ...s.progress.played, [stopId]: event.at };
         s = {
           ...s,
-          audio: s.audio.kind === 'starting' ? { kind: 'playing', token: event.token, stopId, since: event.at } : s.audio,
+          audio: s.audio.kind === 'starting' ? { kind: 'playing', token: event.token, stopId, track, since: event.at } : s.audio,
           progress: played === s.progress.played ? s.progress : { ...s.progress, played },
         };
       }
@@ -162,6 +167,7 @@ export function reduce(state: EngineState, event: EngineEvent): ReduceResult {
             kind: 'interrupted',
             token: event.token,
             stopId: s.audio.stopId,
+            track: s.audio.track,
             since: event.at,
             by: event.by,
             resumeRequested: false,
@@ -171,7 +177,7 @@ export function reduce(state: EngineState, event: EngineEvent): ReduceResult {
       break;
     case 'AUDIO_RESUMED':
       if (s.audio.kind === 'interrupted' && s.audio.token === event.token) {
-        s = { ...s, audio: { kind: 'playing', token: event.token, stopId: s.audio.stopId, since: event.at } };
+        s = { ...s, audio: { kind: 'playing', token: event.token, stopId: s.audio.stopId, track: s.audio.track, since: event.at } };
       }
       break;
     case 'TICK':
@@ -182,6 +188,21 @@ export function reduce(state: EngineState, event: EngineEvent): ReduceResult {
       break;
     case 'MANUAL_TRIGGER':
       s = manualTrigger(s, event.stopId, event.at, effects);
+      break;
+    case 'DEEP_DIVE_REQUESTED': {
+      const stop = activeStopOrThrow(s, event.stopId, 'DEEP_DIVE_REQUESTED');
+      if (s.audio.kind !== 'idle') {
+        effects.push({ type: 'STOP', token: s.audio.token, fade: false, reason: 'preempted' });
+        s = { ...s, audio: { kind: 'idle' } };
+      }
+      s = play(s, stop.id, event.at, effects, 'deep_dive');
+      break;
+    }
+    case 'USER_SKIP':
+      if (s.audio.kind !== 'idle') {
+        effects.push({ type: 'STOP', token: s.audio.token, fade: false, reason: 'user_skip' });
+        s = startNextIfIdle({ ...s, audio: { kind: 'idle' } }, event.at, effects);
+      }
       break;
   }
   return { state: s, effects };
@@ -350,12 +371,13 @@ function reportBearing(
  * not cut the instant it starts.
  */
 function walkingExit(s: EngineState, prev: GpsFix | null, fix: GpsFix, now: number, mode: ModeConfig, effects: Effect[]): EngineState {
-  if (!mode.exitStopsNarration || s.audio.kind === 'idle' || prev === null) return s;
+  // A Deep Dive survives leaving the zone (TASK-602): only narration fades.
+  if (!mode.exitStopsNarration || s.audio.kind === 'idle' || s.audio.track !== 'narration' || prev === null) return s;
   const stop = s.tour.stops.find((st) => st.id === audioStopId(s.audio));
   if (!stop) return s;
   const wasInside = insideZone(prev.coordinate, stop.zone, mode.exitHysteresisFactor);
   if (!wasInside || insideZone(fix.coordinate, stop.zone, mode.exitHysteresisFactor)) return s;
-  effects.push({ type: 'STOP', token: audioToken(s.audio), fade: true });
+  effects.push({ type: 'STOP', token: audioToken(s.audio), fade: true, reason: 'zone_exit' });
   return startNextIfIdle({ ...s, audio: { kind: 'idle' } }, now, effects);
 }
 
@@ -397,7 +419,7 @@ function enqueue(
   if (whileBusy === 'preempt') {
     // Walking: you are standing at the new stop. Older waiting stops are stale.
     for (const q of s.progress.queue) effects.push(telemetry('trigger_expired', q.stopId, { reason: 'preempted' }));
-    effects.push({ type: 'STOP', token: audioToken(s.audio), fade: false });
+    effects.push({ type: 'STOP', token: audioToken(s.audio), fade: false, reason: 'preempted' });
     const cleared: EngineState = { ...s, audio: { kind: 'idle' }, progress: { ...s.progress, queue: [] } };
     return play(cleared, item.stopId, now, effects);
   }
@@ -411,10 +433,10 @@ function enqueue(
   return { ...s, progress: { ...s.progress, queue } };
 }
 
-function play(s: EngineState, stopId: string, now: number, effects: Effect[]): EngineState {
+function play(s: EngineState, stopId: string, now: number, effects: Effect[], track: TrackKind = 'narration'): EngineState {
   const token = s.nextToken;
-  effects.push({ type: 'PLAY', token, stopId });
-  return { ...s, nextToken: token + 1, audio: { kind: 'starting', token, stopId, since: now } };
+  effects.push({ type: 'PLAY', token, stopId, track });
+  return { ...s, nextToken: token + 1, audio: { kind: 'starting', token, stopId, track, since: now } };
 }
 
 /** When the slot is free, drop what expired and put the next waiting stop on air. */
@@ -468,7 +490,7 @@ function advanceClock(s: EngineState, now: number, effects: Effect[]): EngineSta
 function playTimeout(s: EngineState, now: number, effects: Effect[]): EngineState {
   const a = s.audio;
   if (a.kind !== 'starting' || now - a.since < PLAY_TIMEOUT_MS) return s;
-  effects.push({ type: 'STOP', token: a.token, fade: false });
+  effects.push({ type: 'STOP', token: a.token, fade: false, reason: 'play_timeout' });
   effects.push(telemetry('audio_watchdog', a.stopId, { action: 'play_timeout', heldMs: now - a.since }));
   return startNextIfIdle({ ...s, audio: { kind: 'idle' } }, now, effects);
 }
@@ -485,7 +507,7 @@ function watchdog(s: EngineState, now: number, effects: Effect[]): EngineState {
   const timeout = MODE_CONFIG[activeChapter(s).transitMode].interruptionTimeoutMs;
   const held = now - a.since;
   if (held >= 2 * timeout) {
-    effects.push({ type: 'STOP', token: a.token, fade: false });
+    effects.push({ type: 'STOP', token: a.token, fade: false, reason: 'interruption_gave_up' });
     effects.push(telemetry('audio_watchdog', a.stopId, { action: 'gave_up', heldMs: held }));
     return startNextIfIdle({ ...s, audio: { kind: 'idle' } }, now, effects);
   }
@@ -527,11 +549,7 @@ function selectChapter(s: EngineState, chapterId: string, effects: Effect[]): En
  * it count as missed, exactly as before Epic 15 (StopSequence.reach).
  */
 function manualTrigger(s: EngineState, stopId: string, at: number, effects: Effect[]): EngineState {
-  const stop = s.tour.stops.find((st) => st.id === stopId);
-  if (!stop) throw new RangeError(`MANUAL_TRIGGER: unknown stop ${stopId}`);
-  if (stop.chapterId !== s.progress.chapterId) {
-    throw new RangeError(`MANUAL_TRIGGER: stop ${stopId} is not in the active chapter ${s.progress.chapterId}`);
-  }
+  const stop = activeStopOrThrow(s, stopId, 'MANUAL_TRIGGER');
   effects.push(telemetry('trigger_fired', stop.id, { index: stop.index, reason: 'manual' }));
   const fired = stopId in s.progress.fired ? s.progress.fired : { ...s.progress.fired, [stopId]: at };
   // Already waiting in the queue: it plays now, so it must not play again later.
@@ -551,6 +569,16 @@ function manualTrigger(s: EngineState, stopId: string, at: number, effects: Effe
 // -----------------------------------------------------------------------------
 // Small helpers
 // -----------------------------------------------------------------------------
+
+/** A stop of the ACTIVE chapter, or a RangeError naming the caller - a stop elsewhere is a caller bug. */
+function activeStopOrThrow(s: EngineState, stopId: string, caller: string): EngineStop {
+  const stop = s.tour.stops.find((st) => st.id === stopId);
+  if (!stop) throw new RangeError(`${caller}: unknown stop ${stopId}`);
+  if (stop.chapterId !== s.progress.chapterId) {
+    throw new RangeError(`${caller}: stop ${stopId} is not in the active chapter ${s.progress.chapterId}`);
+  }
+  return stop;
+}
 
 export function activeChapter(s: EngineState): EngineChapter {
   return chapterOrThrow(s.tour, s.progress.chapterId);
