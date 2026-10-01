@@ -1,5 +1,8 @@
 import type { ConfigContext, ExpoConfig } from 'expo/config';
-import { withInfoPlist, type ConfigPlugin } from 'expo/config-plugins';
+// '.js' is load-bearing: `expo` has no package "exports" map, so Node's ESM
+// loader (npm run test:auth imports this file) cannot resolve the bare
+// subpath. Expo CLI's own loader resolves either spelling.
+import { withInfoPlist, type ConfigPlugin } from 'expo/config-plugins.js';
 
 /**
  * Epic 13: expo-task-manager's plugin adds the `fetch` background mode
