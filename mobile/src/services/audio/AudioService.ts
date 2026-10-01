@@ -2,6 +2,7 @@ import { createAudioPlayer, setAudioModeAsync, type AudioPlayer, type AudioStatu
 import { Platform } from 'react-native';
 
 import type { AudioTrack, Waypoint } from '../../types/domain';
+import type { SessionInterruptionMode } from './sessionMode';
 import type {
   AudioEventContext,
   AudioTelemetrySink,
@@ -170,7 +171,8 @@ export class AudioService {
   }
 
   /**
-   * Configure the session once at app start.
+   * Configure the session for a chapter's mode (Epic 15: per chapter, via
+   * sessionMode.ts).
    *
    * PM decision (TASK-104): `interruptionMode: 'doNotMix'`. Priority #1 is that
    * sustained background playback survives with the phone locked, and the SDK
@@ -178,15 +180,18 @@ export class AudioService {
    *
    * The accepted trade-off, RATIFIED by the PM in TASK-502: 'doNotMix' requests
    * exclusive audio focus, so a maps instruction PAUSES our narration rather
-   * than talking over it. That is the intended behaviour, not a gap - locked
-   * screen playback is non-negotiable for a pocketed walking tour, and custom
-   * ducking has been abandoned rather than carried as an unimplemented promise.
+   * than talking over it.
+   *
+   * EXCEPTION (PM, Epic 15): Android driving chapters use 'duckOthers', so a
+   * navigation prompt lowers the narration instead of pausing it - expo-audio
+   * does the ducking itself; this service still never sets a volume. iOS stays
+   * 'doNotMix' everywhere for its lock-screen controls.
    */
-  async configureSession(): Promise<void> {
+  async configureSession(interruptionMode: SessionInterruptionMode = 'doNotMix'): Promise<void> {
     await setAudioModeAsync({
       playsInSilentMode: true,
       shouldPlayInBackground: true,
-      interruptionMode: 'doNotMix',
+      interruptionMode,
     });
   }
 

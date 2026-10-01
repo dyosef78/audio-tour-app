@@ -237,6 +237,14 @@ eq('Epic 15: plain sequence_policy == column default', columnDefault('sequence_p
 eq('Epic 15: plain lookahead_stops == column default', columnDefault('lookahead_stops'),
   /c\.lookahead_stops = (\d+)/.exec(normalisedChapters)?.[1]);
 
+// The third party to "plain": what the app assumes for a manifest saved before
+// chapters existed. Read as text, like options.ts above.
+const fromManifestSource = readFileSync(new URL('../../mobile/src/engine/fromManifest.ts', import.meta.url), 'utf8');
+const appDefaults = /PLAIN_CHAPTER_DEFAULTS = \{ sequencePolicy: '(\w+)', lookaheadStops: (\d+) \}/.exec(fromManifestSource);
+assert('Epic 15: PLAIN_CHAPTER_DEFAULTS found in the app', appDefaults !== null);
+eq('Epic 15: app fallback sequence_policy == column default', appDefaults?.[1], columnDefault('sequence_policy'));
+eq('Epic 15: app fallback lookahead_stops == column default', appDefaults?.[2], columnDefault('lookahead_stops'));
+
 // -----------------------------------------------------------------------------
 
 heading('checkTranscript');

@@ -59,6 +59,39 @@ export interface WireWaypoint {
   /** Preference tags (TASK-603). Values may postdate this build - filter, do not trust. */
   audiences?: string[];
   interests?: string[];
+  /** The chapter this stop belongs to (Epic 15). Absent before 20261001120100: the tour's one chapter. */
+  chapter_id?: string;
+  /** Direction-of-travel check (Epic 15). null = no check; absent before 20261001120100. */
+  approach?: WireApproach | null;
+}
+
+/** Epic 15. Present only when the waypoint's bearing_policy is not 'ignore'. */
+export interface WireApproach {
+  bearing_deg: number;
+  tolerance_deg: number;
+  policy: string;
+}
+
+/** Epic 15: where a chapter hands navigation off to Google Maps / Waze. */
+export interface WireHandoff {
+  /** [longitude, latitude]. */
+  destination: LonLat;
+  destination_label: string | null;
+  /** Routing anchors, in order. Never geofenced. */
+  anchors: LonLat[];
+  /** Decided by the server. A value this build does not know is dropped, not trusted. */
+  providers: string[];
+}
+
+/** Epic 15: one chapter of the tour. */
+export interface WireChapter {
+  chapter_id: string;
+  sort_order: number;
+  title: string | null;
+  transit_mode: string;
+  sequence_policy: string;
+  lookahead_stops: number;
+  handoff: WireHandoff | null;
 }
 
 /**
@@ -88,6 +121,12 @@ export interface WireBundle {
   waypoints: WireWaypoint[];
   /** Null when the tour has no route; absent from bundles made before TASK-604. */
   route?: WireRoute | null;
+  /**
+   * Epic 15. Absent from manifests saved before 20261001120100: the device then
+   * synthesises the one plain chapter (engine/fromManifest.ts), which is
+   * exactly what the server sends for every tour that has not been split.
+   */
+  chapters?: WireChapter[];
 }
 
 /** Aggregate progress for the Screen 2 bar. */
@@ -114,11 +153,24 @@ export function isWireBundle(value: unknown): value is WireBundle {
   if (typeof b.bundle_version_hash !== 'string') return false;
   if (typeof b.tour_metadata?.tour_id !== 'string') return false;
   if (!Array.isArray(b.waypoints)) return false;
-  return b.waypoints.every(
+  const waypointsOk = b.waypoints.every(
     (w) =>
       typeof w?.waypoint_id === 'string' &&
       Array.isArray(w?.coordinates) &&
       w.coordinates.length === 2 &&
       w.coordinates.every((n) => typeof n === 'number' && Number.isFinite(n)),
   );
+  if (!waypointsOk) return false;
+
+  // Epic 15. Without `chapters` (a manifest from before 20261001120100) no
+  // waypoint may name a chapter; with them, every waypoint must name one of
+  // them. A manifest that disagrees with itself is refused, never repaired.
+  if (b.chapters === undefined) return b.waypoints.every((w) => w.chapter_id === undefined);
+  if (!Array.isArray(b.chapters) || b.chapters.length === 0) return false;
+  const ids = new Set<string>();
+  for (const c of b.chapters) {
+    if (typeof c?.chapter_id !== 'string' || typeof c.transit_mode !== 'string' || ids.has(c.chapter_id)) return false;
+    ids.add(c.chapter_id);
+  }
+  return b.waypoints.every((w) => typeof w.chapter_id === 'string' && ids.has(w.chapter_id));
 }
