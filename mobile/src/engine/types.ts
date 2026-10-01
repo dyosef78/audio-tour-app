@@ -111,6 +111,12 @@ export interface Progress {
   played: Readonly<Record<string, number>>;
   /** Fired, waiting. Does NOT include the stop currently playing. */
   queue: readonly QueueItem[];
+  /**
+   * Set while the tour is suspended for inactivity (Epic 15, battery): when,
+   * by the shell's clock. Persisted, so a process killed while suspended
+   * comes back suspended instead of quietly tracking again. Absent = running.
+   */
+  suspendedAt?: number;
 }
 
 /** What is on air: a stop's narration, or the Deep Dive a listener asked for (TASK-602). */
@@ -151,6 +157,11 @@ export interface EngineState {
   bearingReported: ReadonlySet<string>;
   /** Monotonic; every PLAY gets a fresh one. Stale audio events carry an old one. */
   nextToken: number;
+  /**
+   * Where the visitor has been standing still, and since when (idle timeout).
+   * Not persisted: a resumed session starts counting afresh.
+   */
+  stillness: { anchor: LatLng; since: number } | null;
 }
 
 // -----------------------------------------------------------------------------
@@ -186,7 +197,9 @@ export type EngineEvent =
    */
   | { type: 'DEEP_DIVE_REQUESTED'; stopId: string; at: number }
   /** The listener stopped what is playing. The next waiting stop, if any, follows. */
-  | { type: 'USER_SKIP'; at: number };
+  | { type: 'USER_SKIP'; at: number }
+  /** The listener resumed a tour suspended for inactivity. */
+  | { type: 'RESUME_REQUESTED'; at: number };
 
 // -----------------------------------------------------------------------------
 // Effects (out of the reducer, executed by the shell after persisting)
@@ -198,7 +211,9 @@ export type TelemetryKind =
   | 'trigger_rejected_bearing'
   | 'trigger_expired'
   | 'trigger_missed'
-  | 'audio_watchdog';
+  | 'audio_watchdog'
+  | 'tour_suspended'
+  | 'tour_resumed';
 
 export type Effect =
   | { type: 'PLAY'; token: number; stopId: string; track: TrackKind }
@@ -216,9 +231,13 @@ export type Effect =
    * audio session its interruption mode (driving: duckOthers on Android).
    */
   | { type: 'APPLY_TRANSIT_MODE'; transitMode: TransitMode }
+  /** Idle timeout: stop GPS tracking and tell the listener (a local notification). */
+  | { type: 'SUSPEND_TRACKING' }
+  /** The listener resumed: start tracking again (an in-app tap, so in the foreground). */
+  | { type: 'RESUME_TRACKING' }
   | { type: 'TELEMETRY'; kind: TelemetryKind; stopId: string | null; detail: Readonly<Record<string, string | number>> };
 
-export type StopReason = 'zone_exit' | 'preempted' | 'user_skip' | 'play_timeout' | 'interruption_gave_up';
+export type StopReason = 'zone_exit' | 'preempted' | 'user_skip' | 'play_timeout' | 'interruption_gave_up' | 'idle_timeout';
 
 export interface ReduceResult {
   state: EngineState;

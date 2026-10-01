@@ -93,6 +93,19 @@ export const MODE_CONFIG: Readonly<Record<TransitMode, ModeConfig>> = {
 };
 
 /**
+ * The documented trigger-radius envelope per mode (PRD Section 3) - content
+ * guidance, not a runtime rule: the engine plays whatever radius a zone has.
+ * The CMS seed tooling validates authored zones against it
+ * (backend/scripts/seed-tel-aviv-qa.ts imports it - this file is pure, so the
+ * backend can, where the old expo-location-bound profile could not).
+ */
+export const TRIGGER_RADIUS_RANGE_M: Readonly<Record<TransitMode, readonly [min: number, max: number]>> = {
+  walking: [15, 30],
+  biking: [50, 80],
+  driving: [150, 300],
+};
+
+/**
  * A PLAY that has not produced AUDIO_STARTED (or AUDIO_FAILED) within this
  * long is abandoned by the reducer itself (PM, Epic 15): the narration slot
  * must never depend on a native callback arriving. Covers resolving a local
@@ -100,6 +113,20 @@ export const MODE_CONFIG: Readonly<Record<TransitMode, ModeConfig>> = {
  * stream is the case that would trip it first.
  */
 export const PLAY_TIMEOUT_MS = 5_000;
+
+/**
+ * Battery (PM, Epic 15): this long without leaving a small circle suspends
+ * the tour - tracking stops, a notification says so, the listener resumes it.
+ */
+export const IDLE_TIMEOUT_MS = 15 * 60_000;
+
+/**
+ * "Not moving" is measured by DISPLACEMENT, not GPS speed: iOS reports speed
+ * as -1 when stationary, and an indoor fix wanders 20-50 m. A fix counts as
+ * still while it stays within max(this, 2 x its accuracy) of where stillness
+ * began.
+ */
+export const IDLE_RADIUS_M = 60;
 
 /** A fix stamped more than this in the future (a skewed device clock) is refused. */
 export const MAX_FUTURE_SKEW_MS = 5_000;

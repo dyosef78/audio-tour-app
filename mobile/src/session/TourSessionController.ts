@@ -8,6 +8,7 @@ import { AudioActor } from '../services/audio/AudioActor';
 import { AudioService } from '../services/audio/AudioService';
 import { interruptionModeFor } from '../services/audio/sessionMode';
 import { TourBundleRepository } from '../services/bundle/TourBundleRepository';
+import { dismissTourSuspended, notifyTourSuspended, prepareTourNotifications } from '../services/notifications/tourNotifications';
 import {
   LocationService,
   registerBackgroundLocationTask,
@@ -265,7 +266,7 @@ class TourSessionController {
     const firstChapter = tour.chapters[0];
     if (!firstChapter) return this.failStart('unexpected', new Error('the tour has no chapters'));
 
-    const service = new LocationService(firstChapter.transitMode, Platform.OS, { engineMode: true });
+    const service = new LocationService(firstChapter.transitMode, Platform.OS);
 
     // Each native stage is guarded (Epic 13, Directive 2): a bridge that throws
     // must end in failStart - teardown, an error the screen shows, a rethrow.
@@ -279,6 +280,14 @@ class TourSessionController {
       // An answer, not a failure: the person said no. Nothing was started.
       useTourSession.getState().sessionFailed('Location permission is required to run a tour.');
       return;
+    }
+
+    // The idle-timeout notice (Epic 15). A refusal is an answer, not a failure:
+    // the paused state still shows in the app.
+    try {
+      await prepareTourNotifications();
+    } catch (err) {
+      console.warn('[TourSession] notification permission could not be requested; an idle pause will only show in the app:', err);
     }
 
     this.location = service;
@@ -344,6 +353,9 @@ class TourSessionController {
         void this.applyTransitMode(mode);
       },
       telemetry: (fx) => this.recordEngineTelemetry(meta.tourId, fx),
+      tracking: (fx) => {
+        void (fx.type === 'SUSPEND_TRACKING' ? this.suspendTracking(meta) : this.restartTrackingAfterIdle());
+      },
       publish: (next, prev) => this.publish(next, prev),
       now: () => Date.now(),
       setInterval: (fn, ms) => setInterval(fn, ms),
@@ -450,6 +462,74 @@ class TourSessionController {
   }
 
   // ---------------------------------------------------------------------------
+  // Idle timeout (Epic 15 - battery)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * The engine saw 15 minutes without movement: stop tracking - the battery
+   * cost this exists to end - and tell the listener. Stopping is allowed from
+   * the background on both platforms (only STARTING is restricted). Failures
+   * are reported: a tracker that could not stop is the battery drain itself.
+   */
+  private async suspendTracking(meta: SessionMeta): Promise<void> {
+    useTourSession.getState().setPaused(true);
+    const service = this.location;
+    try {
+      if (service) {
+        await service.stop();
+        await service.stopBackground();
+      }
+    } catch (err) {
+      console.error('[TourSession] tracking could NOT be stopped for the idle pause - the battery is still being drained:', err);
+    }
+    try {
+      await notifyTourSuspended(meta.tourTitle);
+    } catch (err) {
+      console.error('[TourSession] the inactivity notification was not shown:', err);
+    }
+  }
+
+  /**
+   * Start tracking again after an idle pause. Always from an in-app tap - the
+   * Resume button, or a stop's play button - so the app is in the foreground,
+   * which Android requires to start its task.
+   */
+  private async restartTrackingAfterIdle(): Promise<void> {
+    try {
+      await dismissTourSuspended();
+    } catch (err) {
+      console.warn('[TourSession] the inactivity notification could not be dismissed:', err);
+    }
+    const service = this.location;
+    if (!service) return;
+    try {
+      await service.start();
+      useTourSession.getState().setPaused(false);
+    } catch (err) {
+      // Stays 'paused' in the store, so Resume is still offered (resumeTour).
+      console.error('[TourSession] tracking could not restart after the pause; tap Resume again:', err);
+    }
+  }
+
+  /**
+   * The paused banner's Resume button.
+   *
+   * Normally the engine is still suspended and RESUME_REQUESTED does the rest.
+   * But if an earlier restart failed, the engine already counts the tour as
+   * resumed while tracking is off - a second RESUME_REQUESTED would be a no-op
+   * and the listener would be stuck. So then: retry the tracking directly.
+   */
+  resumeTour(): void {
+    const runner = this.runner;
+    if (!runner) return;
+    if (runner.state.progress.suspendedAt !== undefined) {
+      runner.dispatch({ type: 'RESUME_REQUESTED', at: Date.now() });
+    } else if (useTourSession.getState().status === 'paused') {
+      void this.restartTrackingAfterIdle();
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Persistence and resume
   // ---------------------------------------------------------------------------
 
@@ -537,7 +617,7 @@ class TourSessionController {
     if (!chapter) return discard(`unknown chapter ${snap.progress.chapterId}`);
 
     useTourSession.getState().beginStart(snap.tourId, snap.tourTitle);
-    const service = new LocationService(chapter.transitMode, Platform.OS, { engineMode: true });
+    const service = new LocationService(chapter.transitMode, Platform.OS);
     this.location = service;
     const meta: SessionMeta = {
       tourId: snap.tourId,
@@ -561,10 +641,22 @@ class TourSessionController {
       return fail('audio', err);
     }
     const runner = this.openEngine(meta, createEngineState(tour, snap.progress));
-    try {
-      await service.resumeTracking();
-    } catch (err) {
-      return fail('location', err);
+    // A tour suspended for inactivity comes back suspended: tracking stays
+    // off until the listener taps Resume. A task still registered (the OS
+    // restarted it) is stopped - that is the battery the pause was saving.
+    const suspended = snap.progress.suspendedAt !== undefined;
+    if (suspended) {
+      try {
+        await service.stopBackground();
+      } catch (err) {
+        console.error('[TourSession] a suspended tour still had a tracking task that could not be stopped:', err);
+      }
+    } else {
+      try {
+        await service.resumeTracking();
+      } catch (err) {
+        return fail('location', err);
+      }
     }
     if (!service.persistentTask) this.attachAppState();
 
@@ -576,6 +668,7 @@ class TourSessionController {
       skippedWaypointIds: snap.skippedIds,
     });
     this.publishStaticRoute(snap.tourId, active, chapter.transitMode);
+    if (suspended) useTourSession.getState().setPaused(true);
 
     // SESSION_STARTED replays a restored queue - what fired but had not been heard.
     runner.start();
@@ -844,6 +937,12 @@ class TourSessionController {
     if (actor) await actor.dispose();
     else await this.audio.stop('audio_stopped');
     this.audio.setTelemetry(null);
+
+    try {
+      await dismissTourSuspended();
+    } catch (err) {
+      console.warn('[TourSession] the inactivity notification could not be dismissed:', err);
+    }
 
     // Aborts any route request a pre-Epic-15 path left in flight.
     routeManager.stop();

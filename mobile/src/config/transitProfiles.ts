@@ -3,90 +3,35 @@ import { Accuracy } from 'expo-location';
 import type { TransitMode } from '../types/domain';
 
 /**
- * Per-transit-mode tuning for the Adaptive GPS and geofence engine.
+ * GPS sampling per transit mode (Epic 15).
  *
- * !! SOURCE NOTE !!
- * The numeric envelopes below come from PRD **v1.0.0 Section 3** ("השפעת אופן
- * התנועה על מנוע המערכת"). PRD v2.0.0 dropped that table - Screen 3 now says
- * only "Adaptive GPS transitions to high-accuracy when near a POI" without
- * giving numbers. These values are carried forward on the assumption they still
- * hold; see the handover report, they need PM confirmation.
+ * One setting per mode, pinned for the whole chapter (architecture plan,
+ * Approach A): the swept test cannot step over a zone whatever the interval,
+ * so there is no coarse tier to save battery on and no tier change to make
+ * from the background - which Android forbids (Epic 13). The values are the
+ * pre-Epic-15 "fine" tier.
  *
- *   walking : trigger 15-30 m, moderate adaptive sampling, 90-150 s narration
- *   biking  : trigger 50-80 m, medium sampling (15-25 km/h)
- *   driving : trigger 150-300 m (early trigger), frequent sampling (40-90 km/h)
+ * Everything that DECIDES - trigger rules, hysteresis, queue expiry, re-anchor
+ * - lives in engine/config.ts, which is pure and testable. This file holds
+ * only what the native location API needs, because Accuracy comes from
+ * expo-location.
+ *
+ * distanceInterval is not here on purpose: LocationService always asks for 0,
+ * so a fix arrives every timeInterval even standing still. That stream is the
+ * engine's clock in the background, where Android pauses JS timers.
  */
-export interface TransitProfile {
-  /** Fallback when a zone has no explicit trigger_radius_meters. */
-  defaultTriggerRadiusMeters: number;
-  /** Documented range, for validating content rather than driving runtime. */
-  triggerRadiusRangeMeters: readonly [min: number, max: number];
-
-  /**
-   * Distance to the nearest waypoint at which Adaptive GPS escalates from
-   * `coarse` to `fine`. Set well outside the trigger radius so the fix has
-   * already sharpened before the user reaches the boundary - escalating at the
-   * boundary itself would mean the first accurate fix arrives too late.
-   */
-  escalateWithinMeters: number;
-
-  /** Battery-saving profile used when no waypoint is nearby. */
-  coarse: GpsSampling;
-  /** High-accuracy profile used near a waypoint. */
-  fine: GpsSampling;
-
-  /**
-   * Re-entry cooldown (PRD Screen 4, "Debounce/Cooldown"). A user loitering on
-   * a boundary must not retrigger the same track. Scaled to the mode: a driver
-   * who loops a block should hear it again sooner than a walker on a bench.
-   */
-  retriggerCooldownMs: number;
-
-  /**
-   * Exit hysteresis. The exit boundary is this multiple of the entry radius, so
-   * a GPS fix jittering across the edge does not produce enter/exit churn.
-   */
-  exitHysteresisFactor: number;
-}
-
 export interface GpsSampling {
   accuracy: Accuracy;
-  /** Android only; minimum ms between updates. */
+  /** Android: ms between updates. iOS ignores it and delivers on movement. */
   timeInterval: number;
-  /** Minimum metres of movement before an update fires. */
-  distanceInterval: number;
 }
 
-export const TRANSIT_PROFILES: Record<TransitMode, TransitProfile> = {
-  walking: {
-    defaultTriggerRadiusMeters: 25,
-    triggerRadiusRangeMeters: [15, 30],
-    escalateWithinMeters: 120,
-    coarse: { accuracy: Accuracy.Balanced, timeInterval: 10_000, distanceInterval: 25 },
-    fine: { accuracy: Accuracy.High, timeInterval: 2_000, distanceInterval: 5 },
-    retriggerCooldownMs: 10 * 60_000,
-    exitHysteresisFactor: 1.6,
-  },
-  biking: {
-    defaultTriggerRadiusMeters: 65,
-    triggerRadiusRangeMeters: [50, 80],
-    escalateWithinMeters: 300,
-    coarse: { accuracy: Accuracy.Balanced, timeInterval: 6_000, distanceInterval: 40 },
-    fine: { accuracy: Accuracy.High, timeInterval: 1_500, distanceInterval: 15 },
-    retriggerCooldownMs: 5 * 60_000,
-    exitHysteresisFactor: 1.5,
-  },
-  driving: {
-    defaultTriggerRadiusMeters: 220,
-    triggerRadiusRangeMeters: [150, 300],
-    escalateWithinMeters: 900,
-    coarse: { accuracy: Accuracy.Balanced, timeInterval: 4_000, distanceInterval: 100 },
-    fine: { accuracy: Accuracy.BestForNavigation, timeInterval: 1_000, distanceInterval: 25 },
-    retriggerCooldownMs: 3 * 60_000,
-    exitHysteresisFactor: 1.4,
-  },
+export const TRANSIT_SAMPLING: Readonly<Record<TransitMode, GpsSampling>> = {
+  walking: { accuracy: Accuracy.High, timeInterval: 2_000 },
+  biking: { accuracy: Accuracy.High, timeInterval: 1_500 },
+  driving: { accuracy: Accuracy.BestForNavigation, timeInterval: 1_000 },
 };
 
-export function profileFor(mode: TransitMode): TransitProfile {
-  return TRANSIT_PROFILES[mode];
+export function samplingFor(mode: TransitMode): GpsSampling {
+  return TRANSIT_SAMPLING[mode];
 }

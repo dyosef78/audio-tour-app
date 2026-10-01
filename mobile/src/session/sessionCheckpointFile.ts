@@ -1,7 +1,7 @@
 import { File, Paths } from 'expo-file-system';
 
 import { createProgressRepository } from './progressRepository';
-import { createCheckpointStore, type CheckpointIO } from './sessionCheckpoint';
+import type { CheckpointIO } from './sessionCheckpoint';
 
 /**
  * The real CheckpointIO: two small files in the app's document directory,
@@ -36,9 +36,6 @@ export const checkpointFileIO: CheckpointIO = {
     }
   },
 };
-
-/** Epic 13 (v1) store - kept only so its pure tests keep running; no session writes it. */
-export const sessionCheckpoints = createCheckpointStore(checkpointFileIO);
 
 /**
  * Epic 15 (v2): the engine's progress, same two files, same atomic

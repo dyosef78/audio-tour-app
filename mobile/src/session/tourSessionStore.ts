@@ -18,7 +18,8 @@ import type { LatLng, TransitMode, Waypoint } from '../types/domain';
  * TourSessionController, which is the single owner of the hardware.
  */
 
-export type SessionStatus = 'idle' | 'starting' | 'active' | 'error';
+/** 'paused': suspended for inactivity (Epic 15) - tracking off, resumable. */
+export type SessionStatus = 'idle' | 'starting' | 'active' | 'paused' | 'error';
 
 export interface TourSessionState {
   status: SessionStatus;
@@ -61,11 +62,11 @@ export interface TourSessionState {
    * The waypoint whose Deep Dive is playing instead of its narration (TASK-602).
    *
    * A Deep Dive is chosen, not triggered, and runs for minutes, so it survives a
-   * zone exit - the listener has usually wandered on by the end. Entering a
-   * DIFFERENT waypoint still displaces it; see markEntered.
+   * zone exit - the listener has usually wandered on by the end. A DIFFERENT
+   * stop going on air still displaces it (engine/reduce.ts, setOnAir).
    */
   deepDiveWaypointId: string | null;
-  /** Waypoints whose geofence has been entered at least once. */
+  /** Stops whose narration actually started (Epic 15: from the engine). */
   visitedWaypointIds: string[];
 
   /**
@@ -91,8 +92,6 @@ export interface TourSessionActions {
     skippedWaypointIds?: string[];
   }) => void;
   setRoute: (route: RouteDisplay) => void;
-  /** Reorder `waypoints`. Ignored unless it names exactly the same stops. */
-  setStopOrder: (waypointIds: readonly string[]) => void;
   sessionFailed: (message: string) => void;
   reset: () => void;
 
@@ -101,18 +100,8 @@ export interface TourSessionActions {
 
   setPlaybackError: (message: string | null) => void;
   setPlayback: (snapshot: { isPlaying: boolean; positionSeconds: number; durationSeconds: number }) => void;
-  markEntered: (waypointId: string) => void;
-  /** Epic 13: the visited stops of a session resumed from its checkpoint. */
-  restoreVisited: (waypointIds: readonly string[]) => void;
-  markExited: (waypointId: string) => void;
-  startDeepDive: (waypointId: string) => void;
-  endDeepDive: () => void;
   dismissCompletionPrompt: () => void;
-  /**
-   * Epic 15: the engine's state, projected for the screens. The engine is the
-   * source of truth; this replaces markEntered / markExited / startDeepDive /
-   * endDeepDive for engine sessions.
-   */
+  /** Epic 15: the engine's state, projected for the screens. The engine is the source of truth. */
   applyEngineView: (view: EngineView) => void;
   /**
    * The stop whose card the player shows. Set when its narration or Deep Dive
@@ -123,6 +112,8 @@ export interface TourSessionActions {
   setOnAir: (waypointId: string | null, deepDive: boolean) => void;
   /** Raise the end-of-tour prompt once - on the transition to "every stop resolved". */
   promptCompletion: () => void;
+  /** Idle-timeout suspension and its resume (Epic 15). Only between active and paused. */
+  setPaused: (paused: boolean) => void;
 }
 
 /** What the screens need from the engine's state (EngineRunner publish). */
@@ -166,14 +157,6 @@ export const useTourSession = create<TourSessionState & TourSessionActions>((set
 
   setRoute: (route) => set({ route }),
 
-  setStopOrder: (waypointIds) =>
-    set((s) => {
-      const byId = new Map(s.waypoints.map((w) => [w.id, w]));
-      const ordered = waypointIds.map((id) => byId.get(id));
-      if (ordered.length !== s.waypoints.length || new Set(waypointIds).size !== waypointIds.length) return {};
-      if (!ordered.every((w): w is Waypoint => w !== undefined)) return {};
-      return { waypoints: ordered };
-    }),
 
   sessionFailed: (message) => set({ status: 'error', error: message }),
 
@@ -195,45 +178,10 @@ export const useTourSession = create<TourSessionState & TourSessionActions>((set
         : { playbackError, isPlaying: false, positionSeconds: 0, durationSeconds: 0 },
     ),
 
-  restoreVisited: (waypointIds) =>
-    set((s) => {
-      const known = new Set(s.waypoints.map((w) => w.id));
-      return { visitedWaypointIds: waypointIds.filter((id) => known.has(id)) };
-    }),
 
-  markEntered: (waypointId) =>
-    set((s) => {
-      const visited = s.visitedWaypointIds.includes(waypointId)
-        ? s.visitedWaypointIds
-        : [...s.visitedWaypointIds, waypointId];
 
-      // Prompt once, when every waypoint has been reached. Latching on
-      // `completionPrompted` keeps a re-entry from re-prompting.
-      const allVisited = s.waypoints.length > 0 && visited.length >= s.waypoints.length;
 
-      return {
-        activeWaypointId: waypointId,
-        visitedWaypointIds: visited,
-        completionPrompted: s.completionPrompted || allVisited,
-        // A new stop clears the previous stop's failure.
-        playbackError: null,
-        // Re-entering the same stop keeps its Deep Dive; a new stop's narration
-        // displaces it (PM to confirm - see the TASK-602 handover).
-        deepDiveWaypointId: s.deepDiveWaypointId === waypointId ? s.deepDiveWaypointId : null,
-      };
-    }),
 
-  markExited: (waypointId) =>
-    set((s) => {
-      if (s.activeWaypointId !== waypointId) return {};
-      // Leaving the zone must not hide a Deep Dive the user is still listening to.
-      if (s.deepDiveWaypointId === waypointId) return {};
-      return { activeWaypointId: null, isPlaying: false, positionSeconds: 0, durationSeconds: 0 };
-    }),
-
-  startDeepDive: (waypointId) => set({ deepDiveWaypointId: waypointId, playbackError: null }),
-
-  endDeepDive: () => set({ deepDiveWaypointId: null }),
 
   dismissCompletionPrompt: () => set({ completionPrompted: false }),
 
@@ -256,6 +204,9 @@ export const useTourSession = create<TourSessionState & TourSessionActions>((set
     })),
 
   promptCompletion: () => set({ completionPrompted: true }),
+
+  setPaused: (paused) =>
+    set((s) => (s.status === 'active' || s.status === 'paused' ? { status: paused ? 'paused' : 'active' } : {})),
 }));
 
 /** Selectors, so subscribers only re-render on the slice they actually read. */

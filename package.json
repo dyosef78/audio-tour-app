@@ -21,7 +21,7 @@
     "media:doctor": "node backend/scripts/process-audio.ts doctor",
     "media:process": "node backend/scripts/process-audio.ts",
     "cms:ingest": "node --env-file-if-exists=.env backend/scripts/ingest-audio.ts",
-    "sim:walk": "node --env-file-if-exists=.env --import ./mobile/scripts/register-stubs.mjs mobile/scripts/simulate-walk.ts",
+    "sim:drive": "node mobile/scripts/sim-drive.ts",
     "test:telemetry": "node --env-file-if-exists=.env --import ./mobile/scripts/register-stubs.mjs mobile/scripts/test-telemetry.ts",
     "test:cms": "node backend/scripts/test-cms.ts",
     "test:routing": "node backend/scripts/test-routing.ts",

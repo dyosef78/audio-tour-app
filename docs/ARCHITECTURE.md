@@ -726,8 +726,11 @@ The extension must match the codec because AVFoundation infers the format from i
   them, so a side that drops `group_type` or an interest fails. Change the wire
   shape there first. The time budget and city are deliberately not in the
   request: they pick the tour, not the route.
-- **Manual harnesses** (not in CI, hit a real project): `npm run sim:walk`
-  (end-to-end geofence → offline file → audio), `npm run routing:ping`.
+- **Engine simulation** (in CI, no network): `npm run sim:drive` - the real
+  Epic 15 engine path (manifest → EngineRunner → AudioActor, real progress
+  repository) on a simulated drive-then-walk day with a tunnel, a detour, a
+  chapter switch and the idle timeout.
+- **Manual harnesses** (not in CI, hit a real project): `npm run routing:ping`.
 
 ### 6.4 Epic 11 — closed
 
@@ -849,4 +852,4 @@ good practice rather than an App Store rejection risk on its own.
 | Onboarding screens | `mobile/src/screens/onboarding/`, `mobile/src/components/onboarding/` |
 | Auth (optional sign-in) | `mobile/src/services/auth/` (`secureSessionStorage.ts`, `authStore.ts`, `AuthService.ts`, `accountDeletion.ts`, `AccountService.ts`, `localTeardown.ts`, `sessionTeardown.ts`) |
 | Settings & account | `mobile/src/screens/SettingsScreen.tsx`, `DeleteAccountScreen.tsx`, `mobile/src/components/auth/SignInButtons.tsx` |
-| Tests & harnesses | `mobile/scripts/` (`test-ui-logic.ts`, `test-auth.ts`, `simulate-walk.ts`), `backend/scripts/` |
+| Tests & harnesses | `mobile/scripts/` (`test-ui-logic.ts`, `test-auth.ts`, `sim-drive.ts`), `backend/scripts/` |

@@ -66,21 +66,13 @@ import {
   routePreferencesOf,
   routeRequestBody,
 } from '../src/routing/routeRequest.ts';
-import { LocationService, type GeofenceEvent } from '../src/services/location/LocationService.ts';
-import { StopSequence } from '../src/services/location/stopSequence.ts';
+import { LocationService } from '../src/services/location/LocationService.ts';
 import { parseLocalTime } from '../../shared/src/smartSorter.ts';
 import { connectivityOf } from '../src/services/network/connectivity.ts';
 import AsyncStorage, { __dump, __setFailReads } from './stubs/async-storage.ts';
 import { players } from './stubs/expo-audio.ts';
-import { __setAppForegrounded, calls as locationCalls, resetCalls as resetLocationCalls } from './stubs/expo-location.ts';
-import { profileFor } from '../src/config/transitProfiles.ts';
-import {
-  createCheckpointStore,
-  decideResume,
-  MAX_RESUME_AGE_MS,
-  type CheckpointIO,
-  type SessionCheckpoint,
-} from '../src/session/sessionCheckpoint.ts';
+import { __isAppForegrounded, __setAppForegrounded, calls as locationCalls, resetCalls as resetLocationCalls } from './stubs/expo-location.ts';
+import { samplingFor } from '../src/config/transitProfiles.ts';
 
 // -----------------------------------------------------------------------------
 // Tiny test harness
@@ -461,7 +453,7 @@ eq('contrast sanity: black on white is 21', Math.round(contrastRatio('#000000', 
 // Deep Dive session semantics
 // -----------------------------------------------------------------------------
 
-heading('Deep Dive vs geofence events');
+heading('Session store: the engine projection (Epic 15)');
 
 function waypoint(id: string, sortOrder: number): Waypoint {
   return {
@@ -476,26 +468,37 @@ function waypoint(id: string, sortOrder: number): Waypoint {
   };
 }
 
-const session = useTourSession.getState();
-session.sessionStarted({ waypoints: [waypoint('A', 1), waypoint('B', 2)], transitMode: 'walking', backgroundPermission: true });
+{
+  const session = useTourSession.getState();
+  session.sessionStarted({ waypoints: [waypoint('A', 1), waypoint('B', 2)], transitMode: 'walking', backgroundPermission: true });
 
-session.markEntered('A');
-session.startDeepDive('A');
-session.markExited('A');
-eq('exiting keeps the stop whose Deep Dive is playing', useTourSession.getState().activeWaypointId, 'A');
+  session.setOnAir('A', false);
+  eq('a narration on air: its card is shown', [useTourSession.getState().activeWaypointId, useTourSession.getState().deepDiveWaypointId], ['A', null]);
+  useTourSession.getState().setPlaybackError('boom');
+  session.setOnAir('A', true);
+  eq('its Deep Dive on air: same card, Deep Dive marked', [useTourSession.getState().activeWaypointId, useTourSession.getState().deepDiveWaypointId], ['A', 'A']);
+  eq('...the same stop keeps its error', useTourSession.getState().playbackError, 'boom');
+  session.setOnAir('B', false);
+  eq('a different stop displaces the Deep Dive and clears the old error', [useTourSession.getState().activeWaypointId, useTourSession.getState().deepDiveWaypointId, useTourSession.getState().playbackError], ['B', null, null]);
+  useTourSession.getState().setPlayback({ isPlaying: true, positionSeconds: 12, durationSeconds: 60 });
+  session.setOnAir(null, false);
+  eq('taken off air: no card, transport reset', [useTourSession.getState().activeWaypointId, useTourSession.getState().isPlaying, useTourSession.getState().positionSeconds], [null, false, 0]);
 
-session.markEntered('A');
-eq('re-entering the same stop keeps its Deep Dive', useTourSession.getState().deepDiveWaypointId, 'A');
+  session.applyEngineView({ visitedWaypointIds: ['A'] });
+  const visited = useTourSession.getState().visitedWaypointIds;
+  session.applyEngineView({ visitedWaypointIds: ['A'] });
+  assert('an unchanged visit list keeps its array (no map re-render per heartbeat)', useTourSession.getState().visitedWaypointIds === visited);
+  session.applyEngineView({ visitedWaypointIds: ['A', 'B'] });
+  eq('a new visit is published', useTourSession.getState().visitedWaypointIds, ['A', 'B']);
 
-session.markEntered('B');
-eq('a different stop displaces the Deep Dive', useTourSession.getState().deepDiveWaypointId, null);
-eq('and becomes active', useTourSession.getState().activeWaypointId, 'B');
+  session.promptCompletion();
+  eq('the completion prompt is raised', useTourSession.getState().completionPrompted, true);
+  session.dismissCompletionPrompt();
+  eq('...and can be dismissed', useTourSession.getState().completionPrompted, false);
 
-session.markExited('B');
-eq('without a Deep Dive, exit clears the stop as before', useTourSession.getState().activeWaypointId, null);
-
-session.reset();
-eq('reset clears the Deep Dive', useTourSession.getState().deepDiveWaypointId, null);
+  session.reset();
+  eq('reset clears the card', useTourSession.getState().activeWaypointId, null);
+}
 
 // -----------------------------------------------------------------------------
 // Seek vs the stall watchdog
@@ -1234,293 +1237,64 @@ eq('a duplicate is refused', adoptableStopOrder(['wall', 'wall'], [JAFFA, WALL])
 eq('a stranger is refused', adoptableStopOrder(['wall', 'david'], [JAFFA, WALL]), null);
 
 // -----------------------------------------------------------------------------
-// TASK-902: sequenced geofences
+// Epic 15: LocationService is GPS transport for the engine - no decisions
 // -----------------------------------------------------------------------------
 
-heading('StopSequence');
+heading('LocationService: transport for the engine (Epic 13 rules kept)');
 
 {
-  const seq = new StopSequence(['a', 'b', 'c', 'd']);
-  eq('arms the first stop', seq.next(), 'a');
-  seq.reach('a');
-  eq('reaching it arms the next', seq.next(), 'b');
-  eq(
-    'a reorder must hold exactly the same stops',
-    [seq.reorder(['a', 'b', 'c']), seq.reorder(['a', 'b', 'c', 'x']), seq.reorder(['a', 'a', 'c', 'd'])],
-    [false, false, false],
-  );
-  assert('a valid reorder is accepted', seq.reorder(['a', 'd', 'c', 'b']));
-  eq('progress survives it: the first unpassed stop of the new order is armed', seq.next(), 'd');
-  seq.reach('c');
-  eq('reaching a later stop skips the ones before it', [seq.isPassed('d'), seq.next()], [true, 'b']);
-  seq.reach('a');
-  eq('reaching a passed stop changes nothing', seq.next(), 'b');
-  seq.reach('b');
-  eq('done: nothing armed', seq.next(), null);
-}
-
-heading('LocationService: only the next routed stop narrates');
-
-// Stops on a line running north, 200 m apart, 20 m zones: clear of each other
-// even with walking's x1.6 exit hysteresis.
-const SEQ_ORIGIN = { latitude: 32.08, longitude: 34.78 };
-const northOf = (metres: number): LatLng => ({
-  latitude: SEQ_ORIGIN.latitude + metres / 111_320,
-  longitude: SEQ_ORIGIN.longitude,
-});
-const zonedStop = (id: string, sortOrder: number, metres: number, zoned = true): Waypoint => ({
-  ...waypoint(id, sortOrder),
-  coordinate: northOf(metres),
-  geofence: zoned
-    ? { id: `${id}:zone`, waypointId: id, zoneType: 'radius', center: northOf(metres), radiusMeters: 20 }
-    : null,
-});
-
-function engine(stops: Waypoint[]) {
-  const service = new LocationService('walking');
-  service.loadTour(stops, 'walking');
-  const events: string[] = [];
-  service.setCallbacks({ onGeofence: (e: GeofenceEvent) => events.push(`${e.type}:${e.waypoint.id}`) });
-  let clock = 1_000_000_000;
-  // A minute per fix: every Adaptive GPS change commits at once, leaving no timer.
-  const at = (metres: number): string[] => {
-    const before = events.length;
-    clock += 60_000;
-    service.onFix(northOf(metres), 5, clock);
-    return events.slice(before);
-  };
-  return { service, at };
-}
-
-{
-  const { service, at } = engine([zonedStop('A', 1, 0), zonedStop('B', 2, 200), zonedStop('C', 3, 400), zonedStop('D', 4, 600)]);
-  eq('before any route arrives, authored order: A is armed', service.nextWaypointId(), 'A');
-  eq('the routed order puts C second', service.setStopOrder(['A', 'C', 'B', 'D']), true);
-  eq('enter A', at(0), ['enter:A']);
-  eq('walking through B, scheduled for later, is silent', at(200), ['exit:A']);
-  eq('and leaves no state: B is not "inside"', service.isInside('B'), false);
-  eq('C, the next routed stop, narrates', at(400), ['enter:C']);
-  eq('walking back to B: exit C, then B narrates, in that order', at(200), ['exit:C', 'enter:B']);
-  eq('D narrates last', at(600), ['exit:B', 'enter:D']);
-  eq('returning to a narrated stop does not replay it', [...at(400), ...at(0)], ['exit:D']);
-  eq('the tour is done', service.nextWaypointId(), null);
-  eq('with nothing armed, no zone holds the GPS on fine sampling', service.distanceToNearestZone(northOf(0)), null);
-  await service.stop();
-}
-
-{
-  const { service, at } = engine([zonedStop('A', 1, 0), zonedStop('B', 2, 200), zonedStop('C', 3, 400)]);
-  service.setStopOrder(['A', 'C', 'B']);
-  at(0);
-  eq('standing in B early is ignored', at(200), ['exit:A']);
-  eq('a mid-walk reorder arms B while the user already stands in it', service.setStopOrder(['A', 'B', 'C']), true);
-  eq('B narrates on the next fix, without walking out and back in', at(200), ['enter:B']);
-  eq(
-    'Adaptive GPS measures to the armed stop (C), not the nearer unarmed one',
-    Math.round(service.distanceToNearestZone(northOf(300)) ?? -1),
-    80,
-  );
-  eq(
-    'a reorder naming other stops is refused and changes nothing',
-    [service.setStopOrder(['A', 'B', 'X']), service.nextWaypointId()],
-    [false, 'C'],
-  );
-  await service.stop();
-}
-
-{
-  const stops = [zonedStop('A', 1, 0), zonedStop('B', 2, 200), zonedStop('C', 3, 400)];
-  const { service, at } = engine(stops);
-  at(0);
-  eq("B's zone is missed entirely: C is not armed", at(400), ['exit:A']);
-  service.markReached('B');
-  eq('reaching B by hand arms C', service.nextWaypointId(), 'C');
-  eq('and C narrates on the next fix', at(400), ['enter:C']);
-  await service.stop();
-
-  const skip = engine(stops);
-  skip.at(0);
-  skip.service.markReached('C');
-  eq('reaching a later stop by hand skips the one in between', [skip.service.nextWaypointId(), skip.at(200)], [null, ['exit:A']]);
-  await skip.service.stop();
-}
-
-{
-  const { service, at } = engine([zonedStop('A', 1, 0), zonedStop('X', 2, 100, false), zonedStop('B', 3, 200)]);
-  at(0);
-  eq('a stop with no geofence cannot block the stops after it', at(200), ['exit:A', 'enter:B']);
-  await service.stop();
-}
-
-heading('Epic 13: session checkpoint (resume after a process kill)');
-
-{
-  // In-memory files, with a switch to "kill" the process between two steps.
-  const files = new Map<string, string>();
-  let killAfter: 'writeTemp' | 'deleteMain' | null = null;
-  const io: CheckpointIO = {
-    readMain: () => files.get('main') ?? null,
-    readTemp: () => files.get('temp') ?? null,
-    writeTemp: (text) => {
-      files.set('temp', text);
-      if (killAfter === 'writeTemp') throw new Error('killed');
-    },
-    commitTemp: () => {
-      files.delete('main');
-      if (killAfter === 'deleteMain') throw new Error('killed');
-      files.set('main', files.get('temp') as string);
-      files.delete('temp');
-    },
-    clear: () => files.clear(),
-  };
-  const store = createCheckpointStore(io);
-  const cp = (over: Partial<SessionCheckpoint> = {}): SessionCheckpoint => ({
-    v: 1, tourId: 't1', tourTitle: 'Tel Aviv', transitMode: 'walking',
-    activeIds: ['A', 'B', 'C'], skippedIds: ['X'], order: ['A', 'C', 'B'], passed: ['A', 'C'], visited: ['A', 'C'],
-    backgroundPermission: true, notificationPermission: false, startedAt: 1_000, savedAt: 2_000, ...over,
+  const ORIGIN_15 = { latitude: 32.08, longitude: 34.78 };
+  const fixAt = (metres: number, t: number) => ({
+    coordinate: { latitude: ORIGIN_15.latitude + metres / 111_320, longitude: ORIGIN_15.longitude },
+    timestamp: t,
+    accuracyM: 5,
+    speedMps: 1.2,
+    headingDeg: 0,
   });
-
-  eq('nothing saved -> none', store.load(), { kind: 'none' });
-  store.save(cp());
-  eq('round trip: order, and a passed set that is NOT a prefix of it', store.load(), { kind: 'found', checkpoint: cp() });
-  eq('...and only the committed file remains', [...files.keys()], ['main']);
-
-  // Atomicity: a kill at either point leaves one complete copy.
-  killAfter = 'writeTemp';
-  try { store.save(cp({ passed: ['A', 'C', 'B'], savedAt: 3_000 })); } catch { /* the kill */ }
-  eq('killed after the temp write -> the OLD checkpoint loads', (store.load() as { checkpoint: SessionCheckpoint }).checkpoint.savedAt, 2_000);
-  killAfter = 'deleteMain';
-  try { store.save(cp({ passed: ['A', 'C', 'B'], savedAt: 3_000 })); } catch { /* the kill */ }
-  eq('killed between delete and rename -> the NEW checkpoint loads from the temp', (store.load() as { checkpoint: SessionCheckpoint }).checkpoint.savedAt, 3_000);
-  killAfter = null;
-
-  files.set('main', '{"v":1,"tourId":');
-  eq('a torn file is invalid, never "none" (not mistaken for an ended tour)', store.load().kind, 'invalid');
-  for (const [label, bad] of [
-    ['an order that is not the active stops', cp({ order: ['A', 'B'] })],
-    ['a passed stop that is not active', cp({ passed: ['Z'] })],
-    ['an unknown version', { ...cp(), v: 2 }],
-    ['an unknown transit mode', cp({ transitMode: 'flying' as never })],
-  ] as const) {
-    files.set('main', JSON.stringify(bad));
-    assert(`rejects ${label}`, store.load().kind === 'invalid');
-  }
-  let refused = false;
-  try { store.save(cp({ order: ['A'] })); } catch { refused = true; }
-  assert('save() refuses a checkpoint load() would reject', refused);
-  store.clear();
-  eq('clear() removes both files', files.size, 0);
-
-  const found = { kind: 'found' as const, checkpoint: cp({ savedAt: 10_000_000 }) };
-  eq('fresh -> resume', decideResume(found, 10_000_000 + MAX_RESUME_AGE_MS).kind, 'resume');
-  eq('older than the limit -> discard', decideResume(found, 10_000_001 + MAX_RESUME_AGE_MS).kind, 'discard');
-  eq('invalid -> discard (with the reason)', decideResume({ kind: 'invalid', reason: 'not JSON' }, 0), { kind: 'discard', reason: 'unusable checkpoint (not JSON)' });
-  eq('none -> nothing', decideResume({ kind: 'none' }, 0).kind, 'nothing');
-}
-
-{
-  const seq = new StopSequence(['A', 'B', 'C', 'D']);
-  seq.reorder(['A', 'C', 'B', 'D']);
-  seq.reach('A');
-  seq.reach('C');
-  eq('passedIds in visiting order', seq.passedIds(), ['A', 'C']);
-
-  const fresh = new StopSequence(['A', 'B', 'C', 'D']);
-  // B was reached before a reorder moved C ahead of it: {A, B} is NOT a prefix
-  // of A, C, B, D. Replaying reach() would wrongly pass C as well.
-  eq('restore puts back a non-prefix passed set exactly', [fresh.restore(['A', 'C', 'B', 'D'], ['A', 'B']), fresh.next(), fresh.isPassed('C')], [true, 'C', false]);
-  const untouched = new StopSequence(['A', 'B']);
-  eq('restore with an unknown passed stop is refused and changes nothing', [untouched.restore(['B', 'A'], ['Z']), untouched.ids()], [false, ['A', 'B']]);
-}
-
-{
-  const stops = [zonedStop('A', 1, 0), zonedStop('B', 2, 200), zonedStop('C', 3, 400)];
-  const before = new LocationService('walking', 'android');
-  before.loadTour(stops, 'walking');
-  before.setStopOrder(['A', 'C', 'B']);
-  before.markReached('A');
-  const saved = before.progress();
-
-  const after = new LocationService('walking', 'android');
-  after.loadTour(stops, 'walking');
-  eq('LocationService progress survives a round trip', [after.restoreProgress(saved.order, saved.passed), after.nextWaypointId()], [true, 'C']);
-
-  // Android, task still registered (the OS restarted it): ADOPT, touch nothing.
+  const walking = samplingFor('walking');
+  const driving = samplingFor('driving');
   resetLocationCalls();
-  const running = new LocationService('walking', 'ios');
-  running.loadTour(stops, 'walking');
-  await running.startBackground(); // stands in for the task the OS restarted
-  __setAppForegrounded(false); // the restarted process is headless: no UI
-  const beforeAdopt = locationCalls.length;
-  const tiers: string[] = [];
-  after.setCallbacks({ onSamplingChange: (t) => tiers.push(t) });
-  await after.resumeTracking();
-  eq('Android resume with the task running: adopted - no stop, no start (a start would throw in the background)', locationCalls.slice(beforeAdopt), []);
-  eq('...and the pinned tier is reported', tiers, ['fine']);
 
-  // Android, no task: a normal start, which only works in the foreground.
-  resetLocationCalls();
-  const cold = new LocationService('walking', 'android');
-  cold.loadTour(stops, 'walking');
-  let threw = false;
-  __setAppForegrounded(false);
-  try { await cold.resumeTracking(); } catch { threw = true; }
-  assert('Android resume with no task, in the background: throws (the caller tears down)', threw);
-  __setAppForegrounded(true);
-  await cold.resumeTracking();
-  eq('...in the foreground: starts the task', locationCalls.map((c) => c.kind), ['background-start']);
-  await cold.stopBackground();
-
-  resetLocationCalls();
   const ios = new LocationService('walking', 'ios');
-  ios.loadTour(stops, 'walking');
-  await ios.resumeTracking();
-  eq('iOS resume: the foreground watcher, as start() opens it', locationCalls.map((c) => c.kind), ['watch']);
+  eq('iOS: no persistent task', ios.persistentTask, false);
+  await ios.start();
+  const watch = locationCalls.find((c) => c.kind === 'watch');
+  assert(
+    'iOS start(): a foreground watcher, pinned sampling, distanceInterval 0 (the background clock)',
+    watch?.options?.distanceInterval === 0 && watch.options.accuracy === walking.accuracy && watch.options.timeInterval === walking.timeInterval,
+    JSON.stringify(locationCalls),
+  );
+  resetLocationCalls();
+  await ios.retune('driving');
+  const rewatch = locationCalls.find((c) => c.kind === 'watch');
+  assert('iOS retune(): the watcher reopened with the new mode', rewatch?.options?.accuracy === driving.accuracy, JSON.stringify(locationCalls));
   await ios.stop();
   resetLocationCalls();
-}
 
-heading('Epic 13: Android - one persistent task, pinned to fine');
-
-{
-  const fine = profileFor('walking').fine;
-  const stops = [zonedStop('A', 1, 0), zonedStop('B', 2, 600)];
-  resetLocationCalls();
-
-  const ios = new LocationService('walking', 'ios');
-  ios.loadTour(stops, 'walking');
-  eq('iOS keeps Adaptive GPS: starts coarse, no persistent task', [ios.getTier(), ios.persistentTask], ['coarse', false]);
-
-  const droid = new LocationService('walking', 'android');
-  droid.loadTour(stops, 'walking');
+  const droid = new LocationService('walking', 'android', { isForeground: __isAppForegrounded });
   const tiers: string[] = [];
-  const entered: string[] = [];
-  droid.setCallbacks({
-    onSamplingChange: (tier) => tiers.push(tier),
-    onGeofence: (e: GeofenceEvent) => e.type === 'enter' && entered.push(e.waypoint.id),
-  });
+  const got: number[] = [];
+  droid.setCallbacks({ onSamplingChange: (tier) => tiers.push(tier), onGpsFix: (f) => got.push(f.timestamp) });
   await droid.start();
   const starts = locationCalls.filter((c) => c.kind === 'background-start');
   assert(
-    'start() opens the background task, never a watcher, on the fine tier',
-    starts.length === 1 && !locationCalls.some((c) => c.kind === 'watch') &&
-      starts[0].options?.distanceInterval === fine.distanceInterval && starts[0].options?.accuracy === fine.accuracy,
+    'Android start(): the background task, never a watcher, distanceInterval 0',
+    starts.length === 1 &&
+      !locationCalls.some((c) => c.kind === 'watch') &&
+      starts[0]?.options?.distanceInterval === 0 &&
+      starts[0]?.options?.accuracy === walking.accuracy,
     JSON.stringify(locationCalls),
   );
-  eq('the pinned tier is reported once, so the debug overlay is honest', tiers, ['fine']);
+  eq('the pinned tier is reported once, for the debug overlay', tiers, ['fine']);
 
   // Pocketed: from here any start with a foreground service throws, as on a device.
   __setAppForegrounded(false);
   const before = locationCalls.length;
-  let clock = 2_000_000_000;
-  for (const metres of [-3_000, 0, 300, -3_000, 580, 600]) {
-    clock += 60_000;
-    droid.onFix(northOf(metres), 5, clock);
+  for (const [i, metres] of [-3_000, 0, 300, -3_000, 580, 600].entries()) {
+    droid.onGpsFix(fixAt(metres, 2_000_000_000 + i * 60_000));
   }
-  await droid.settled();
-  eq('walking far -> near -> far in the background touches the task zero times', locationCalls.slice(before), []);
-  eq('the tier never leaves fine', droid.getTier(), 'fine');
-  eq('and every stop still narrates', entered, ['A', 'B']);
+  eq('pocketed: fixes far and near touch the task zero times', locationCalls.slice(before), []);
+  eq('...and every fix reaches the engine with its own timestamp', got, [0, 1, 2, 3, 4, 5].map((i) => 2_000_000_000 + i * 60_000));
 
   let refused = false;
   try {
@@ -1530,51 +1304,84 @@ heading('Epic 13: Android - one persistent task, pinned to fine');
   }
   assert('startBackground() on Android is a loud contract violation', refused);
 
-  // Not vacuous: the stub really refuses what the old code did from the background.
-  let stubRefuses = false;
-  const probe = new LocationService('walking', 'android');
-  probe.loadTour(stops, 'walking');
+  let retuneRefused = false;
+  const beforeRetune = locationCalls.length;
   try {
-    await probe.start();
+    await droid.retune('driving');
   } catch {
-    stubRefuses = true;
+    retuneRefused = true;
   }
-  assert('a start while pocketed throws (the Android rule is enforced by the stub)', stubRefuses);
+  assert('retune() while pocketed throws - a chapter change must come from an in-app tap', retuneRefused);
+  eq('...and leaves the running task UNTOUCHED (stopping it first would leave no tracking at all)', locationCalls.slice(beforeRetune), []);
 
+  // Not resetLocationCalls(): the stub's reset also forgets the running task.
   __setAppForegrounded(true);
+  const markRetune = locationCalls.length;
+  await droid.retune('driving');
+  const retuneCalls = locationCalls.slice(markRetune);
+  const retuned = retuneCalls.filter((c) => c.kind === 'background-start').at(-1);
+  assert(
+    'retune() in the foreground: stop, then start with the new mode (the failed retune did not wedge the chain)',
+    retuneCalls.map((c) => c.kind).join() === 'background-stop,background-start' && retuned?.options?.timeInterval === driving.timeInterval && retuned.options.accuracy === driving.accuracy,
+    JSON.stringify(retuneCalls),
+  );
   await droid.stop();
   await droid.stopBackground();
   eq('ending the session stops the task', locationCalls.at(-1)?.kind, 'background-stop');
 
+  // Not vacuous: with the guard bypassed, the STUB itself refuses a start
+  // from the background - so the guard tests above test something real.
+  let stubRefuses = false;
+  __setAppForegrounded(false);
+  try {
+    await new LocationService('walking', 'android', { isForeground: () => true }).start();
+  } catch {
+    stubRefuses = true;
+  }
+  __setAppForegrounded(true);
+  assert('a start while pocketed throws (the Android rule is enforced by the stub)', stubRefuses);
+
   // A task left by a previous process keeps ITS options; start() must replace it.
   resetLocationCalls();
-  await ios.startBackground(); // leaves a task running, as a killed process would
-  const again = new LocationService('walking', 'android');
-  again.loadTour(stops, 'walking');
+  await new LocationService('walking', 'ios').startBackground(); // stands in for a killed process's task
+  const again = new LocationService('walking', 'android', { isForeground: __isAppForegrounded });
   await again.start();
-  eq(
-    'a task already running is replaced, not adopted',
-    locationCalls.map((c) => c.kind),
-    ['background-start', 'background-stop', 'background-start'],
-  );
+  eq('a task already running is replaced, not adopted', locationCalls.map((c) => c.kind), ['background-start', 'background-stop', 'background-start']);
+
+  // Resume (Epic 13): the OS restarted the task after a kill - ADOPT it.
+  __setAppForegrounded(false); // the restarted process is headless: no UI
+  const beforeAdopt = locationCalls.length;
+  const adopted: string[] = [];
+  const after = new LocationService('walking', 'android', { isForeground: __isAppForegrounded });
+  after.setCallbacks({ onSamplingChange: (t) => adopted.push(t) });
+  await after.resumeTracking();
+  eq('Android resume with the task running: adopted - no stop, no start', locationCalls.slice(beforeAdopt), []);
+  eq('...and the pinned tier is reported', adopted, ['fine']);
+  __setAppForegrounded(true);
   await again.stopBackground();
+
+  // Android, no task: a normal start, which only works in the foreground.
   resetLocationCalls();
-}
+  const cold = new LocationService('walking', 'android', { isForeground: __isAppForegrounded });
+  let threw = false;
+  __setAppForegrounded(false);
+  try {
+    await cold.resumeTracking();
+  } catch {
+    threw = true;
+  }
+  assert('Android resume with no task, in the background: throws (the caller tears down)', threw);
+  __setAppForegrounded(true);
+  await cold.resumeTracking();
+  eq('...in the foreground: starts the task', locationCalls.map((c) => c.kind), ['background-start']);
+  await cold.stopBackground();
 
-heading('Session store follows the routed order');
-
-{
-  useTourSession.getState().sessionStarted({
-    waypoints: [waypoint('A', 1), waypoint('B', 2), waypoint('C', 3)],
-    transitMode: 'walking',
-    backgroundPermission: true,
-  });
-  useTourSession.getState().setStopOrder(['C', 'A', 'B']);
-  eq('stops are listed in narration order', useTourSession.getState().waypoints.map((w) => w.id), ['C', 'A', 'B']);
-  useTourSession.getState().setStopOrder(['C', 'A']);
-  useTourSession.getState().setStopOrder(['C', 'C', 'A']);
-  eq('an order that is not the same stops is ignored', useTourSession.getState().waypoints.map((w) => w.id), ['C', 'A', 'B']);
-  useTourSession.getState().reset();
+  resetLocationCalls();
+  const iosResume = new LocationService('walking', 'ios');
+  await iosResume.resumeTracking();
+  eq('iOS resume: the foreground watcher, as start() opens it', locationCalls.map((c) => c.kind), ['watch']);
+  await iosResume.stop();
+  resetLocationCalls();
 }
 
 // -----------------------------------------------------------------------------

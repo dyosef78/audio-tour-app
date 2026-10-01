@@ -70,28 +70,22 @@ import { CmsIngestError, ingestWaypointAudio } from '../cms/index.ts';
 // of a 58.7 m gap while the real boundaries were 32 + 40 = 72 m and overlapped.
 // The symptom was narration cutting out at Jaffa Gate: one fix emitted enter(1)
 // and exit(2) together and the exit stopped the track the enter had just
-// started. See the comment block in prod_test_seed.sql and Phase E of
-// `npm run sim:walk`.
+// started. See the comment block in prod_test_seed.sql.
 //
-// TourSessionController has since been taught to stop only the track the
-// EXITING waypoint owns, which defuses that specific failure. It does not
-// defuse the other one: where ENTRY circles overlap, a single fix sits inside
-// two zones and fires enter(a) then enter(b), and the second narration replaces
-// the first mid-sentence. There is no clean mitigation for that in the client -
-// the content simply must not ask for it.
+// The Epic 15 engine stops only the track an EXITING stop owns and lets at
+// most one stop fire per fix - but where ENTRY circles overlap, two stops still
+// compete for one place, and the content simply must not ask for it.
 //
 // MIRRORED CONSTANT, DELIBERATELY.
-// The authority is mobile/src/config/transitProfiles.ts. It cannot be imported
-// here: it pulls in expo-location, which is a React Native dependency and not
-// installable in the backend workspace. So the number is copied, the way
-// storage-path.ts copies isSafeStoragePath from the mobile client - with the
-// duplication called out rather than hidden. If the profile changes, change it
-// here too; --plan is what tells you whether the change broke the route.
+// The authority is mobile/src/engine/config.ts (MODE_CONFIG.*.exitHysteresisFactor
+// and TRIGGER_RADIUS_RANGE_M). The backend typecheck treats mobile files as
+// CommonJS, so it is copied rather than imported - and test-cms fails if the
+// copy drifts from the engine.
 // =============================================================================
 
 const EXIT_HYSTERESIS_FACTOR = { walking: 1.6, biking: 1.5, driving: 1.4 } as const;
 
-/** Documented trigger-radius envelope per mode, also from transitProfiles.ts. */
+/** Documented trigger-radius envelope per mode - engine/config.ts TRIGGER_RADIUS_RANGE_M. */
 const TRIGGER_RADIUS_RANGE = {
   walking: [15, 30],
   biking: [50, 80],

@@ -98,6 +98,9 @@ export function snapshotProblem(value: unknown): string | null {
   if (!isTimeRecord(p.fired)) return 'progress.fired is not a map of times';
   if (!isTimeRecord(p.played)) return 'progress.played is not a map of times';
   if (!Array.isArray(p.queue) || !p.queue.every(isQueueItem)) return 'progress.queue is malformed';
+  if (p.suspendedAt !== undefined && (typeof p.suspendedAt !== 'number' || !Number.isFinite(p.suspendedAt))) {
+    return 'progress.suspendedAt is not a timestamp';
+  }
   const active = new Set(c.activeIds);
   for (const id of [...Object.keys(p.fired as object), ...(p.queue as QueueItem[]).map((q) => q.stopId)]) {
     if (!active.has(id)) return `progress names ${id}, which is not an active stop`;

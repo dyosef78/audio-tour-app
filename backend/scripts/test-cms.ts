@@ -536,6 +536,26 @@ heading('Epic 15: no CMS function is executable by anon');
 }
 
 // -----------------------------------------------------------------------------
+heading('Seed tooling mirrors the engine config');
+// -----------------------------------------------------------------------------
+// seed-tel-aviv-qa.ts copies the exit factors and the radius envelope (the
+// backend typecheck cannot import mobile modules). Both read as text.
+{
+  const engineConfig = readFileSync(new URL('../../mobile/src/engine/config.ts', import.meta.url), 'utf8');
+  const seed = readFileSync(new URL('./seed-tel-aviv-qa.ts', import.meta.url), 'utf8');
+  for (const mode of ['walking', 'biking', 'driving'] as const) {
+    const engineFactor = new RegExp(`\\n  ${mode}: \\{[\\s\\S]*?exitHysteresisFactor: ([\\d.]+)`).exec(engineConfig)?.[1];
+    const seedFactor = new RegExp(`EXIT_HYSTERESIS_FACTOR = \\{[^}]*${mode}: ([\\d.]+)`).exec(seed)?.[1];
+    assert(`${mode}: exit factor found in both`, engineFactor !== undefined && seedFactor !== undefined);
+    eq(`${mode}: seed exit factor == engine`, seedFactor, engineFactor);
+    const engineRange = new RegExp(`TRIGGER_RADIUS_RANGE_M[\\s\\S]*?${mode}: \\[(\\d+), (\\d+)\\]`).exec(engineConfig)?.slice(1);
+    const seedRange = new RegExp(`TRIGGER_RADIUS_RANGE = \\{[\\s\\S]*?${mode}: \\[(\\d+), (\\d+)\\]`).exec(seed)?.slice(1);
+    assert(`${mode}: radius envelope found in both`, engineRange?.length === 2 && seedRange?.length === 2);
+    eq(`${mode}: seed radius envelope == engine`, seedRange, engineRange);
+  }
+}
+
+// -----------------------------------------------------------------------------
 heading('Telemetry vocabulary: database == app');
 // -----------------------------------------------------------------------------
 // A type the server refuses is accepted by the device's offline queue and then

@@ -197,6 +197,10 @@ const snapshot: TourProgressSnapshot = {
   assert('an unreadable file is invalid, never "none"', broken.kind === 'invalid' && /EIO/.test(broken.reason));
   assert('12 h + 1 min old: discarded', decideSnapshotResume({ kind: 'found', snapshot }, 3000 + 12 * 3_600_000 + 60_000).kind === 'discard');
   assert('fresh: resumed', decideSnapshotResume({ kind: 'found', snapshot }, 4000).kind === 'resume');
+  repo.save({ ...snapshot, progress: { ...progress, suspendedAt: 5000 } });
+  const susp = repo.load();
+  assert('a suspended tour round-trips its suspendedAt', susp.kind === 'found' && susp.snapshot.progress.suspendedAt === 5000);
+  throws('a non-numeric suspendedAt is refused', () => repo.save({ ...snapshot, progress: { ...progress, suspendedAt: 'soon' as unknown as number } }), /suspendedAt/);
 }
 
 // -----------------------------------------------------------------------------
@@ -213,6 +217,7 @@ function harness(over: Partial<EngineRunnerPorts> = {}) {
     persist: (p) => log.push(`persist fired=${Object.keys(p.fired).join('+')}`),
     audio: (fx) => log.push(`audio ${fx.type} ${fx.token}`),
     applyTransitMode: (m) => log.push(`mode ${m}`),
+    tracking: (fx) => log.push(`tracking ${fx.type}`),
     telemetry: (fx) => log.push(`tel ${fx.kind}`),
     publish: () => log.push('publish'),
     now: () => now,
@@ -302,6 +307,21 @@ function harness(over: Partial<EngineRunnerPorts> = {}) {
   assert('a reducer throw is reported with the event type', h.log.some((l) => l.startsWith('error reduce MANUAL_TRIGGER')));
   h.runner.fixes([at(34.78, 32.08, h.now() - 100)]);
   assert('...and the loop keeps working afterwards', 'w1' in h.runner.state.progress.fired);
+}
+{
+  // Idle timeout through the loop: SUSPEND reaches the tracking port, after the persist.
+  const h = harness();
+  h.runner.start();
+  h.runner.fixes([at(34.7, 32.0, h.now() - 100)]);
+  h.log.length = 0;
+  h.advance(15 * 60_000);
+  h.beat();
+  const persistAt = h.log.findIndex((l) => l.startsWith('persist'));
+  const suspendAt = h.log.indexOf('tracking SUSPEND_TRACKING');
+  assert('15 min still: SUSPEND_TRACKING reaches the tracking port', suspendAt >= 0, h.log.join(' | '));
+  assert('...after the suspension is persisted', persistAt >= 0 && persistAt < suspendAt, h.log.join(' | '));
+  h.runner.dispatch({ type: 'RESUME_REQUESTED', at: h.now() });
+  assert('resume: RESUME_TRACKING reaches the tracking port', h.log.includes('tracking RESUME_TRACKING'));
 }
 
 // -----------------------------------------------------------------------------

@@ -71,6 +71,10 @@ let appForegrounded = true;
 export function __setAppForegrounded(foregrounded: boolean): void {
   appForegrounded = foregrounded;
 }
+/** For LocationService's injected foreground check, so it sees the same phone. */
+export function __isAppForegrounded(): boolean {
+  return appForegrounded;
+}
 
 /** The sampling options of the most recent watcher, or undefined if none. */
 export function currentWatchOptions(): LocationOptions | undefined {

@@ -9,7 +9,6 @@
  * Run:  npm run test:engine
  */
 
-import { distanceMeters, isInsideZone } from '../src/services/location/geometry.ts';
 import {
   angularDifference,
   estimateCourse,
@@ -60,6 +59,18 @@ function offset(origin: LatLng, east: number, north: number): LatLng {
 
 const TLV: LatLng = { latitude: 32.0853, longitude: 34.7818 };
 
+/**
+ * The ORACLE: great-circle distance by haversine, written here and nowhere
+ * else, so the code under test is checked against an independent formula.
+ */
+function distanceMeters(a: LatLng, b: LatLng): number {
+  const r = (d: number): number => (d * Math.PI) / 180;
+  const h =
+    Math.sin(r(b.latitude - a.latitude) / 2) ** 2 +
+    Math.cos(r(a.latitude)) * Math.cos(r(b.latitude)) * Math.sin(r(b.longitude - a.longitude) / 2) ** 2;
+  return 2 * EARTH_RADIUS_M * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+}
+
 // -----------------------------------------------------------------------------
 heading('Local plane: error against haversine, antimeridian wrap');
 // -----------------------------------------------------------------------------
@@ -102,8 +113,7 @@ heading('sweptCircle');
   const c = TLV;
   const a = offset(c, -50, 215);
   const b = offset(c, 50, 215);
-  const zone = { id: 'z', waypointId: 'w', zoneType: 'radius' as const, center: c, radiusMeters: 220 };
-  assert('blind spot: neither fix is inside (the point test misses)', !isInsideZone(a, zone) && !isInsideZone(b, zone));
+  assert('blind spot: neither fix is inside (the point test misses)', distanceMeters(a, c) > 220 && distanceMeters(b, c) > 220);
   const h = sweptCircle(a, b, c, 220);
   const halfChord = Math.sqrt(220 ** 2 - 215 ** 2);
   assert(

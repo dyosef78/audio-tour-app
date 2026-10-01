@@ -140,7 +140,7 @@ export default function ActiveTourScreen({ route, navigation }: ActiveTourScreen
           <Text style={styles.cardMeta}>
             {visited.length}/{waypoints.length} stops
             {accuracy !== null ? ` · ±${Math.round(accuracy)} m` : ''}
-            {` · ${tier === 'fine' ? 'high accuracy' : 'power saving'}`}
+            {status === 'paused' ? ' · tracking paused' : ` · ${tier === 'fine' ? 'high accuracy' : 'power saving'}`}
           </Text>
           {/* Says which of the three routes is on screen, so a field tester can
               tell "live route" from "offline route" without reading logs. */}
@@ -151,6 +151,19 @@ export default function ActiveTourScreen({ route, navigation }: ActiveTourScreen
               : ''}
           </Text>
         </View>
+
+        {/* Epic 15: the engine's idle timeout stopped tracking to save battery. */}
+        {status === 'paused' && (
+          <View style={styles.paused}>
+            <Text style={styles.pausedTitle}>Tour paused</Text>
+            <Text style={styles.pausedBody}>
+              No movement for 15 minutes, so location tracking stopped to save battery.
+            </Text>
+            <Pressable style={styles.primary} onPress={() => tourSession.resumeTour()} accessibilityRole="button">
+              <Text style={styles.primaryText}>Resume tour</Text>
+            </Pressable>
+          </View>
+        )}
 
         {!bgGranted && (
           <Text style={styles.warn}>
@@ -199,6 +212,12 @@ const styles = StyleSheet.create({
   },
   cardTitle: { fontSize: 15, fontWeight: '700' },
   cardMeta: { fontSize: 12, opacity: 0.65, marginTop: 2, fontVariant: ['tabular-nums'] },
+  paused: {
+    backgroundColor: 'rgba(255,255,255,0.97)', borderRadius: 12, padding: 14, gap: 8,
+    shadowColor: '#000', shadowOpacity: 0.15, shadowRadius: 10, shadowOffset: { width: 0, height: 3 }, elevation: 5,
+  },
+  pausedTitle: { fontSize: 15, fontWeight: '700' },
+  pausedBody: { fontSize: 13, opacity: 0.75, lineHeight: 18 },
   warn: {
     fontSize: 11, color: '#8A5A00', backgroundColor: 'rgba(251,240,224,0.96)',
     padding: 9, borderRadius: 9, overflow: 'hidden',

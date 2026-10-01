@@ -63,9 +63,15 @@ jobs:
       - name: App logic tests
         run: npm run test:ui
 
-      # Epic 15: swept geofence test and bearing math. Pure - no stubs.
-      - name: Engine geometry tests
+      # Epic 15: geometry, reducer and runtime (event loop, audio actor,
+      # persistence, manifest mapping). Pure - no stubs.
+      - name: Engine tests
         run: npm run test:engine
+
+      # The real engine path on a simulated day out: drive, tunnel, detour,
+      # chapter switch, walk, idle timeout. Deterministic, no network.
+      - name: Engine drive simulation
+        run: npm run sim:drive
 
       - name: Auth storage tests
         run: npm run test:auth

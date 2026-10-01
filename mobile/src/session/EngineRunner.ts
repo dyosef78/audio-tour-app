@@ -52,6 +52,8 @@ export interface EngineRunnerPorts {
   audio(effect: Extract<Effect, { type: 'PLAY' | 'STOP' | 'RESUME' }>): void;
   /** Tracking sampling and audio-session mode for a new chapter. Non-blocking. */
   applyTransitMode(mode: TransitMode): void;
+  /** Idle timeout: stop tracking (and say so); or start it again. Non-blocking. */
+  tracking(effect: Extract<Effect, { type: 'SUSPEND_TRACKING' | 'RESUME_TRACKING' }>): void;
   telemetry(effect: Extract<Effect, { type: 'TELEMETRY' }>): void;
   /** The UI store. Called once per drain, after persisting. */
   publish(next: EngineState, prev: EngineState): void;
@@ -164,6 +166,10 @@ export class EngineRunner {
             break;
           case 'APPLY_TRANSIT_MODE':
             this.ports.applyTransitMode(fx.transitMode);
+            break;
+          case 'SUSPEND_TRACKING':
+          case 'RESUME_TRACKING':
+            this.ports.tracking(fx);
             break;
           case 'TELEMETRY':
             this.ports.telemetry(fx);

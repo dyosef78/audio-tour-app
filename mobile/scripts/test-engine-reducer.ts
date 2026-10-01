@@ -523,5 +523,104 @@ heading('Deep Dive and user skip');
   assert('user skip with nothing on air: nothing happens', reduce(idle.state, { type: 'USER_SKIP', at: T0 }).effects.length === 0);
 }
 
+// -----------------------------------------------------------------------------
+heading('Idle timeout: 15 minutes still suspends the tour (battery)');
+// -----------------------------------------------------------------------------
+{
+  const MIN = 60_000;
+  const tour: EngineTour = {
+    chapters: [chapter('walk', 'walking')],
+    stops: [stop('a', 'walk', 0, 500, 0, 20), stop('b', 'walk', 1, 1000, 0, 20)],
+  };
+  /** Sitting at a cafe: a fix every 30 s, wandering inside 25 m, accuracy 15 m. */
+  const sit = (run: Run, fromMin: number, toMin: number, east = 0): Run => {
+    for (let t = fromMin * MIN; t <= toMin * MIN; t += 30_000) {
+      run = feed(run, [fix(east + ((t / 30_000) % 5) * 5, ((t / 30_000) % 3) * 5, T0 + t, { accuracyM: 15 })]);
+    }
+    return run;
+  };
+  const suspends = (r: Run) => r.effects.filter((e) => e.type === 'SUSPEND_TRACKING').length;
+
+  let r = start(tour, 'walk');
+  r = sit(r, 0, 14.5);
+  assert('14.5 min still: still tracking', suspends(r) === 0 && r.state.progress.suspendedAt === undefined);
+  r = sit(r, 15, 15.5);
+  assert('15 min still: SUSPEND_TRACKING, once', suspends(r) === 1, `${suspends(r)}`);
+  assert('...suspendedAt persisted, reported as tour_suspended', r.state.progress.suspendedAt !== undefined && tel(r, 'tour_suspended').length === 1);
+  r = sit(r, 16, 20);
+  assert('...and not again while suspended', suspends(r) === 1);
+  r = feed(r, [fix(500, 0, T0 + 21 * MIN, { accuracyM: 5 }), fix(502, 0, T0 + 21 * MIN + 2000, { accuracyM: 5 })]);
+  assert('a late fix inside a zone while suspended fires nothing', Object.keys(r.state.progress.fired).length === 0);
+
+  r = send(r, { type: 'RESUME_REQUESTED', at: T0 + 22 * MIN });
+  assert('resume: RESUME_TRACKING, suspension cleared, tour_resumed', r.effects.some((e) => e.type === 'RESUME_TRACKING') && r.state.progress.suspendedAt === undefined && tel(r, 'tour_resumed').length === 1);
+  assert('...the next fix is a fresh start, not a sweep from before', r.state.lastFix === null);
+  r = feed(r, [0, 1, 2, 3, 4, 5, 6, 7, 8].map((i) => fix(470 + i * 5, 0, T0 + 23 * MIN + i * 4000, { accuracyM: 5 })));
+  assert('...and stops fire again', 'a' in r.state.progress.fired);
+}
+{
+  const MIN = 60_000;
+  const tour: EngineTour = { chapters: [chapter('walk', 'walking')], stops: [stop('a', 'walk', 0, 5000, 0, 20)] };
+  let r = start(tour, 'walk');
+  for (let m = 0; m <= 10; m++) r = feed(r, [fix(0, 0, T0 + m * MIN, { accuracyM: 10 })]);
+  r = feed(r, [fix(100, 0, T0 + 10.5 * MIN, { accuracyM: 10 })]);
+  for (let m = 11; m <= 24; m++) r = feed(r, [fix(100, 0, T0 + m * MIN, { accuracyM: 10 })]);
+  assert('moving 100 m at minute 10 restarts the clock: no suspension at 15 or 24', !r.effects.some((e) => e.type === 'SUSPEND_TRACKING'));
+  // The move was RECEIVED 200 ms after its fix time; the clock is the shell's.
+  r = send(r, { type: 'TICK', at: T0 + 25.5 * MIN + 200 });
+  assert('...15 min after the move, a bare TICK suspends (no fix needed)', r.effects.some((e) => e.type === 'SUSPEND_TRACKING'));
+}
+{
+  // A narration actually playing is never cut for inactivity.
+  const MIN = 60_000;
+  const tour: EngineTour = { chapters: [chapter('walk', 'walking')], stops: [stop('a', 'walk', 0, 0, 0, 30)] };
+  let r = start(tour, 'walk');
+  r = feed(r, [fix(0, 0, T0, { accuracyM: 5 })]);
+  const tok = plays(r)[0]?.token ?? -1;
+  assert('standing in a stop: its narration plays', r.state.audio.kind === 'playing');
+  for (let m = 1; m <= 16; m++) r = send(r, { type: 'TICK', at: T0 + m * MIN });
+  assert('16 min still, narration (a long Deep Dive) still playing: NOT suspended', !r.effects.some((e) => e.type === 'SUSPEND_TRACKING'));
+  r = send(r, { type: 'AUDIO_ENDED', token: tok, at: T0 + 17 * MIN });
+  r = send(r, { type: 'TICK', at: T0 + 17 * MIN + 1000 });
+  assert('...it ends: suspended on the next tick', r.effects.some((e) => e.type === 'SUSPEND_TRACKING'));
+
+  let p = start(tour, 'walk');
+  p = feed(p, [fix(0, 0, T0, { accuracyM: 5 })]);
+  const ptok = plays(p)[0]?.token ?? -1;
+  p = send(p, { type: 'AUDIO_INTERRUPTED', token: ptok, at: T0 + 1000, by: 'user' });
+  p = send(p, { type: 'TICK', at: T0 + 15 * MIN + 1000 });
+  assert('paused by the listener and left: STOP idle_timeout, then suspended', p.effects.some((e) => e.type === 'STOP' && e.token === ptok && e.reason === 'idle_timeout') && p.effects.some((e) => e.type === 'SUSPEND_TRACKING'));
+  p = send(p, { type: 'MANUAL_TRIGGER', stopId: 'a', at: T0 + 20 * MIN });
+  assert('a tap on a stop while suspended resumes tracking AND plays it', p.effects.some((e) => e.type === 'RESUME_TRACKING') && plays(p).at(-1)?.stopId === 'a');
+}
+{
+  // Driving: stuck behind an accident with a stop waiting - it expires on suspension.
+  const MIN = 60_000;
+  const tour: EngineTour = {
+    chapters: [chapter('drive', 'driving')],
+    stops: [0, 1].map((i) => stop(`s${i}`, 'drive', i, 1000 * (i + 1), 0, 150)),
+  };
+  let r = start(tour, 'drive');
+  r = feed(r, drive(0, 2000, 0, T0, 27.8));
+  const tok = plays(r)[0]?.token ?? -1;
+  r = send(r, { type: 'AUDIO_INTERRUPTED', token: tok, at: T0 + 73_000, by: 'user' });
+  assert('setup: s1 waiting behind a paused s0', r.state.progress.queue.length === 1);
+  for (let m = 2; m <= 18; m++) r = feed(r, [fix(2000, 0, T0 + m * MIN, { speedMps: 0, headingDeg: -1, accuracyM: 10 })]);
+  // Queue TTLs (<= 2 min) always beat the 15 min idle timeout: the waiting stop
+  // expired on its own long before, so suspension has nothing left to expire.
+  assert('the waiting stop expired on its TTL minutes before the suspension', r.effects.some((e) => e.type === 'TELEMETRY' && e.kind === 'trigger_expired' && e.detail.reason === 'ttl'));
+  assert('...and the paused narration is stopped as the tour suspends', r.state.progress.suspendedAt !== undefined && r.effects.some((e) => e.type === 'STOP' && e.token === tok && e.reason === 'idle_timeout'));
+}
+{
+  // Restored suspended: the checkpoint brings the suspension back.
+  const tour: EngineTour = { chapters: [chapter('walk', 'walking')], stops: [stop('a', 'walk', 0, 0, 0, 30)] };
+  let r = restore(tour, { chapterId: 'walk', fired: {}, played: {}, queue: [], suspendedAt: T0 });
+  r = feed(r, [fix(0, 0, T0 + 60_000, { accuracyM: 5 })]);
+  assert('restored while suspended: a fix inside a stop fires nothing', Object.keys(r.state.progress.fired).length === 0 && plays(r).length === 0);
+  r = send(r, { type: 'RESUME_REQUESTED', at: T0 + 120_000 });
+  r = feed(r, [fix(0, 0, T0 + 121_000, { accuracyM: 5 })]);
+  assert('...resumed: it fires', 'a' in r.state.progress.fired);
+}
+
 console.log(`\n${checks - failures}/${checks} checks passed`);
 if (failures > 0) process.exit(1);

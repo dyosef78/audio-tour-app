@@ -1,7 +1,15 @@
 import type { LatLng } from '../types/domain.ts';
 import { estimateCourse, evaluateApproach, type Course, type CourseFix } from './geo/bearing.ts';
 import { planarDistanceMeters } from './geo/sweep.ts';
-import { MAX_FIX_AGE_MS, MAX_FUTURE_SKEW_MS, MODE_CONFIG, PLAY_TIMEOUT_MS, type ModeConfig } from './config.ts';
+import {
+  IDLE_RADIUS_M,
+  IDLE_TIMEOUT_MS,
+  MAX_FIX_AGE_MS,
+  MAX_FUTURE_SKEW_MS,
+  MODE_CONFIG,
+  PLAY_TIMEOUT_MS,
+  type ModeConfig,
+} from './config.ts';
 import type {
   AudioState,
   Effect,
@@ -101,6 +109,7 @@ export function createEngineState(tour: EngineTour, progress: Progress): EngineS
     reanchor: null,
     bearingReported: new Set(),
     nextToken: 1,
+    stillness: null,
   };
 }
 
@@ -130,8 +139,11 @@ export function reduce(state: EngineState, event: EngineEvent): ReduceResult {
       s = startNextIfIdle(s, event.at, effects);
       break;
     case 'FIX_BATCH':
+      // Suspended: tracking was stopped; a late delivery changes nothing.
+      if (s.progress.suspendedAt !== undefined) break;
       s = advanceClock(s, event.receivedAt, effects);
       for (const fix of ingest(event.fixes, event.receivedAt, s.lastFix)) s = stepFix(s, fix, event.receivedAt, effects);
+      s = idleCheck(s, event.receivedAt, effects);
       break;
     case 'AUDIO_STARTED':
       // Also when an interruption arrived while the player was still loading:
@@ -187,10 +199,12 @@ export function reduce(state: EngineState, event: EngineEvent): ReduceResult {
       s = selectChapter(s, event.chapterId, effects);
       break;
     case 'MANUAL_TRIGGER':
-      s = manualTrigger(s, event.stopId, event.at, effects);
+      // A tap on a stop is the listener coming back: a suspended tour resumes.
+      s = manualTrigger(resumeFromSuspension(s, event.at, effects), event.stopId, event.at, effects);
       break;
     case 'DEEP_DIVE_REQUESTED': {
       const stop = activeStopOrThrow(s, event.stopId, 'DEEP_DIVE_REQUESTED');
+      s = resumeFromSuspension(s, event.at, effects);
       if (s.audio.kind !== 'idle') {
         effects.push({ type: 'STOP', token: s.audio.token, fade: false, reason: 'preempted' });
         s = { ...s, audio: { kind: 'idle' } };
@@ -203,6 +217,9 @@ export function reduce(state: EngineState, event: EngineEvent): ReduceResult {
         effects.push({ type: 'STOP', token: s.audio.token, fade: false, reason: 'user_skip' });
         s = startNextIfIdle({ ...s, audio: { kind: 'idle' } }, event.at, effects);
       }
+      break;
+    case 'RESUME_REQUESTED':
+      s = resumeFromSuspension(s, event.at, effects);
       break;
   }
   return { state: s, effects };
@@ -248,6 +265,7 @@ function stepFix(state: EngineState, fix: GpsFix, now: number, effects: Effect[]
   // A fix that cannot resolve a zone is not used at all - not even as the
   // start of the next segment, which then sweeps from the last good fix.
   if (fix.accuracyM !== null && fix.accuracyM > mode.accuracyCeilingM) return state;
+  state = trackStillness(state, fix, now);
 
   const prev = state.lastFix;
   const sweepable = prev !== null && isSweepable(prev, fix, mode);
@@ -477,7 +495,67 @@ function advanceClock(s: EngineState, now: number, effects: Effect[]): EngineSta
   let next = playTimeout(s, now, effects);
   next = watchdog(next, now, effects);
   const progress = pruneQueue(next, now, next.lastFix, effects);
-  return progress === next.progress ? next : { ...next, progress };
+  next = progress === next.progress ? next : { ...next, progress };
+  // Also on a bare TICK: a phone that stops delivering fixes indoors has not
+  // shown it moved either.
+  return idleCheck(next, now, effects);
+}
+
+// -----------------------------------------------------------------------------
+// Idle timeout (PM, Epic 15 - battery)
+// -----------------------------------------------------------------------------
+
+/**
+ * Stillness is a circle, not a speed: the anchor is where it began, and a fix
+ * leaving max(IDLE_RADIUS_M, 2 x its accuracy) of it starts a new one. GPS
+ * speed is not used - iOS reports -1 when stationary, and an indoor fix
+ * wanders tens of metres while the visitor sits still.
+ */
+function trackStillness(s: EngineState, fix: GpsFix, now: number): EngineState {
+  const radius = Math.max(IDLE_RADIUS_M, 2 * (fix.accuracyM ?? 0));
+  const still = s.stillness;
+  if (still !== null && planarDistanceMeters(still.anchor, fix.coordinate) <= radius) return s;
+  return { ...s, stillness: { anchor: fix.coordinate, since: now } };
+}
+
+/**
+ * IDLE_TIMEOUT_MS still -> suspend: stop what is paused on air, expire what is
+ * waiting, and ask the shell to stop tracking and tell the listener.
+ *
+ * A narration that is actually PLAYING is never cut for inactivity - someone
+ * sitting through a Deep Dive is not inactive; the suspension waits for it to
+ * end. One that is paused or interrupted is stopped (the STOP the PM asked for).
+ */
+function idleCheck(s: EngineState, now: number, effects: Effect[]): EngineState {
+  if (s.progress.suspendedAt !== undefined || s.stillness === null) return s;
+  const stillMs = now - s.stillness.since;
+  if (stillMs < IDLE_TIMEOUT_MS) return s;
+  if (s.audio.kind === 'playing' || s.audio.kind === 'starting') return s;
+
+  if (s.audio.kind === 'interrupted') {
+    effects.push({ type: 'STOP', token: s.audio.token, fade: false, reason: 'idle_timeout' });
+  }
+  for (const q of s.progress.queue) effects.push(telemetry('trigger_expired', q.stopId, { reason: 'suspended' }));
+  effects.push({ type: 'SUSPEND_TRACKING' });
+  effects.push(telemetry('tour_suspended', null, { stillMs }));
+  return {
+    ...s,
+    audio: { kind: 'idle' },
+    progress: { ...s.progress, queue: [], suspendedAt: now },
+    stillness: null,
+    // The next fix after resuming is a fresh start: never a sweep from here.
+    lastFix: null,
+    reanchor: null,
+  };
+}
+
+/** Undo a suspension (RESUME_REQUESTED, or any tap on a stop). No-op when running. */
+function resumeFromSuspension(s: EngineState, now: number, effects: Effect[]): EngineState {
+  const { suspendedAt, ...running } = s.progress;
+  if (suspendedAt === undefined) return s;
+  effects.push({ type: 'RESUME_TRACKING' });
+  effects.push(telemetry('tour_resumed', null, { suspendedMs: now - suspendedAt }));
+  return { ...s, progress: running, stillness: null, lastFix: null };
 }
 
 /**
