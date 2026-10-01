@@ -110,6 +110,41 @@ export type Database = {
           },
         ]
       }
+      chapter_route_anchors: {
+        Row: {
+          chapter_id: string
+          created_at: string
+          geom: unknown
+          id: string
+          sort_order: number
+          updated_at: string
+        }
+        Insert: {
+          chapter_id: string
+          created_at?: string
+          geom: unknown
+          id?: string
+          sort_order: number
+          updated_at?: string
+        }
+        Update: {
+          chapter_id?: string
+          created_at?: string
+          geom?: unknown
+          id?: string
+          sort_order?: number
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "chapter_route_anchors_chapter_id_fkey"
+            columns: ["chapter_id"]
+            isOneToOne: false
+            referencedRelation: "tour_chapters"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       cities: {
         Row: {
           center: unknown
@@ -314,6 +349,56 @@ export type Database = {
           },
         ]
       }
+      tour_chapters: {
+        Row: {
+          created_at: string
+          destination: unknown
+          destination_label: string | null
+          id: string
+          lookahead_stops: number
+          sequence_policy: string
+          sort_order: number
+          title: string | null
+          tour_id: string
+          transit_mode: string
+          updated_at: string
+        }
+        Insert: {
+          created_at?: string
+          destination?: unknown
+          destination_label?: string | null
+          id?: string
+          lookahead_stops?: number
+          sequence_policy?: string
+          sort_order: number
+          title?: string | null
+          tour_id: string
+          transit_mode: string
+          updated_at?: string
+        }
+        Update: {
+          created_at?: string
+          destination?: unknown
+          destination_label?: string | null
+          id?: string
+          lookahead_stops?: number
+          sequence_policy?: string
+          sort_order?: number
+          title?: string | null
+          tour_id?: string
+          transit_mode?: string
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "tour_chapters_tour_id_fkey"
+            columns: ["tour_id"]
+            isOneToOne: false
+            referencedRelation: "tours"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       tours: {
         Row: {
           audiences: string[]
@@ -455,7 +540,12 @@ export type Database = {
       }
       waypoints: {
         Row: {
+          approach_bearing_deg: number | null
+          approach_bearing_source: string | null
           audiences: string[]
+          bearing_policy: string
+          bearing_tolerance_deg: number
+          chapter_id: string
           created_at: string
           geom: unknown
           id: string
@@ -467,7 +557,12 @@ export type Database = {
           updated_at: string
         }
         Insert: {
+          approach_bearing_deg?: number | null
+          approach_bearing_source?: string | null
           audiences?: string[]
+          bearing_policy?: string
+          bearing_tolerance_deg?: number
+          chapter_id: string
           created_at?: string
           geom: unknown
           id?: string
@@ -479,7 +574,12 @@ export type Database = {
           updated_at?: string
         }
         Update: {
+          approach_bearing_deg?: number | null
+          approach_bearing_source?: string | null
           audiences?: string[]
+          bearing_policy?: string
+          bearing_tolerance_deg?: number
+          chapter_id?: string
           created_at?: string
           geom?: unknown
           id?: string
@@ -491,6 +591,13 @@ export type Database = {
           updated_at?: string
         }
         Relationships: [
+          {
+            foreignKeyName: "waypoints_chapter_same_tour_fkey"
+            columns: ["chapter_id", "tour_id"]
+            isOneToOne: false
+            referencedRelation: "tour_chapters"
+            referencedColumns: ["id", "tour_id"]
+          },
           {
             foreignKeyName: "waypoints_tour_id_fkey"
             columns: ["tour_id"]
@@ -597,6 +704,7 @@ export type Database = {
         Args: { p_object_name: string }
         Returns: boolean
       }
+      chapter_is_published: { Args: { p_chapter_id: string }; Returns: boolean }
       cms_normalise_tags: {
         Args: { p_label: string; p_tags: string[]; p_vocabulary: string[] }
         Returns: string[]
@@ -634,6 +742,10 @@ export type Database = {
           p_track_kind?: string
           p_waypoint_id: string
         }
+        Returns: Json
+      }
+      cms_replace_tour_chapters: {
+        Args: { p_chapters: Json; p_tour_id: string }
         Returns: Json
       }
       cms_replace_tour_waypoints: {
@@ -744,12 +856,17 @@ export type Database = {
       get_tour_bundle: { Args: { p_tour_id: string }; Returns: Json }
       interest_tag_vocabulary: { Args: never; Returns: string[] }
       is_cms_admin: { Args: never; Returns: boolean }
+      max_route_anchors: { Args: never; Returns: number }
       route_tolerance_meters: {
         Args: { p_transit_mode: string }
         Returns: number
       }
       sync_pull_itineraries: { Args: { p_since?: string }; Returns: Json }
       tour_is_published: { Args: { p_tour_id: string }; Returns: boolean }
+      tour_transit_mode_from_chapters: {
+        Args: { p_tour_id: string }
+        Returns: string
+      }
       transcript_path_for: { Args: { p_storage_path: string }; Returns: string }
       waypoint_is_published: {
         Args: { p_waypoint_id: string }

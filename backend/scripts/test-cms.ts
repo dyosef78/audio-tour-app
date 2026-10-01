@@ -73,6 +73,8 @@ const schemaSql = read('20260915120000_track_kind_tags_transcripts.sql');
 const functionsSql = read('20260915120100_bundle_and_cms_track_kind_tags.sql');
 const previousBundleSql = read('20260828150000_bundle_audio_track_id.sql');
 const routeSql = read('20260916090000_tour_route_polyline.sql');
+const chaptersSchemaSql = read('20261001120000_epic15_chapters_schema.sql');
+const chaptersFunctionsSql = read('20261001120100_epic15_chapters_functions.sql');
 
 // -----------------------------------------------------------------------------
 
@@ -201,6 +203,39 @@ assert(
   normalisedRoute.includes(`${outerPrefix}, CASE WHEN tr.route IS NOT NULL THEN`),
   'a route term that is not NULL-when-absent would change every existing hash',
 );
+
+// Epic 15 rewrites get_tour_bundle on top of TASK-604, which is what
+// PRODUCTION runs. Both hash expressions must be 604's with CASE terms appended.
+const normalisedChapters = normalise(chaptersFunctionsSql);
+const routeBlock = signatureBlock(normalisedRoute);
+const routeBlockTail = "), '|' ORDER BY r.sort_order ) ";
+assert(
+  'Epic 15: the TASK-604 waypoint signature block was located',
+  routeBlock.endsWith(routeBlockTail),
+  JSON.stringify(routeBlock.slice(-40)),
+);
+assert(
+  'Epic 15: per-waypoint signature is the production one with CASE terms appended',
+  signatureBlock(normalisedChapters).startsWith(`${routeBlock.slice(0, -routeBlockTail.length).trimEnd()}, CASE WHEN`),
+  'the waypoint signature changed - every bundle hash in production would move',
+);
+const routeOuter = `${outerPrefix}, CASE WHEN tr.route IS NOT NULL THEN 'route=' || md5(ST_AsBinary(tr.route)) END`;
+assert('Epic 15: the TASK-604 tour-level expression was located', normalisedRoute.includes(`${routeOuter})`));
+assert(
+  'Epic 15: tour-level expression only APPENDS a chapters term that is NULL for a plain tour',
+  normalisedChapters.includes(`${routeOuter}, CASE WHEN NOT ch.plain THEN`),
+  'a chapters term that is not NULL-when-plain would change every existing hash',
+);
+
+// "Plain" is three things that must agree: the column defaults, the predicate
+// get_tour_bundle hashes by, and what a device assumes for a manifest saved
+// before Epic 15. The app side joins this check when the client lands.
+const columnDefault = (column: string): string | undefined =>
+  new RegExp(`${column}\\s+\\w+\\s+NOT NULL DEFAULT\\s+'?([\\w]+)'?`).exec(chaptersSchemaSql)?.[1];
+eq('Epic 15: plain sequence_policy == column default', columnDefault('sequence_policy'),
+  /c\.sequence_policy = '(\w+)'/.exec(normalisedChapters)?.[1]);
+eq('Epic 15: plain lookahead_stops == column default', columnDefault('lookahead_stops'),
+  /c\.lookahead_stops = (\d+)/.exec(normalisedChapters)?.[1]);
 
 // -----------------------------------------------------------------------------
 
