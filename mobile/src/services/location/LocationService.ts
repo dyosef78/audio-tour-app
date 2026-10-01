@@ -3,6 +3,7 @@ import * as TaskManager from 'expo-task-manager';
 import { PermissionsAndroid, Platform } from 'react-native';
 
 import { profileFor, type GpsSampling, type TransitProfile } from '../../config/transitProfiles';
+import type { GpsFix } from '../../engine/types';
 import type { LatLng, TransitMode, Waypoint } from '../../types/domain';
 import { distanceMeters, distanceToZone, isInsideZone } from './geometry';
 import { StopSequence } from './stopSequence';
@@ -60,6 +61,11 @@ export interface GeofenceEvent {
 export interface LocationServiceCallbacks {
   /** Fired for every accepted fix - drives the map's blue dot. */
   onLocation?: (fix: LatLng, accuracyMeters: number | null) => void;
+  /**
+   * Every fix with everything the OS reported - its own timestamp, speed,
+   * course and accuracy (Epic 15). The loose-sequence engine's input.
+   */
+  onGpsFix?: (fix: GpsFix) => void;
   /** Fired when a zone is entered or exited, after debounce/hysteresis. */
   onGeofence?: (event: GeofenceEvent) => void;
   /** Fired when Adaptive GPS changes sampling tier. */
@@ -287,13 +293,7 @@ export class LocationService {
     this.watcher = null;
     this.watcher = await Location.watchPositionAsync(
       this.samplingOptions(this.currentTier),
-      (loc) => {
-        this.onFix(
-          { latitude: loc.coords.latitude, longitude: loc.coords.longitude },
-          loc.coords.accuracy,
-          loc.timestamp,
-        );
-      },
+      (loc) => this.onGpsFix(toGpsFix(loc)),
     );
   }
 
@@ -385,10 +385,19 @@ export class LocationService {
    * it a scripted list of coordinates - which is how this should be verified
    * before anyone walks around Jerusalem with a phone.
    */
+  onGpsFix(fix: GpsFix): void {
+    this.callbacks.onLocation?.(fix.coordinate, fix.accuracyM);
+    this.callbacks.onGpsFix?.(fix);
+    this.evaluateGeofences(fix.coordinate, fix.timestamp);
+    this.applyAdaptiveGps(fix.coordinate, fix.timestamp);
+  }
+
+  /**
+   * A fix with no speed or course - what the walk simulator and the tests
+   * script. Same path as a real fix.
+   */
   onFix(fix: LatLng, accuracyMeters: number | null, timestamp: number = Date.now()): void {
-    this.callbacks.onLocation?.(fix, accuracyMeters);
-    this.evaluateGeofences(fix, timestamp);
-    this.applyAdaptiveGps(fix, timestamp);
+    this.onGpsFix({ coordinate: fix, timestamp, accuracyM: accuracyMeters, speedMps: null, headingDeg: null });
   }
 
   /**
@@ -673,22 +682,35 @@ export async function stopOrphanedLocationUpdates(): Promise<boolean> {
  * requires the task to be defined at module scope so the OS can revive it into
  * a cold-started JS context.
  */
-export function registerBackgroundLocationTask(
-  handler: (fixes: LatLng[], timestamp: number) => void,
-): void {
+export function registerBackgroundLocationTask(handler: (fixes: GpsFix[]) => void): void {
   if (TaskManager.isTaskDefined(LOCATION_TASK_NAME)) return;
 
   TaskManager.defineTask<{ locations: Location.LocationObject[] }>(
     LOCATION_TASK_NAME,
     async ({ data, error }) => {
-      if (error || !data?.locations?.length) return;
-      handler(
-        data.locations.map((l) => ({
-          latitude: l.coords.latitude,
-          longitude: l.coords.longitude,
-        })),
-        Date.now(),
-      );
+      if (error) {
+        console.error('[LocationService] background location task reported an error:', error);
+        return;
+      }
+      if (!data?.locations?.length) return;
+      // Each fix keeps ITS OWN timestamp (Epic 15). Stamping a batch with one
+      // Date.now() made the time between its fixes zero.
+      handler(data.locations.map(toGpsFix));
     },
   );
+}
+
+/**
+ * The OS fix as the engine needs it. Values are passed through raw - iOS
+ * reports -1 for an invalid speed or course - and judged by the engine
+ * (geo/bearing.ts), the one place that knows what counts as valid.
+ */
+export function toGpsFix(l: Location.LocationObject): GpsFix {
+  return {
+    coordinate: { latitude: l.coords.latitude, longitude: l.coords.longitude },
+    timestamp: l.timestamp,
+    accuracyM: l.coords.accuracy ?? null,
+    speedMps: l.coords.speed ?? null,
+    headingDeg: l.coords.heading ?? null,
+  };
 }

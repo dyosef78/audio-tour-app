@@ -22,6 +22,7 @@ import { routeManager } from './routing';
 import { decideResume } from './sessionCheckpoint';
 import { sessionCheckpoints } from './sessionCheckpointFile';
 import { useTourSession } from './tourSessionStore';
+import type { GpsFix } from '../engine/types';
 import type { AudioTrack, LatLng, TransitMode, Waypoint } from '../types/domain';
 
 /**
@@ -123,7 +124,7 @@ class TourSessionController {
   /** When the running tour was first started; carried into every checkpoint. */
   private sessionStartedAt = 0;
   /** Background fixes that arrived with no session in memory (see onBackgroundFixes). */
-  private pendingFixes: { fix: LatLng; timestamp: number }[] = [];
+  private pendingFixes: GpsFix[] = [];
   /** A background-task resume is queued; later batches only add to pendingFixes. */
   private resumeQueued = false;
 
@@ -506,7 +507,7 @@ class TourSessionController {
       this.pendingFixes = [];
       this.resumeQueued = false;
       const service = this.location;
-      if (service) for (const p of pending) service.onFix(p.fix, null, p.timestamp);
+      if (service) for (const p of pending) service.onGpsFix(p);
     }
   }
 
@@ -835,13 +836,13 @@ class TourSessionController {
    * Android restarted the tracking service in a fresh process. See
    * resumeFromBackgroundTask for why nothing falls between the two.
    */
-  onBackgroundFixes(fixes: LatLng[], timestamp: number): void {
+  onBackgroundFixes(fixes: GpsFix[]): void {
     const service = this.location;
     if (service) {
-      for (const fix of fixes) service.onFix(fix, null, timestamp);
+      for (const fix of fixes) service.onGpsFix(fix);
       return;
     }
-    for (const fix of fixes) this.pendingFixes.push({ fix, timestamp });
+    this.pendingFixes.push(...fixes);
     if (this.pendingFixes.length > MAX_PENDING_FIXES) {
       this.pendingFixes.splice(0, this.pendingFixes.length - MAX_PENDING_FIXES);
     }
@@ -910,8 +911,8 @@ export const tourSession = new TourSessionController();
  * defined before the OS revives a cold-started JS context, and a component may
  * never have mounted at that point.
  */
-registerBackgroundLocationTask((fixes, timestamp) => {
-  tourSession.onBackgroundFixes(fixes, timestamp);
+registerBackgroundLocationTask((fixes) => {
+  tourSession.onBackgroundFixes(fixes);
 });
 // This is the entry point Android's restarted tracking service reaches: the OS
 // re-runs index.ts headless, which imports this module, which registers the

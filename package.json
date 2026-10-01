@@ -30,7 +30,7 @@
     "routing:ping": "node --env-file-if-exists=.env --env-file-if-exists=mobile/.env backend/scripts/ping-routing.ts",
     "test:ui": "node --import ./mobile/scripts/register-stubs.mjs mobile/scripts/test-ui-logic.ts",
     "test:auth": "node --import ./mobile/scripts/register-stubs.mjs mobile/scripts/test-auth.ts",
-    "test:engine": "node mobile/scripts/test-engine-geo.ts",
+    "test:engine": "node mobile/scripts/test-engine-geo.ts && node mobile/scripts/test-engine-reducer.ts",
     "seed:telaviv": "node --env-file-if-exists=.env backend/scripts/seed-tel-aviv-qa.ts"
   },
   "keywords": [],
