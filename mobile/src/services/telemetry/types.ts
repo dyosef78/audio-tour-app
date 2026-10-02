@@ -36,7 +36,8 @@ export type TelemetryEventType =
   | 'trigger_missed'
   | 'audio_watchdog'
   | 'tour_suspended'
-  | 'tour_resumed';
+  | 'tour_resumed'
+  | 'chapter_arrived';
 
 /**
  * One row of public.telemetry_events, as the client posts it.

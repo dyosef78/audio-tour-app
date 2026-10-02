@@ -21,6 +21,8 @@
 --   tour_suspended            idle timeout: tracking stopped after 15 min
 --                             without moving (Epic 15, battery)
 --   tour_resumed              the listener resumed a suspended tour
+--   chapter_arrived           a chapter's navigation destination was reached
+--                             (meta: next chapter) - the prompt to start the next
 --
 -- trigger_fired is NOT added: it already travels as geofence_entered, which
 -- this vocabulary has always had, with the engine's detail in meta.
@@ -65,7 +67,8 @@ ALTER TABLE public.telemetry_events
         'trigger_missed',
         'audio_watchdog',
         'tour_suspended',
-        'tour_resumed'
+        'tour_resumed',
+        'chapter_arrived'
     ));
 
 COMMENT ON CONSTRAINT telemetry_events_event_type_check ON public.telemetry_events IS
