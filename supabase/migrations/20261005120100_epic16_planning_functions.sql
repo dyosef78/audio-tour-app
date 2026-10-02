@@ -8,8 +8,8 @@
 --   2. cms_replace_tour_chapters   items gain plannable, entry_point, exit_point
 --   3. cms_replace_tour_waypoints  items gain stop_role, dwell_seconds,
 --                                    interest_weights
---   4. cms_validate_tour           + 6 checks (17-22), incl. the PM's MVP rule:
---                                    no extension in an anchored driving chapter
+--   4. cms_validate_tour           + 5 checks (17, 19-22), incl. the PM rule:
+--                                    no extension in a chapter with anchors
 --   5. get_planner_candidates      NEW: the plan-tour Edge Function's single
 --                                    read - feasible chapters, their stops,
 --                                    and the cached costs between them
@@ -918,16 +918,17 @@ COMMENT ON FUNCTION public.cms_replace_tour_waypoints(uuid, jsonb) IS
 
 
 -- -----------------------------------------------------------------------------
--- 4. cms_validate_tour  (+ Epic 16 checks 17-22)
+-- 4. cms_validate_tour  (+ Epic 16 checks 17, 19-22)
 --
 -- Reproduced from 20261001120100; checks 0-16 unchanged. New (all Epic 16):
 --
---   17 extension_in_anchored_driving_chapter   (error)   PM MVP rule, 2 Oct:
---        Google Maps follows the anchors, so it drives past a kept extension
---        (or the plan must regenerate anchors against the 9-anchor cap).
---   18 extension_in_anchored_chapter           (warning) the same mechanism
---        on a walking/biking chapter with a handoff. Warning, not error,
---        because the PM's rule names driving; see the handover.
+--   17 extension_in_anchored_chapter           (error)   PM rule, 2 Oct, in
+--        EVERY transit mode: a chapter cannot have rigid external anchors and
+--        dynamic internal extensions. The navigation app follows the anchors
+--        and passes a kept extension by; injecting anchors per plan would
+--        breach the 9-anchor cap (3 in a browser).
+--   (18 was a walking/biking warning in review; the PM made it an error,
+--    which made it check 17. The number is left unused.)
 --   19 extension_unreachable                   (error)   an extension in a
 --        chapter that is not plannable: catalogue sessions play core only and
 --        the planner never selects the chapter, so no one ever hears it.
@@ -1220,28 +1221,14 @@ AS $fn$
 
     UNION ALL
 
-    -- 17. NEW (Epic 16). PM MVP rule.
-    SELECT 'error', 'extension_in_anchored_driving_chapter', w.id,
-           format('Waypoint %s is an extension in driving chapter %s (%s), which has routing anchors. Google Maps follows the anchors and would drive past it. Make it core, or remove the anchors.',
-                  w.name, c.sort_order, coalesce(c.title, 'untitled'))
-    FROM public.waypoints w
-    JOIN public.tour_chapters c ON c.id = w.chapter_id
-    WHERE w.tour_id = p_tour_id
-      AND w.stop_role = 'extension'
-      AND c.transit_mode = 'driving'
-      AND EXISTS (SELECT 1 FROM public.chapter_route_anchors a WHERE a.chapter_id = c.id)
-
-    UNION ALL
-
-    -- 18. NEW. Warning. Same mechanism, walking/biking handoff.
-    SELECT 'warning', 'extension_in_anchored_chapter', w.id,
-           format('Waypoint %s is an extension in %s chapter %s (%s), which has routing anchors. A navigation app following the anchors may not pass it.',
+    -- 17. NEW (Epic 16). PM rule, every transit mode.
+    SELECT 'error', 'extension_in_anchored_chapter', w.id,
+           format('Waypoint %s is an extension in %s chapter %s (%s), which has routing anchors. The navigation app follows the anchors and would pass it by. Make it core, or remove the anchors.',
                   w.name, c.transit_mode, c.sort_order, coalesce(c.title, 'untitled'))
     FROM public.waypoints w
     JOIN public.tour_chapters c ON c.id = w.chapter_id
     WHERE w.tour_id = p_tour_id
       AND w.stop_role = 'extension'
-      AND c.transit_mode <> 'driving'
       AND EXISTS (SELECT 1 FROM public.chapter_route_anchors a WHERE a.chapter_id = c.id)
 
     UNION ALL
@@ -1315,7 +1302,7 @@ AS $fn$
 $fn$;
 
 COMMENT ON FUNCTION public.cms_validate_tour(uuid) IS
-    'Pre-flight checks for publishing. One row per problem; errors block publication, warnings do not. Covers missing narration, missing storage objects, unreachable Deep Dives, route coverage and order, orphaned transcripts, untagged tours, tours with no city, and (Epic 15) chapter order, titles, handoff destinations, routing-anchor caps and walking-pace bearing checks, and (Epic 16) core/extension and planner-eligibility checks, including no extension in an anchored driving chapter.';
+    'Pre-flight checks for publishing. One row per problem; errors block publication, warnings do not. Covers missing narration, missing storage objects, unreachable Deep Dives, route coverage and order, orphaned transcripts, untagged tours, tours with no city, and (Epic 15) chapter order, titles, handoff destinations, routing-anchor caps and walking-pace bearing checks, and (Epic 16) core/extension and planner-eligibility checks, including no extension in a chapter with routing anchors.';
 
 -- -----------------------------------------------------------------------------
 -- 5. get_planner_candidates
