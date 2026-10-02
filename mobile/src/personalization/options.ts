@@ -11,8 +11,10 @@
  * the two lists drift.
  */
 
-export type GroupType = 'solo' | 'couple' | 'friends' | 'family_kids';
-export type Interest = 'history' | 'culinary' | 'nature' | 'architecture' | 'art_culture';
+// The id unions live in shared/ since Epic 16 (the plan-tour contract names them).
+import type { GroupType, Interest } from '../../../shared/src/vocabulary';
+export type { GroupType, Interest };
+
 export type TimeBudget = 'quick' | 'half_day' | 'full_day';
 
 export interface ChoiceOption<Id extends string> {

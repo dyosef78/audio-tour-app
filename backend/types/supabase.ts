@@ -110,6 +110,47 @@ export type Database = {
           },
         ]
       }
+      chapter_leg_costs: {
+        Row: {
+          chapter_id: string
+          computed_at: string
+          coords_key: string
+          distance_meters: number | null
+          duration_seconds: number | null
+          from_node: string
+          profile: string
+          to_node: string
+        }
+        Insert: {
+          chapter_id: string
+          computed_at?: string
+          coords_key: string
+          distance_meters?: number | null
+          duration_seconds?: number | null
+          from_node: string
+          profile: string
+          to_node: string
+        }
+        Update: {
+          chapter_id?: string
+          computed_at?: string
+          coords_key?: string
+          distance_meters?: number | null
+          duration_seconds?: number | null
+          from_node?: string
+          profile?: string
+          to_node?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "chapter_leg_costs_chapter_id_fkey"
+            columns: ["chapter_id"]
+            isOneToOne: false
+            referencedRelation: "tour_chapters"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       chapter_route_anchors: {
         Row: {
           chapter_id: string
@@ -139,6 +180,51 @@ export type Database = {
           {
             foreignKeyName: "chapter_route_anchors_chapter_id_fkey"
             columns: ["chapter_id"]
+            isOneToOne: false
+            referencedRelation: "tour_chapters"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      chapter_travel_matrix: {
+        Row: {
+          computed_at: string
+          coords_key: string
+          distance_meters: number | null
+          duration_seconds: number | null
+          from_chapter_id: string
+          profile: string
+          to_chapter_id: string
+        }
+        Insert: {
+          computed_at?: string
+          coords_key: string
+          distance_meters?: number | null
+          duration_seconds?: number | null
+          from_chapter_id: string
+          profile: string
+          to_chapter_id: string
+        }
+        Update: {
+          computed_at?: string
+          coords_key?: string
+          distance_meters?: number | null
+          duration_seconds?: number | null
+          from_chapter_id?: string
+          profile?: string
+          to_chapter_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "chapter_travel_matrix_from_chapter_id_fkey"
+            columns: ["from_chapter_id"]
+            isOneToOne: false
+            referencedRelation: "tour_chapters"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "chapter_travel_matrix_to_chapter_id_fkey"
+            columns: ["to_chapter_id"]
             isOneToOne: false
             referencedRelation: "tour_chapters"
             referencedColumns: ["id"]
@@ -354,8 +440,11 @@ export type Database = {
           created_at: string
           destination: unknown
           destination_label: string | null
+          entry_point: unknown
+          exit_point: unknown
           id: string
           lookahead_stops: number
+          plannable: boolean
           sequence_policy: string
           sort_order: number
           title: string | null
@@ -367,8 +456,11 @@ export type Database = {
           created_at?: string
           destination?: unknown
           destination_label?: string | null
+          entry_point?: unknown
+          exit_point?: unknown
           id?: string
           lookahead_stops?: number
+          plannable?: boolean
           sequence_policy?: string
           sort_order: number
           title?: string | null
@@ -380,8 +472,11 @@ export type Database = {
           created_at?: string
           destination?: unknown
           destination_label?: string | null
+          entry_point?: unknown
+          exit_point?: unknown
           id?: string
           lookahead_stops?: number
+          plannable?: boolean
           sequence_policy?: string
           sort_order?: number
           title?: string | null
@@ -395,6 +490,68 @@ export type Database = {
             columns: ["tour_id"]
             isOneToOne: false
             referencedRelation: "tours"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      tour_plans: {
+        Row: {
+          budget_seconds: number
+          chapter_ids: string[]
+          city_id: string
+          content_hash: string
+          contract_version: number
+          created_at: string
+          estimated_seconds: number
+          expires_at: string
+          id: string
+          origin_approx: unknown
+          plan: Json
+          planner_version: string
+          request: Json
+          source_tour_hashes: Json
+          user_id: string | null
+        }
+        Insert: {
+          budget_seconds: number
+          chapter_ids: string[]
+          city_id: string
+          content_hash: string
+          contract_version: number
+          created_at?: string
+          estimated_seconds: number
+          expires_at: string
+          id?: string
+          origin_approx: unknown
+          plan: Json
+          planner_version: string
+          request: Json
+          source_tour_hashes: Json
+          user_id?: string | null
+        }
+        Update: {
+          budget_seconds?: number
+          chapter_ids?: string[]
+          city_id?: string
+          content_hash?: string
+          contract_version?: number
+          created_at?: string
+          estimated_seconds?: number
+          expires_at?: string
+          id?: string
+          origin_approx?: unknown
+          plan?: Json
+          planner_version?: string
+          request?: Json
+          source_tour_hashes?: Json
+          user_id?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "tour_plans_city_id_fkey"
+            columns: ["city_id"]
+            isOneToOne: false
+            referencedRelation: "cities"
             referencedColumns: ["id"]
           },
         ]
@@ -538,6 +695,35 @@ export type Database = {
           },
         ]
       }
+      waypoint_interest_weights: {
+        Row: {
+          interest: string
+          updated_at: string
+          waypoint_id: string
+          weight: number
+        }
+        Insert: {
+          interest: string
+          updated_at?: string
+          waypoint_id: string
+          weight: number
+        }
+        Update: {
+          interest?: string
+          updated_at?: string
+          waypoint_id?: string
+          weight?: number
+        }
+        Relationships: [
+          {
+            foreignKeyName: "waypoint_interest_weights_waypoint_id_fkey"
+            columns: ["waypoint_id"]
+            isOneToOne: false
+            referencedRelation: "waypoints"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       waypoints: {
         Row: {
           approach_bearing_deg: number | null
@@ -547,12 +733,14 @@ export type Database = {
           bearing_tolerance_deg: number
           chapter_id: string
           created_at: string
+          dwell_seconds: number | null
           geom: unknown
           id: string
           interests: string[]
           name: string
           poi_type: string
           sort_order: number
+          stop_role: string
           tour_id: string
           updated_at: string
         }
@@ -564,12 +752,14 @@ export type Database = {
           bearing_tolerance_deg?: number
           chapter_id: string
           created_at?: string
+          dwell_seconds?: number | null
           geom: unknown
           id?: string
           interests?: string[]
           name: string
           poi_type: string
           sort_order: number
+          stop_role?: string
           tour_id: string
           updated_at?: string
         }
@@ -581,12 +771,14 @@ export type Database = {
           bearing_tolerance_deg?: number
           chapter_id?: string
           created_at?: string
+          dwell_seconds?: number | null
           geom?: unknown
           id?: string
           interests?: string[]
           name?: string
           poi_type?: string
           sort_order?: number
+          stop_role?: string
           tour_id?: string
           updated_at?: string
         }
@@ -850,6 +1042,20 @@ export type Database = {
           p_capacities: number[]
           p_keys: string[]
           p_refill_per_second: number[]
+        }
+        Returns: Json
+      }
+      get_planner_candidates: {
+        Args: {
+          p_budget_seconds: number
+          p_city_id: string
+          p_exclude_chapter_ids?: string[]
+          p_group_type: string
+          p_include_deep_dives: boolean
+          p_interests: string[]
+          p_origin_lat: number
+          p_origin_lon: number
+          p_transit_mode: string
         }
         Returns: Json
       }

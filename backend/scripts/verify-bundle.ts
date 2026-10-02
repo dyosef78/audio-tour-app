@@ -256,6 +256,14 @@ async function main(): Promise<void> {
         `${label} tags are string arrays`,
         isStringArray(w.audiences) && isStringArray(w.interests),
       );
+
+      // Epic 16: a catalogue session arms core stops only, so a missing or
+      // misspelt role would silently drop the stop from every session.
+      check(
+        `${label} stop_role is core or extension`,
+        w.stop_role === 'core' || w.stop_role === 'extension',
+        `stop_role = ${JSON.stringify(w.stop_role)} - Epic 16 migrations not applied?`,
+      );
     }
 
     // --- Route (TASK-604) ---------------------------------------------------
@@ -356,6 +364,42 @@ async function main(): Promise<void> {
     'cms_upsert_tour still resolves with these arguments and reaches the admin guard (service_role)',
     svcError?.code === '42501' && /Not authorised/.test(svcError.message),
     svcError ? `${svcError.code}: ${svcError.message}` : 'the call SUCCEEDED as service_role',
+  );
+
+  // --- 4. The planner read is service_role only (Epic 16) -------------------
+  // Anon-executable, get_planner_candidates would be a compute endpoint
+  // reachable straight through PostgREST, around plan-tour's rate limit. Same
+  // two acceptable refusals as above; then service_role must get a well-formed
+  // answer through REAL PostgREST - which also proves the optional
+  // p_exclude_chapter_ids resolves by default and no overload is ambiguous.
+  section('Planner RPC is service_role only');
+
+  const plannerArgs = {
+    p_city_id: tours[0]?.city_id,
+    p_origin_lon: 34.78,
+    p_origin_lat: 32.08,
+    p_transit_mode: 'walking',
+    p_group_type: 'solo',
+    p_interests: ['history'],
+    p_budget_seconds: 7200,
+    p_include_deep_dives: false,
+  };
+  const { error: anonPlanError, status: anonPlanStatus } = await supabase.rpc('get_planner_candidates', plannerArgs);
+  check(
+    'anon calling get_planner_candidates is refused at the GRANT layer',
+    anonPlanError?.code === 'PGRST202' || anonPlanStatus === 404
+      || (anonPlanError?.code === '42501' && /permission denied for function/i.test(anonPlanError.message)),
+    anonPlanError ? `HTTP ${anonPlanStatus} ${anonPlanError.code}: ${anonPlanError.message}` : 'the call SUCCEEDED as anon',
+  );
+
+  const { data: plan, error: svcPlanError } = await service.rpc('get_planner_candidates', plannerArgs);
+  const p = plan as any;
+  check('service_role gets candidates', !svcPlanError && p != null, svcPlanError?.message);
+  check(
+    'candidate payload has its documented shape',
+    Array.isArray(p?.candidates) && Array.isArray(p?.transfers) && Array.isArray(p?.legs)
+      && typeof p?.considered === 'number' && typeof p?.pruned === 'object' && p?.transfer_profile === 'pedestrian',
+    JSON.stringify(p)?.slice(0, 200),
   );
 
   // --- Summary -------------------------------------------------------------

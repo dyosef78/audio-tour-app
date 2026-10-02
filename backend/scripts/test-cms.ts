@@ -19,6 +19,8 @@
 import { readFileSync, readdirSync } from 'node:fs';
 
 import { CmsIngestError } from '../cms/errors.ts';
+import { PROFILE_FOR_TRANSIT_MODE } from '../../shared/src/routing/valhalla.ts';
+import { GROUP_TYPE_IDS, INTEREST_IDS } from '../../shared/src/vocabulary.ts';
 import { buildAudioStoragePath, transcriptPathFor } from '../cms/storage-path.ts';
 import { MAX_TRANSCRIPT_BYTES, checkTranscript } from '../cms/transcript-ingest.ts';
 import {
@@ -75,6 +77,7 @@ const previousBundleSql = read('20260828150000_bundle_audio_track_id.sql');
 const routeSql = read('20260916090000_tour_route_polyline.sql');
 const chaptersSchemaSql = read('20261001120000_epic15_chapters_schema.sql');
 const chaptersFunctionsSql = read('20261001120100_epic15_chapters_functions.sql');
+const planningFunctionsSql = read('20261005120100_epic16_planning_functions.sql');
 
 // -----------------------------------------------------------------------------
 
@@ -156,6 +159,9 @@ for (const [fn, constName] of [
   assert(`${constName} ids extracted from options.ts`, app.length > 0);
   eq(`${fn}() == ${constName} ids`, db, app);
 }
+// Epic 16: the unions moved to shared/ (the plan-tour contract names them).
+eq('audience_tag_vocabulary() == shared GROUP_TYPE_IDS', sqlVocabulary('audience_tag_vocabulary').sort(), [...GROUP_TYPE_IDS].sort());
+eq('interest_tag_vocabulary() == shared INTEREST_IDS', sqlVocabulary('interest_tag_vocabulary').sort(), [...INTEREST_IDS].sort());
 
 // -----------------------------------------------------------------------------
 
@@ -227,6 +233,27 @@ assert(
   'a chapters term that is not NULL-when-plain would change every existing hash',
 );
 
+// Epic 16 rewrites get_tour_bundle on top of Epic 15, which is what
+// PRODUCTION runs: Epic 15's waypoint signature with ONE CASE term appended
+// (NULL for a core stop), and the tour-level expression byte-identical.
+const normalisedPlanning = normalise(planningFunctionsSql);
+const chaptersBlock = signatureBlock(normalisedChapters);
+assert('Epic 16: the Epic 15 waypoint signature block was located', chaptersBlock.endsWith(routeBlockTail));
+eq(
+  "Epic 16: per-waypoint signature is Epic 15's plus a stop_role term that is NULL for core",
+  signatureBlock(normalisedPlanning),
+  `${chaptersBlock.slice(0, -routeBlockTail.length).trimEnd()}, CASE WHEN r.stop_role <> 'core' THEN 'role=' || r.stop_role END ${routeBlockTail}`,
+);
+const chaptersOuter = `${routeOuter}, CASE WHEN NOT ch.plain THEN 'chapters=' || md5(ch.signature) END)`;
+assert(
+  "Epic 16: tour-level hash expression is Epic 15's, unchanged",
+  normalisedChapters.includes(chaptersOuter) && normalisedPlanning.includes(chaptersOuter),
+);
+assert(
+  'Epic 16: the stop_role column defaults to the value the hash treats as plain',
+  /stop_role text NOT NULL DEFAULT 'core'/.test(read('20261005120000_epic16_planning_schema.sql')),
+);
+
 // "Plain" is three things that must agree: the column defaults, the predicate
 // get_tour_bundle hashes by, and what a device assumes for a manifest saved
 // before Epic 15. The app side joins this check when the client lands.
@@ -244,6 +271,33 @@ const appDefaults = /PLAIN_CHAPTER_DEFAULTS = \{ sequencePolicy: '(\w+)', lookah
 assert('Epic 15: PLAIN_CHAPTER_DEFAULTS found in the app', appDefaults !== null);
 eq('Epic 15: app fallback sequence_policy == column default', appDefaults?.[1], columnDefault('sequence_policy'));
 eq('Epic 15: app fallback lookahead_stops == column default', appDefaults?.[2], columnDefault('lookahead_stops'));
+
+// -----------------------------------------------------------------------------
+
+heading('Epic 16: get_planner_candidates constants');
+// -----------------------------------------------------------------------------
+// The lower bound is only safe to prune on if (a) the transfer speed and the
+// chapter speed come from ONE table - the bound's "valid in any position"
+// argument needs every eligible chapter mode no faster than the transfer mode
+// - and (b) the SQL's profile names are the ones the cost tables are written
+// under (shared PROFILE_FOR_TRANSIT_MODE). Both CASEs are duplicated in the
+// function for planner reasons; this pins that they agree.
+{
+  const body = normalisedPlanning.slice(normalisedPlanning.indexOf('FUNCTION public.get_planner_candidates'));
+  const speeds = [...body.matchAll(/WHEN 'walking' THEN ([\d.]+) WHEN 'biking' THEN ([\d.]+) ELSE ([\d.]+) END::double precision/g)]
+    .map((m) => m.slice(1).map(Number));
+  eq('two speed tables found (transfer, chapter)', speeds.length, 2);
+  eq('transfer and chapter speeds are the same table', JSON.stringify(speeds[0]), JSON.stringify(speeds[1]));
+  const [walk, bike, drive] = speeds[0] ?? [];
+  assert('v_max walking >= 1.6 m/s (above Valhalla pedestrian 5.1 km/h with margin)', (walk ?? 0) >= 1.6, String(walk));
+  assert('v_max biking > walking, driving > biking (the any-position argument)', (bike ?? 0) > (walk ?? 0) && (drive ?? 0) > (bike ?? 0));
+  const profiles = [...body.matchAll(/WHEN 'walking' THEN '(\w+)' WHEN 'biking' THEN '(\w+)' ELSE '(\w+)'/g)].map((m) => m.slice(1).join());
+  eq('two profile mappings found', profiles.length, 2);
+  for (const p of profiles) {
+    eq('SQL profile mapping == shared PROFILE_FOR_TRANSIT_MODE', p,
+      [PROFILE_FOR_TRANSIT_MODE.walking, PROFILE_FOR_TRANSIT_MODE.biking, PROFILE_FOR_TRANSIT_MODE.driving].join());
+  }
+}
 
 // -----------------------------------------------------------------------------
 
@@ -496,7 +550,10 @@ heading('Epic 15: no CMS function is executable by anon');
 // The migration's own DO-block self-check proves the same thing on a real
 // database; this catches it at PR time, before anything is applied.
 {
-  const SEALED = (name: string): boolean => /^cms_\w+$/.test(name) || name === 'assert_cms_admin' || name === 'is_cms_admin';
+  // get_planner_candidates (Epic 16) is service_role only: anon-executable, it
+// would be a compute endpoint that bypasses plan-tour's rate limit.
+  const SEALED = (name: string): boolean =>
+    /^cms_\w+$/.test(name) || name === 'assert_cms_admin' || name === 'is_cms_admin' || name === 'get_planner_candidates';
   const stream = migrationFiles.map((file) => read(file).replace(/--[^\n]*/g, '')).join('\n');
 
   const closedByDefault = stream.search(
