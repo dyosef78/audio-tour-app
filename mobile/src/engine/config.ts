@@ -45,6 +45,15 @@ export interface ModeConfig {
   reanchorSuppressM: number;
   /** An OS interruption longer than this triggers one RESUME, twice this gives up on the narration. */
   interruptionTimeoutMs: number;
+  /**
+   * Arrival at the chapter's navigation destination (Slice 5): within this
+   * radius AND below arrivalSlowMps for ARRIVAL_FIXES fixes in a row. Wide
+   * for driving - the car park is rarely the pin - and the manual "I'm here"
+   * button covers the rest (PM).
+   */
+  arrivalRadiusM: number;
+  /** Faster than this is still travelling, not arrived (a drive-through past the pin). */
+  arrivalSlowMps: number;
 }
 
 export const MODE_CONFIG: Readonly<Record<TransitMode, ModeConfig>> = {
@@ -61,6 +70,8 @@ export const MODE_CONFIG: Readonly<Record<TransitMode, ModeConfig>> = {
     reanchorFixes: 3,
     reanchorSuppressM: 120,
     interruptionTimeoutMs: 60_000,
+    arrivalRadiusM: 40,
+    arrivalSlowMps: 2.5,
   },
   biking: {
     exitHysteresisFactor: 1.5,
@@ -75,6 +86,8 @@ export const MODE_CONFIG: Readonly<Record<TransitMode, ModeConfig>> = {
     reanchorFixes: 2,
     reanchorSuppressM: 300,
     interruptionTimeoutMs: 60_000,
+    arrivalRadiusM: 100,
+    arrivalSlowMps: 2.5,
   },
   driving: {
     exitHysteresisFactor: 1.4,
@@ -89,6 +102,8 @@ export const MODE_CONFIG: Readonly<Record<TransitMode, ModeConfig>> = {
     reanchorFixes: 2,
     reanchorSuppressM: 1_000,
     interruptionTimeoutMs: 60_000,
+    arrivalRadiusM: 250,
+    arrivalSlowMps: 3,
   },
 };
 
@@ -127,6 +142,9 @@ export const IDLE_TIMEOUT_MS = 15 * 60_000;
  * began.
  */
 export const IDLE_RADIUS_M = 60;
+
+/** Consecutive slow fixes inside the arrival radius before CHAPTER_ARRIVED. */
+export const ARRIVAL_FIXES = 3;
 
 /** A fix stamped more than this in the future (a skewed device clock) is refused. */
 export const MAX_FUTURE_SKEW_MS = 5_000;

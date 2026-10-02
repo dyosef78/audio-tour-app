@@ -54,6 +54,8 @@ export interface EngineRunnerPorts {
   applyTransitMode(mode: TransitMode): void;
   /** Idle timeout: stop tracking (and say so); or start it again. Non-blocking. */
   tracking(effect: Extract<Effect, { type: 'SUSPEND_TRACKING' | 'RESUME_TRACKING' }>): void;
+  /** A chapter's destination was reached: notify and offer the next chapter. Non-blocking. */
+  chapterArrived(effect: Extract<Effect, { type: 'CHAPTER_ARRIVED' }>): void;
   telemetry(effect: Extract<Effect, { type: 'TELEMETRY' }>): void;
   /** The UI store. Called once per drain, after persisting. */
   publish(next: EngineState, prev: EngineState): void;
@@ -170,6 +172,9 @@ export class EngineRunner {
           case 'SUSPEND_TRACKING':
           case 'RESUME_TRACKING':
             this.ports.tracking(fx);
+            break;
+          case 'CHAPTER_ARRIVED':
+            this.ports.chapterArrived(fx);
             break;
           case 'TELEMETRY':
             this.ports.telemetry(fx);

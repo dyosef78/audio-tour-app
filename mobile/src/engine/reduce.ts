@@ -2,6 +2,7 @@ import type { LatLng } from '../types/domain.ts';
 import { estimateCourse, evaluateApproach, type Course, type CourseFix } from './geo/bearing.ts';
 import { planarDistanceMeters } from './geo/sweep.ts';
 import {
+  ARRIVAL_FIXES,
   IDLE_RADIUS_M,
   IDLE_TIMEOUT_MS,
   MAX_FIX_AGE_MS,
@@ -84,6 +85,9 @@ export function freshProgress(tour: EngineTour, chapterId: string): Progress {
 /** Why `progress` cannot run on `tour`, or null. The shell discards (loudly) on non-null. */
 export function progressProblem(tour: EngineTour, progress: Progress): string | null {
   if (!tour.chapters.some((c) => c.id === progress.chapterId)) return `unknown chapter ${progress.chapterId}`;
+  for (const id of progress.arrivedChapterIds ?? []) {
+    if (!tour.chapters.some((c) => c.id === id)) return `arrived names unknown chapter ${id}`;
+  }
   const stops = new Map(tour.stops.map((s) => [s.id, s]));
   for (const id of Object.keys(progress.fired)) if (!stops.has(id)) return `fired names unknown stop ${id}`;
   for (const id of Object.keys(progress.played)) {
@@ -110,6 +114,7 @@ export function createEngineState(tour: EngineTour, progress: Progress): EngineS
     bearingReported: new Set(),
     nextToken: 1,
     stillness: null,
+    arrivalHits: 0,
   };
 }
 
@@ -196,7 +201,10 @@ export function reduce(state: EngineState, event: EngineEvent): ReduceResult {
       s = advanceClock(s, event.at, effects);
       break;
     case 'CHAPTER_SELECTED':
-      s = selectChapter(s, event.chapterId, effects);
+      // A tap ("I'm here - start next chapter"), so the listener is back: a
+      // suspended tour resumes. RESUME_TRACKING is emitted BEFORE the new
+      // mode's APPLY_TRANSIT_MODE; the controller runs them in that order.
+      s = selectChapter(resumeFromSuspension(s, event.at, effects), event.chapterId, effects);
       break;
     case 'MANUAL_TRIGGER':
       // A tap on a stop is the listener coming back: a suspended tour resumes.
@@ -266,6 +274,7 @@ function stepFix(state: EngineState, fix: GpsFix, now: number, effects: Effect[]
   // start of the next segment, which then sweeps from the last good fix.
   if (fix.accuracyM !== null && fix.accuracyM > mode.accuracyCeilingM) return state;
   state = trackStillness(state, fix, now);
+  state = trackArrival(state, chapter, mode, fix, effects);
 
   const prev = state.lastFix;
   const sweepable = prev !== null && isSweepable(prev, fix, mode);
@@ -502,6 +511,54 @@ function advanceClock(s: EngineState, now: number, effects: Effect[]): EngineSta
 }
 
 // -----------------------------------------------------------------------------
+// Arrival at the chapter's destination (Slice 5)
+// -----------------------------------------------------------------------------
+
+/**
+ * Inside the destination radius AND slow, ARRIVAL_FIXES fixes in a row ->
+ * CHAPTER_ARRIVED, once per chapter (persisted). A prompt only: the chapter
+ * changes when the listener taps (PM: manual), and the "I'm here" button is
+ * there for a car park far from the pin.
+ */
+function trackArrival(s: EngineState, chapter: EngineChapter, mode: ModeConfig, fix: GpsFix, effects: Effect[]): EngineState {
+  const destination = chapter.destination;
+  if (destination === null) return s;
+  const arrived = s.progress.arrivedChapterIds ?? [];
+  if (arrived.includes(chapter.id)) return s;
+
+  const inside = planarDistanceMeters(fix.coordinate, destination) <= mode.arrivalRadiusM;
+  const hits = inside && isSlow(s.lastFix, fix, mode.arrivalSlowMps) ? s.arrivalHits + 1 : 0;
+  if (hits < ARRIVAL_FIXES) return hits === s.arrivalHits ? s : { ...s, arrivalHits: hits };
+
+  const next = nextChapterOf(s.tour, chapter.id);
+  effects.push({ type: 'CHAPTER_ARRIVED', chapterId: chapter.id, nextChapterId: next?.id ?? null });
+  effects.push(telemetry('chapter_arrived', null, { chapter: chapter.id, next: next?.id ?? 'none' }));
+  return { ...s, arrivalHits: 0, progress: { ...s.progress, arrivedChapterIds: [...arrived, chapter.id] } };
+}
+
+/**
+ * The OS speed when it is valid; otherwise the displacement since the last
+ * fix - counted as slow when within twice the fix's error, because two
+ * stationary fixes a second apart can be 5-10 m apart on noise alone (iOS
+ * reports speed -1 at rest, which is exactly when this matters).
+ */
+function isSlow(prev: GpsFix | null, fix: GpsFix, slowMps: number): boolean {
+  if (fix.speedMps !== null && fix.speedMps >= 0) return fix.speedMps < slowMps;
+  if (prev === null) return false;
+  const dtS = (fix.timestamp - prev.timestamp) / 1000;
+  if (dtS <= 0) return false;
+  const moved = planarDistanceMeters(prev.coordinate, fix.coordinate);
+  return moved <= Math.max(slowMps * dtS, 2 * (fix.accuracyM ?? 0));
+}
+
+/** The chapter after this one by sort order, or null for the last. */
+export function nextChapterOf(tour: EngineTour, chapterId: string): EngineChapter | null {
+  const ordered = [...tour.chapters].sort((a, b) => a.sortOrder - b.sortOrder);
+  const i = ordered.findIndex((c) => c.id === chapterId);
+  return i >= 0 ? ordered[i + 1] ?? null : null;
+}
+
+// -----------------------------------------------------------------------------
 // Idle timeout (PM, Epic 15 - battery)
 // -----------------------------------------------------------------------------
 
@@ -616,6 +673,7 @@ function selectChapter(s: EngineState, chapterId: string, effects: Effect[]): En
     ...s,
     progress: { ...s.progress, chapterId, queue: [] },
     reanchor: null,
+    arrivalHits: 0,
     bearingReported: new Set(),
   };
 }

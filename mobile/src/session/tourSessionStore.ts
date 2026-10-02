@@ -75,6 +75,15 @@ export interface TourSessionState {
    */
   completionPrompted: boolean;
 
+  /**
+   * Epic 15 Slice 5: the tour's chapters, in order, for the chapter panel.
+   * One entry and no handoff = a single plain chapter: the panel stays hidden.
+   */
+  chapters: ChapterView[];
+  activeChapterId: string | null;
+  /** Chapters whose navigation destination was reached (highlights "start next"). */
+  arrivedChapterIds: string[];
+
   /** Whether background location permission was granted, for honest UI. */
   backgroundPermission: boolean;
   /** Android 13+: false hides the tracking notice (the tour still runs). */
@@ -114,6 +123,18 @@ export interface TourSessionActions {
   promptCompletion: () => void;
   /** Idle-timeout suspension and its resume (Epic 15). Only between active and paused. */
   setPaused: (paused: boolean) => void;
+  setChapters: (chapters: ChapterView[], activeChapterId: string, arrivedChapterIds: string[]) => void;
+  setActiveChapter: (chapterId: string) => void;
+  setArrivedChapters: (chapterIds: string[]) => void;
+}
+
+/** One chapter as the chapter panel shows it. */
+export interface ChapterView {
+  id: string;
+  title: string | null;
+  transitMode: TransitMode;
+  /** The navigation handoff, or null for a chapter that uses the in-app map. */
+  handoff: { destinationLabel: string | null; anchorCount: number; providers: ('google_maps' | 'waze')[] } | null;
 }
 
 /** What the screens need from the engine's state (EngineRunner publish). */
@@ -141,6 +162,9 @@ const initial: TourSessionState = {
   deepDiveWaypointId: null,
   visitedWaypointIds: [],
   completionPrompted: false,
+  chapters: [],
+  activeChapterId: null,
+  arrivedChapterIds: [],
   backgroundPermission: false,
   notificationPermission: true,
   error: null,
@@ -204,6 +228,10 @@ export const useTourSession = create<TourSessionState & TourSessionActions>((set
     })),
 
   promptCompletion: () => set({ completionPrompted: true }),
+
+  setChapters: (chapters, activeChapterId, arrivedChapterIds) => set({ chapters, activeChapterId, arrivedChapterIds }),
+  setActiveChapter: (activeChapterId) => set({ activeChapterId }),
+  setArrivedChapters: (arrivedChapterIds) => set({ arrivedChapterIds }),
 
   setPaused: (paused) =>
     set((s) => (s.status === 'active' || s.status === 'paused' ? { status: paused ? 'paused' : 'active' } : {})),

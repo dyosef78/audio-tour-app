@@ -1,14 +1,21 @@
 import Constants from 'expo-constants';
 import { AppState, Platform, type AppStateStatus } from 'react-native';
 
-import { engineTourFromManifest } from '../engine/fromManifest';
-import { allStopsResolved, createEngineState, freshProgress, progressProblem } from '../engine/reduce';
+import { chaptersOf, engineTourFromManifest } from '../engine/fromManifest';
+import { allStopsResolved, createEngineState, freshProgress, nextChapterOf, progressProblem } from '../engine/reduce';
+import { planHandoff, type HandoffPlan, type HandoffProvider, type HandoffSpec } from '../handoff/handoffLinks';
 import type { Effect, EngineState, EngineTour, Progress, TrackKind } from '../engine/types';
 import { AudioActor } from '../services/audio/AudioActor';
 import { AudioService } from '../services/audio/AudioService';
 import { interruptionModeFor } from '../services/audio/sessionMode';
 import { TourBundleRepository } from '../services/bundle/TourBundleRepository';
-import { dismissTourSuspended, notifyTourSuspended, prepareTourNotifications } from '../services/notifications/tourNotifications';
+import { isGoogleMapsInstalled, openNavigationUrl } from '../services/handoff/navigationApps';
+import {
+  dismissTourNotification,
+  notifyChapterArrived,
+  notifyTourSuspended,
+  requestTourNotificationPermission,
+} from '../services/notifications/tourNotifications';
 import {
   LocationService,
   registerBackgroundLocationTask,
@@ -26,8 +33,9 @@ import { EngineRunner, type EngineRunnerPorts } from './EngineRunner';
 import { decideSnapshotResume, type TourProgressSnapshot } from './progressRepository';
 import { routeManager } from './routing';
 import { tourProgress } from './sessionCheckpointFile';
-import { useTourSession } from './tourSessionStore';
+import { useTourSession, type ChapterView } from './tourSessionStore';
 import type { GpsFix } from '../engine/types';
+import type { WireChapter } from '../services/bundle/types';
 import type { AudioTrack, LatLng, TransitMode, Waypoint } from '../types/domain';
 
 /**
@@ -132,6 +140,8 @@ interface SessionMeta {
   notificationPermission: boolean;
   startedAt: number;
   waypointsById: Map<string, Waypoint>;
+  /** The manifest's chapters (titles, handoff), sorted - for the panel and the handoff. */
+  chapters: WireChapter[];
 }
 
 class TourSessionController {
@@ -282,14 +292,6 @@ class TourSessionController {
       return;
     }
 
-    // The idle-timeout notice (Epic 15). A refusal is an answer, not a failure:
-    // the paused state still shows in the app.
-    try {
-      await prepareTourNotifications();
-    } catch (err) {
-      console.warn('[TourSession] notification permission could not be requested; an idle pause will only show in the app:', err);
-    }
-
     this.location = service;
     const meta: SessionMeta = {
       tourId,
@@ -300,6 +302,7 @@ class TourSessionController {
       notificationPermission: permissions.notifications,
       startedAt: Date.now(),
       waypointsById: new Map(selection.active.map((w) => [w.id, w])),
+      chapters: chaptersOf(manifest),
     };
     void telemetry.record('tour_started', { tourId });
 
@@ -350,11 +353,14 @@ class TourSessionController {
       persist: (progress) => tourProgress.save(this.snapshot(meta, progress)),
       audio: (fx) => this.runAudioEffect(fx),
       applyTransitMode: (mode) => {
-        void this.applyTransitMode(mode);
+        void this.serialTracking(() => this.applyTransitMode(mode));
       },
       telemetry: (fx) => this.recordEngineTelemetry(meta.tourId, fx),
       tracking: (fx) => {
-        void (fx.type === 'SUSPEND_TRACKING' ? this.suspendTracking(meta) : this.restartTrackingAfterIdle());
+        void this.serialTracking(() => (fx.type === 'SUSPEND_TRACKING' ? this.suspendTracking(meta) : this.restartTrackingAfterIdle()));
+      },
+      chapterArrived: (fx) => {
+        void this.announceArrival(meta, fx.chapterId, fx.nextChapterId);
       },
       publish: (next, prev) => this.publish(next, prev),
       now: () => Date.now(),
@@ -389,6 +395,9 @@ class TourSessionController {
     this.actor = actor;
     this.session = meta;
     useTourSession.getState().applyEngineView({ visitedWaypointIds: Object.keys(initial.progress.played) });
+    useTourSession
+      .getState()
+      .setChapters(meta.chapters.map(toChapterView), initial.progress.chapterId, [...(initial.progress.arrivedChapterIds ?? [])]);
     return runner;
   }
 
@@ -416,22 +425,41 @@ class TourSessionController {
     if (next.progress.fired !== prev.progress.fired && allStopsResolved(next) && !allStopsResolved(prev)) {
       useTourSession.getState().promptCompletion();
     }
+    if (next.progress.chapterId !== prev.progress.chapterId) {
+      useTourSession.getState().setActiveChapter(next.progress.chapterId);
+      // The arrival that prompted it is acted on: its notification is stale.
+      void dismissTourNotification('chapter_arrived').catch((err) => console.warn('[TourSession] arrival notification not dismissed:', err));
+    }
+    if (next.progress.arrivedChapterIds !== prev.progress.arrivedChapterIds) {
+      useTourSession.getState().setArrivedChapters([...(next.progress.arrivedChapterIds ?? [])]);
+    }
   }
 
   /**
-   * Engine telemetry. trigger_fired goes to the server as geofence_entered -
-   * a type telemetry_events already accepts - with the engine's detail in
-   * meta. The other kinds are LOGGED ONLY: telemetry_events_event_type_check
-   * does not list them, and batches are all-or-nothing, so sending one would
-   * also lose the valid events beside it. A migration extending the check
-   * comes first.
+   * Engine telemetry, with the engine's detail in meta. trigger_fired travels
+   * as geofence_entered (the vocabulary always had it); every other kind is
+   * its own type since migration 20261003120000 - applied to production
+   * BEFORE this build could send them (a refused type poisons its batch).
    */
   private recordEngineTelemetry(tourId: string, fx: Extract<Effect, { type: 'TELEMETRY' }>): void {
-    if (fx.kind === 'trigger_fired') {
-      void telemetry.record('geofence_entered', { tourId, waypointId: fx.stopId, meta: { ...fx.detail } });
-      return;
-    }
-    console.info(`[Engine] ${fx.kind}${fx.stopId ? ` ${fx.stopId}` : ''}`, fx.detail);
+    const type = fx.kind === 'trigger_fired' ? 'geofence_entered' : fx.kind;
+    void telemetry.record(type, { tourId, waypointId: fx.stopId ?? undefined, meta: { ...fx.detail } });
+  }
+
+  /**
+   * Tracking changes run one at a time, in effect order. "Start next chapter"
+   * while idle-suspended emits RESUME_TRACKING then APPLY_TRANSIT_MODE: run
+   * concurrently, LocationService.start() and retune() would each open a
+   * watcher (start() is outside retune's chain) and one would leak - double
+   * fixes, the battery drain the pause exists to stop. Every op catches its
+   * own failures, so the chain never wedges; the catch below is belt and braces
+   * for a bug, logged loudly.
+   */
+  private trackingOps: Promise<void> = Promise.resolve();
+  private serialTracking(op: () => Promise<void>): Promise<void> {
+    const run = this.trackingOps.then(op);
+    this.trackingOps = run.catch((err) => console.error('[TourSession] tracking operation threw (a bug: each op reports its own failures):', err));
+    return run;
   }
 
   /** A chapter's mode: tracking sampling and the audio session. Reported, never thrown. */
@@ -483,7 +511,7 @@ class TourSessionController {
       console.error('[TourSession] tracking could NOT be stopped for the idle pause - the battery is still being drained:', err);
     }
     try {
-      await notifyTourSuspended(meta.tourTitle);
+      await notifyTourSuspended(meta.tourId, meta.tourTitle);
     } catch (err) {
       console.error('[TourSession] the inactivity notification was not shown:', err);
     }
@@ -496,7 +524,7 @@ class TourSessionController {
    */
   private async restartTrackingAfterIdle(): Promise<void> {
     try {
-      await dismissTourSuspended();
+      await dismissTourNotification('tour_suspended');
     } catch (err) {
       console.warn('[TourSession] the inactivity notification could not be dismissed:', err);
     }
@@ -525,8 +553,90 @@ class TourSessionController {
     if (runner.state.progress.suspendedAt !== undefined) {
       runner.dispatch({ type: 'RESUME_REQUESTED', at: Date.now() });
     } else if (useTourSession.getState().status === 'paused') {
-      void this.restartTrackingAfterIdle();
+      void this.serialTracking(() => this.restartTrackingAfterIdle());
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Chapters and the navigation handoff (Epic 15, Slice 5)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * The engine saw the active chapter's destination reached. Notify - the one
+   * way to come forward over Google Maps - and let the store highlight the
+   * "start next chapter" button (publish does that from the progress).
+   */
+  private async announceArrival(meta: SessionMeta, chapterId: string, nextChapterId: string | null): Promise<void> {
+    const chapter = meta.chapters.find((c) => c.chapter_id === chapterId);
+    const next = nextChapterId === null ? null : meta.chapters.find((c) => c.chapter_id === nextChapterId);
+    try {
+      await notifyChapterArrived({
+        tourId: meta.tourId,
+        chapterId,
+        nextChapterId,
+        destinationLabel: chapter?.handoff?.destination_label ?? null,
+        nextChapterTitle: next?.title ?? null,
+      });
+    } catch (err) {
+      console.error('[TourSession] the arrival notification was not shown (the in-app button still is):', err);
+    }
+  }
+
+  /**
+   * "Navigate with Google Maps / Waze" for the active chapter.
+   *
+   * The notification permission is asked HERE, lazily (PM): the moment the
+   * listener is about to leave the app is when an arrival notice will matter.
+   * Returns the plan: 'open' was opened; 'needs_app' is for the screen to ask
+   * (install Google Maps, or go without the scenic route - never silently).
+   */
+  async navigateWith(provider: HandoffProvider): Promise<HandoffPlan | null> {
+    const meta = this.session;
+    const runner = this.runner;
+    if (!meta || !runner) return null;
+    const chapter = meta.chapters.find((c) => c.chapter_id === runner.state.progress.chapterId);
+    if (!chapter?.handoff) throw new Error(`chapter ${runner.state.progress.chapterId} has no navigation handoff`);
+
+    try {
+      await requestTourNotificationPermission();
+    } catch (err) {
+      console.warn('[TourSession] notification permission could not be requested; arrival will only show in the app:', err);
+    }
+
+    const spec: HandoffSpec = {
+      destination: { latitude: chapter.handoff.destination[1], longitude: chapter.handoff.destination[0] },
+      destinationLabel: chapter.handoff.destination_label,
+      anchors: chapter.handoff.anchors.map(([longitude, latitude]) => ({ latitude, longitude })),
+      providers: chapter.handoff.providers.filter((p): p is HandoffProvider => p === 'google_maps' || p === 'waze'),
+    };
+    const plan = planHandoff(
+      provider,
+      spec,
+      chapter.transit_mode as TransitMode,
+      { googleMaps: await isGoogleMapsInstalled() },
+      Platform.OS === 'ios' ? 'ios' : 'android',
+    );
+    if (plan.kind === 'open') await openNavigationUrl(plan.url);
+    return plan;
+  }
+
+  /** Open a URL the screen chose after a 'needs_app' plan (store page, or no scenic route). */
+  async openHandoffUrl(url: string): Promise<void> {
+    await openNavigationUrl(url);
+  }
+
+  /**
+   * "I'm here - start the next chapter" (PM): always offered, so a car park
+   * far from the pin never strands the listener. The same CHAPTER_SELECTED the
+   * arrival notification leads to. An in-app tap, so the app is foregrounded -
+   * which Android needs to restart tracking for the new mode.
+   */
+  startNextChapter(): void {
+    const runner = this.runner;
+    if (!runner) return;
+    const next = nextChapterOf(runner.state.tour, runner.state.progress.chapterId);
+    if (next === null) throw new Error('startNextChapter: this is the last chapter');
+    runner.dispatch({ type: 'CHAPTER_SELECTED', chapterId: next.id, at: Date.now() });
   }
 
   // ---------------------------------------------------------------------------
@@ -628,6 +738,7 @@ class TourSessionController {
       notificationPermission: snap.notificationPermission,
       startedAt: snap.startedAt,
       waypointsById: new Map(active.map((w) => [w.id, w])),
+      chapters: chaptersOf(manifest),
     };
 
     const fail = async (stage: 'audio' | 'location', err: unknown): Promise<false> => {
@@ -939,9 +1050,10 @@ class TourSessionController {
     this.audio.setTelemetry(null);
 
     try {
-      await dismissTourSuspended();
+      await dismissTourNotification('tour_suspended');
+      await dismissTourNotification('chapter_arrived');
     } catch (err) {
-      console.warn('[TourSession] the inactivity notification could not be dismissed:', err);
+      console.warn('[TourSession] tour notifications could not be dismissed:', err);
     }
 
     // Aborts any route request a pre-Epic-15 path left in flight.
@@ -954,6 +1066,23 @@ class TourSessionController {
   get isRunning(): boolean {
     return this.location !== null;
   }
+}
+
+/** A manifest chapter as the chapter panel shows it. */
+function toChapterView(c: WireChapter): ChapterView {
+  return {
+    id: c.chapter_id,
+    title: c.title,
+    transitMode: c.transit_mode as TransitMode,
+    handoff:
+      c.handoff === null
+        ? null
+        : {
+            destinationLabel: c.handoff.destination_label,
+            anchorCount: c.handoff.anchors.length,
+            providers: c.handoff.providers.filter((p): p is 'google_maps' | 'waze' => p === 'google_maps' || p === 'waze'),
+          },
+  };
 }
 
 export const tourSession = new TourSessionController();

@@ -67,6 +67,12 @@ export interface EngineChapter {
   sequencePolicy: SequencePolicy;
   /** How many stops past the cursor may fire. strict behaves as 1. */
   lookaheadStops: number;
+  /**
+   * Where the chapter's navigation handoff goes (Slice 5), or null when it
+   * has none. Reaching it raises CHAPTER_ARRIVED - a prompt, never an
+   * automatic chapter switch (PM: manual only).
+   */
+  destination: LatLng | null;
 }
 
 export interface EngineTour {
@@ -117,6 +123,11 @@ export interface Progress {
    * comes back suspended instead of quietly tracking again. Absent = running.
    */
   suspendedAt?: number;
+  /**
+   * Chapters whose destination was reached (Slice 5). Persisted, so a resume
+   * does not announce the same arrival twice. Absent = none yet.
+   */
+  arrivedChapterIds?: readonly string[];
 }
 
 /** What is on air: a stop's narration, or the Deep Dive a listener asked for (TASK-602). */
@@ -162,6 +173,8 @@ export interface EngineState {
    * Not persisted: a resumed session starts counting afresh.
    */
   stillness: { anchor: LatLng; since: number } | null;
+  /** Consecutive slow fixes inside the active chapter's destination radius. Not persisted. */
+  arrivalHits: number;
 }
 
 // -----------------------------------------------------------------------------
@@ -213,7 +226,8 @@ export type TelemetryKind =
   | 'trigger_missed'
   | 'audio_watchdog'
   | 'tour_suspended'
-  | 'tour_resumed';
+  | 'tour_resumed'
+  | 'chapter_arrived';
 
 export type Effect =
   | { type: 'PLAY'; token: number; stopId: string; track: TrackKind }
@@ -235,6 +249,12 @@ export type Effect =
   | { type: 'SUSPEND_TRACKING' }
   /** The listener resumed: start tracking again (an in-app tap, so in the foreground). */
   | { type: 'RESUME_TRACKING' }
+  /**
+   * The active chapter's destination was reached. The shell notifies (the only
+   * way to come forward over a navigation app) and highlights the "start next
+   * chapter" button; the switch itself waits for the listener's tap.
+   */
+  | { type: 'CHAPTER_ARRIVED'; chapterId: string; nextChapterId: string | null }
   | { type: 'TELEMETRY'; kind: TelemetryKind; stopId: string | null; detail: Readonly<Record<string, string | number>> };
 
 export type StopReason = 'zone_exit' | 'preempted' | 'user_skip' | 'play_timeout' | 'interruption_gave_up' | 'idle_timeout';

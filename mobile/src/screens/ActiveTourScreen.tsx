@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useState } from 'react';
 import { ActivityIndicator, Alert, Pressable, StyleSheet, Text, View } from 'react-native';
 
+import ChapterPanel from '../components/ChapterPanel';
 import TourMap from '../components/TourMap';
 import { SessionStartError, tourSession } from '../session/TourSessionController';
 import { useTourSession } from '../session/tourSessionStore';
@@ -151,6 +152,10 @@ export default function ActiveTourScreen({ route, navigation }: ActiveTourScreen
               : ''}
           </Text>
         </View>
+
+        {/* Epic 15 Slice 5: the chapter, its navigation handoff, and the manual
+            "I'm here - Start next chapter" (hidden for a single plain chapter). */}
+        <ChapterPanel />
 
         {/* Epic 15: the engine's idle timeout stopped tracking to save battery. */}
         {status === 'paused' && (

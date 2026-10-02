@@ -78,7 +78,7 @@ function drive(x0: number, x1: number, north: number, tStart: number, speed: num
 }
 
 function chapter(id: string, mode: TransitMode, over: Partial<EngineChapter> = {}): EngineChapter {
-  return { id, sortOrder: 0, transitMode: mode, sequencePolicy: 'windowed', lookaheadStops: 3, ...over };
+  return { id, sortOrder: 0, transitMode: mode, sequencePolicy: 'windowed', lookaheadStops: 3, destination: null, ...over };
 }
 function stop(id: string, chapterId: string, index: number, east: number, north: number, radiusM: number, approach: EngineApproach | null = null): EngineStop {
   return { id, chapterId, index, zone: { kind: 'radius', center: at(east, north), radiusM }, approach };
@@ -620,6 +620,64 @@ heading('Idle timeout: 15 minutes still suspends the tour (battery)');
   r = send(r, { type: 'RESUME_REQUESTED', at: T0 + 120_000 });
   r = feed(r, [fix(0, 0, T0 + 121_000, { accuracyM: 5 })]);
   assert('...resumed: it fires', 'a' in r.state.progress.fired);
+}
+{
+  // Parked, coffee for 15+ min, then "I'm here - start next chapter".
+  const tour: EngineTour = { chapters: [chapter('drive', 'driving'), chapter('walk', 'walking')], stops: [stop('a', 'walk', 0, 0, 0, 30)] };
+  let r = restore(tour, { chapterId: 'drive', fired: {}, played: {}, queue: [], suspendedAt: T0 });
+  r = send(r, { type: 'CHAPTER_SELECTED', chapterId: 'walk', at: T0 + 20 * 60_000 });
+  const order = r.effects.map((e) => e.type).filter((t) => t === 'RESUME_TRACKING' || t === 'APPLY_TRANSIT_MODE').join();
+  assert('next chapter while suspended: resumes, THEN applies the new mode', order === 'RESUME_TRACKING,APPLY_TRANSIT_MODE' && r.state.progress.suspendedAt === undefined && r.state.progress.chapterId === 'walk', order);
+}
+
+// -----------------------------------------------------------------------------
+heading('Arrival at a chapter destination (Slice 5)');
+// -----------------------------------------------------------------------------
+{
+  const parking = at(5_000, 0);
+  const tour: EngineTour = {
+    chapters: [
+      chapter('drive', 'driving', { destination: parking }),
+      chapter('walk', 'walking', { sortOrder: 1, destination: at(5_300, 300) }),
+    ],
+    stops: [stop('w1', 'walk', 0, 5_100, 100, 25)],
+  };
+  const arrivals = (r: Run) => r.effects.filter((e): e is Extract<Effect, { type: 'CHAPTER_ARRIVED' }> => e.type === 'CHAPTER_ARRIVED');
+
+  let r = start(tour, 'drive');
+  r = feed(r, drive(0, 6_000, 0, T0, 27.8));
+  assert('driving PAST the destination at 100 km/h: no arrival', arrivals(r).length === 0);
+
+  let p = start(tour, 'drive');
+  p = feed(p, drive(0, 4_950, 0, T0, 27.8));
+  p = feed(p, [0, 1, 2].map((i) => fix(4_960 + i, 0, T0 + 200_000 + i * 1000, { speedMps: 0, headingDeg: -1 })));
+  const a = arrivals(p);
+  assert('stopping at the destination: CHAPTER_ARRIVED after 3 slow fixes, naming the next chapter', a.length === 1 && a[0]?.chapterId === 'drive' && a[0]?.nextChapterId === 'walk');
+  assert('...persisted and reported', p.state.progress.arrivedChapterIds?.join() === 'drive' && tel(p, 'chapter_arrived').length === 1);
+  p = feed(p, [3, 4, 5, 6].map((i) => fix(4_960, 0, T0 + 200_000 + i * 1000, { speedMps: 0 })));
+  assert('...announced once, however long the car stays', arrivals(p).length === 1);
+  assert('...and the chapter does NOT switch by itself (manual only)', p.state.progress.chapterId === 'drive');
+
+  let ios = start(tour, 'drive');
+  ios = feed(ios, drive(0, 4_950, 0, T0, 27.8));
+  ios = feed(ios, [0, 1, 2, 3].map((i) => fix(4_960 + (i % 2) * 6, (i % 3) * 4, T0 + 200_000 + i * 1000, { speedMps: -1, headingDeg: -1, accuracyM: 8 })));
+  assert('iOS at rest (speed -1, 6 m of jitter): arrival from displacement within the fix error', arrivals(ios).length === 1);
+
+  let far = start(tour, 'drive');
+  far = feed(far, drive(0, 4_500, 0, T0, 27.8));
+  far = feed(far, [0, 1, 2, 3, 4].map((i) => fix(4_600, -300, T0 + 200_000 + i * 1000, { speedMps: 0 })));
+  assert('parked 450 m from the pin (traffic): no arrival...', arrivals(far).length === 0);
+  far = send(far, { type: 'CHAPTER_SELECTED', chapterId: 'walk', at: T0 + 210_000 });
+  assert('...the manual "I\'m here" switch still works', far.state.progress.chapterId === 'walk' && far.effects.some((e) => e.type === 'APPLY_TRANSIT_MODE' && e.transitMode === 'walking'));
+
+  let last = restore(tour, { chapterId: 'walk', fired: {}, played: {}, queue: [], arrivedChapterIds: ['drive'] });
+  last = feed(last, [0, 1, 2, 3, 4, 5].map((i) => fix(5_300, 300, T0 + i * 3000, { speedMps: 0.5, accuracyM: 5 })));
+  const la = arrivals(last);
+  assert('the last chapter\'s destination: arrival with no next chapter', la.length === 1 && la[0]?.nextChapterId === null);
+  let again = restore(tour, { chapterId: 'drive', fired: {}, played: {}, queue: [], arrivedChapterIds: ['drive'] });
+  again = feed(again, [0, 1, 2, 3].map((i) => fix(4_960, 0, T0 + i * 1000, { speedMps: 0 })));
+  assert('resumed after the arrival: not announced again', arrivals(again).length === 0);
+  assert('progressProblem: an unknown arrived chapter is refused', progressProblem(tour, { chapterId: 'drive', fired: {}, played: {}, queue: [], arrivedChapterIds: ['ghost'] }) !== null);
 }
 
 console.log(`\n${checks - failures}/${checks} checks passed`);

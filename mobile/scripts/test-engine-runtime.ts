@@ -218,6 +218,7 @@ function harness(over: Partial<EngineRunnerPorts> = {}) {
     audio: (fx) => log.push(`audio ${fx.type} ${fx.token}`),
     applyTransitMode: (m) => log.push(`mode ${m}`),
     tracking: (fx) => log.push(`tracking ${fx.type}`),
+    chapterArrived: (fx) => log.push(`arrived ${fx.chapterId}`),
     telemetry: (fx) => log.push(`tel ${fx.kind}`),
     publish: () => log.push('publish'),
     now: () => now,

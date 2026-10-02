@@ -16,7 +16,7 @@ import SettingsScreen from '../screens/SettingsScreen';
 import TourDetailScreen from '../screens/TourDetailScreen';
 import { useAuth } from '../services/auth/authStore';
 import { routeAfterAuthChange } from './accountGuard';
-import { navigationRef } from './navigationRef';
+import { flushPendingNavigation, navigationRef } from './navigationRef';
 import type { RootStackParamList } from './types';
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
@@ -79,7 +79,15 @@ export default function RootNavigator() {
   if (!preferencesReady) return null;
 
   return (
-    <NavigationContainer ref={navigationRef} onReady={syncRoute} onStateChange={syncRoute}>
+    <NavigationContainer
+      ref={navigationRef}
+      onReady={() => {
+        syncRoute();
+        // A notification tap that cold-started the app (Epic 15).
+        flushPendingNavigation();
+      }}
+      onStateChange={syncRoute}
+    >
       <Stack.Navigator
         initialRouteName={!welcomeSeen ? 'Welcome' : onboarded ? 'Discovery' : 'OnboardingGroup'}
         screenOptions={{

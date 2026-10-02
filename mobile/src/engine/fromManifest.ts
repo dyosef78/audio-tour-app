@@ -93,6 +93,7 @@ function toChapter(c: WireChapter): EngineChapter {
     transitMode: c.transit_mode as TransitMode,
     sequencePolicy: c.sequence_policy as SequencePolicy,
     lookaheadStops: c.lookahead_stops,
+    destination: c.handoff === null ? null : lonLat(c.handoff.destination),
   };
 }
 

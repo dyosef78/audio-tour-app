@@ -101,6 +101,9 @@ export function snapshotProblem(value: unknown): string | null {
   if (p.suspendedAt !== undefined && (typeof p.suspendedAt !== 'number' || !Number.isFinite(p.suspendedAt))) {
     return 'progress.suspendedAt is not a timestamp';
   }
+  if (p.arrivedChapterIds !== undefined && !isStringArray(p.arrivedChapterIds)) {
+    return 'progress.arrivedChapterIds is not a list of chapter ids';
+  }
   const active = new Set(c.activeIds);
   for (const id of [...Object.keys(p.fired as object), ...(p.queue as QueueItem[]).map((q) => q.stopId)]) {
     if (!active.has(id)) return `progress names ${id}, which is not an active stop`;

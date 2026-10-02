@@ -229,6 +229,9 @@ let writes = 0;
 let trackingOn = true;
 const telemetry: Extract<Effect, { type: 'TELEMETRY' }>[] = [];
 const transitModes: string[] = [];
+/** CHAPTER_ARRIVED effects, and whether the listener had switched chapter yet. */
+const arrivals: { chapterId: string; nextChapterId: string | null; beforeSwitch: boolean }[] = [];
+let chapterSwitched = false;
 let heartbeat: (() => void) | null = null;
 let actorRef: AudioActor | null = null;
 
@@ -252,6 +255,10 @@ const runner = new EngineRunner(createEngineState(tour, freshProgress(tour, 'dri
   tracking: (fx) => {
     trackingOn = fx.type === 'RESUME_TRACKING';
     log(fx.type === 'SUSPEND_TRACKING' ? 'TRACKING OFF (idle timeout) + notification' : 'TRACKING ON (resumed)');
+  },
+  chapterArrived: (fx) => {
+    arrivals.push({ chapterId: fx.chapterId, nextChapterId: fx.nextChapterId, beforeSwitch: !chapterSwitched });
+    log(`ARRIVED at the end of "${fx.chapterId}" + notification (next: ${fx.nextChapterId ?? 'none'})`);
   },
   telemetry: (fx) => {
     telemetry.push(fx);
@@ -304,6 +311,7 @@ for (const leg of legs) {
   if ('action' in leg) {
     if (leg.action === 'chapter') {
       log(`listener starts "${leg.chapterId}"`);
+      chapterSwitched = true;
       runner.dispatch({ type: 'CHAPTER_SELECTED', chapterId: leg.chapterId, at: now });
     } else {
       log('listener taps Resume');
@@ -373,6 +381,11 @@ assert('h5: inside the tunnel -> not fired from the 2 km chord', !fired.includes
 assert('detour past h6..h8 -> re-anchored to h9', kinds('trigger_reanchored').some((t) => t.stopId === 'h9') && played.includes('h9'));
 assert('...h5..h8 reported as skipped', ['h5', 'h6', 'h7', 'h8'].every((id) => kinds('trigger_missed').some((t) => t.stopId === id)));
 assert('h10: back on plan -> heard', played.includes('h10'));
+assert(
+  'parked at the chapter destination -> arrival announced once, before the manual switch',
+  arrivals.length === 1 && arrivals[0].chapterId === 'drive' && arrivals[0].nextChapterId === 'walk' && arrivals[0].beforeSwitch && kinds('chapter_arrived').length === 1,
+  JSON.stringify(arrivals),
+);
 assert('chapter 2 by hand -> transit mode switched to walking', transitModes.join() === 'walking');
 assert('w1, w2, w3 heard on foot', ['w1', 'w2', 'w3'].every((id) => played.includes(id)));
 assert('16 min sitting -> suspended once, resumed on tap', kinds('tour_suspended').length === 1 && kinds('tour_resumed').length === 1);

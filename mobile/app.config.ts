@@ -2,7 +2,46 @@ import type { ConfigContext, ExpoConfig } from 'expo/config';
 // '.js' is load-bearing: `expo` has no package "exports" map, so Node's ESM
 // loader (npm run test:auth imports this file) cannot resolve the bare
 // subpath. Expo CLI's own loader resolves either spelling.
-import { withInfoPlist, type ConfigPlugin } from 'expo/config-plugins.js';
+import { withAndroidManifest, withInfoPlist, type ConfigPlugin } from 'expo/config-plugins.js';
+
+/**
+ * Epic 15 Slice 5: the handoff asks "is the Google Maps app installed?" before
+ * sending a scenic route with more anchors than a browser honours
+ * (handoff/handoffLinks.ts). Both platforms answer canOpenURL only for schemes
+ * the app DECLARES - undeclared, the answer is always "no", and every scenic
+ * handoff would wrongly ask the listener to install Google Maps.
+ *   iOS      LSApplicationQueriesSchemes: comgooglemaps, waze
+ *   Android  <queries> (package visibility, Android 11+): VIEW intents for the
+ *            google.navigation and waze schemes
+ * Merged with whatever is already declared, never replacing it.
+ */
+const NAVIGATION_SCHEMES_IOS = ['comgooglemaps', 'waze'];
+const NAVIGATION_SCHEMES_ANDROID = ['google.navigation', 'waze'];
+
+const withNavigationAppQueries: ConfigPlugin = (config) => {
+  const withIos = withInfoPlist(config, (mod) => {
+    const existing: string[] = Array.isArray(mod.modResults.LSApplicationQueriesSchemes) ? mod.modResults.LSApplicationQueriesSchemes : [];
+    mod.modResults.LSApplicationQueriesSchemes = [...new Set([...existing, ...NAVIGATION_SCHEMES_IOS])];
+    return mod;
+  });
+  return withAndroidManifest(withIos, (mod) => {
+    const manifest = mod.modResults.manifest as unknown as { queries?: { intent?: unknown[] }[] };
+    const queries = manifest.queries?.[0] ?? {};
+    const intents = queries.intent ?? [];
+    for (const scheme of NAVIGATION_SCHEMES_ANDROID) {
+      const declared = JSON.stringify(intents).includes(`"android:scheme":"${scheme}"`);
+      if (!declared) {
+        intents.push({
+          action: [{ $: { 'android:name': 'android.intent.action.VIEW' } }],
+          data: [{ $: { 'android:scheme': scheme } }],
+        });
+      }
+    }
+    queries.intent = intents;
+    manifest.queries = [queries, ...(manifest.queries?.slice(1) ?? [])];
+    return mod;
+  });
+};
 
 /**
  * Epic 13: expo-task-manager's plugin adds the `fetch` background mode
@@ -145,7 +184,7 @@ export default ({ config }: ConfigContext): ExpoConfig => {
     console.warn(`\n[app.config] Google Sign-In is off in this build: ${googleErrors.join('; ')}.\n`);
   }
 
-  return withoutUnusedBackgroundFetch({
+  return withNavigationAppQueries(withoutUnusedBackgroundFetch({
     ...config,
     plugins: [...(config.plugins ?? []), ...googlePlugins],
     name: config.name ?? 'Audio Tour',
@@ -157,5 +196,5 @@ export default ({ config }: ConfigContext): ExpoConfig => {
       // than carrying a bogus placeholder into the manifest.
       ...(apiKey ? { config: { googleMaps: { apiKey } } } : {}),
     },
-  });
+  }));
 };
