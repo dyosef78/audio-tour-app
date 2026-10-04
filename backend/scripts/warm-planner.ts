@@ -65,7 +65,10 @@ async function main(): Promise<number> {
     return 1;
   }
 
-  const supabase = createClient(url, anonKey, { auth: { persistSession: false, autoRefreshToken: true } });
+  // No auto-refresh: its timer would keep the process alive after the loop
+  // ends. A run is bounded by --max-minutes (<= 240), and each batch re-reads
+  // the session, so an expiring token is refreshed explicitly below.
+  const supabase = createClient(url, anonKey, { auth: { persistSession: false, autoRefreshToken: false } });
   const { error: signInError } = await supabase.auth.signInWithPassword({ email, password });
   if (signInError) {
     console.error(`Sign-in failed: ${signInError.message}`);
@@ -75,8 +78,10 @@ async function main(): Promise<number> {
   const deadline = Date.now() + args.maxMinutes * 60_000;
   let totalFilled = 0;
   for (let batch = 1; ; batch++) {
-    // Re-read each time: autoRefreshToken may have rotated it during a long run.
-    const { data: session } = await supabase.auth.getSession();
+    let { data: session } = await supabase.auth.getSession();
+    if (session.session && session.session.expires_at !== undefined && session.session.expires_at * 1000 - Date.now() < 120_000) {
+      ({ data: session } = await supabase.auth.refreshSession());
+    }
     const token = session.session?.access_token;
     if (!token) {
       console.error('Lost the admin session.');
@@ -117,10 +122,14 @@ async function main(): Promise<number> {
   }
 }
 
+// exitCode, not process.exit(): exiting while fetch's sockets are closing trips
+// a libuv assertion on Windows (seen 4 Oct 2026).
 main().then(
-  (code) => process.exit(code),
+  (code) => {
+    process.exitCode = code;
+  },
   (err) => {
     console.error(err instanceof Error ? err.message : err);
-    process.exit(1);
+    process.exitCode = 1;
   },
 );

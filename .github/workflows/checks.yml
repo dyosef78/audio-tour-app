@@ -61,6 +61,10 @@ jobs:
       - name: Planner tests
         run: npm run test:planner
 
+      # Epic 16 Part 4: the app's planned-session mode (client, stops, engine).
+      - name: Plan mode tests
+        run: npm run test:plan
+
       - name: CMS contract tests
         run: npm run test:cms
 

@@ -145,7 +145,7 @@ async function googleAccessToken(): Promise<GoogleTokenResult> {
 }
 
 /** A token for the request, without ever waiting indefinitely on the auth lock. */
-async function accessTokenForRequest(): Promise<string | null> {
+export async function accessTokenForRequest(): Promise<string | null> {
   const raced = await raceTimeout(supabase.auth.getSession(), SESSION_LOOKUP_MS);
   if (!raced.timedOut) {
     const { data, error } = raced.value;

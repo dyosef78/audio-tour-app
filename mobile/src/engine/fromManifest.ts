@@ -65,7 +65,7 @@ export function chaptersOf(manifest: WireBundle): WireChapter[] {
     );
 }
 
-function plainChapter(manifest: WireBundle): WireChapter {
+export function plainChapter(manifest: WireBundle): WireChapter {
   return {
     chapter_id: manifest.tour_metadata.tour_id,
     sort_order: 0,
@@ -77,7 +77,7 @@ function plainChapter(manifest: WireBundle): WireChapter {
   };
 }
 
-function toChapter(c: WireChapter): EngineChapter {
+export function toChapter(c: WireChapter): EngineChapter {
   if (!TRANSIT_MODES.includes(c.transit_mode as TransitMode)) {
     throw new RangeError(`chapter ${c.chapter_id}: unknown transit mode '${c.transit_mode}'`);
   }
@@ -103,7 +103,7 @@ const lonLat = (p: readonly [number, number] | readonly number[]): LatLng => {
   return { latitude, longitude };
 };
 
-function toZone(w: WireWaypoint): EngineZone {
+export function toZone(w: WireWaypoint): EngineZone {
   const g = w.geofence;
   if (g === null) throw new RangeError(`stop ${w.waypoint_id}: no geofence`);
   if (g.type === 'radius') {
@@ -115,7 +115,7 @@ function toZone(w: WireWaypoint): EngineZone {
   return { kind: 'polygon', ring: g.ring.map(lonLat) };
 }
 
-function toApproach(w: WireWaypoint): EngineApproach | null {
+export function toApproach(w: WireWaypoint): EngineApproach | null {
   const a = w.approach;
   if (a === undefined || a === null) return null;
   if (a.policy !== 'required' && a.policy !== 'preferred') {

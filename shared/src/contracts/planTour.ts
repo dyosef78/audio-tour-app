@@ -244,3 +244,175 @@ export interface PlanFetchError {
   stale_tour_ids?: readonly string[];
   request_id: string;
 }
+
+// -----------------------------------------------------------------------------
+// Runtime parsing - the app never trusts a response's shape (Epic 16 Part 4).
+// One parser for both sides: the app parses with it, and plan-tour's tests do.
+// -----------------------------------------------------------------------------
+
+export class PlanContractError extends Error {
+  override readonly name = 'PlanContractError';
+}
+
+type Obj = Record<string, unknown>;
+const isObj = (v: unknown): v is Obj => typeof v === 'object' && v !== null && !Array.isArray(v);
+function bad(where: string): never {
+  throw new PlanContractError(`plan-tour response: unexpected ${where}`);
+}
+const MODES: readonly string[] = ['walking', 'biking', 'driving'];
+const SOURCES: readonly string[] = ['valhalla', 'estimated'];
+const PROVIDERS: readonly string[] = ['google_maps', 'waze'];
+const HEX32 = /^[0-9a-f]{32}$/;
+const UUIDISH = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function str(o: Obj, k: string, w: string): string {
+  return typeof o[k] === 'string' ? (o[k] as string) : bad(`${w}.${k}`);
+}
+function num(o: Obj, k: string, w: string, min = 0): number {
+  const v = o[k];
+  return typeof v === 'number' && Number.isFinite(v) && v >= min ? v : bad(`${w}.${k}`);
+}
+function strings(o: Obj, k: string, w: string): string[] {
+  const v = o[k];
+  return Array.isArray(v) && v.every((x) => typeof x === 'string') ? (v as string[]) : bad(`${w}.${k}`);
+}
+function point(v: unknown, w: string): LonLat {
+  if (!isObj(v) || typeof v.lon !== 'number' || typeof v.lat !== 'number' || !Number.isFinite(v.lon) || !Number.isFinite(v.lat)) bad(w);
+  return { lon: v.lon as number, lat: v.lat as number };
+}
+function oneOf<T extends string>(v: unknown, allowed: readonly string[], w: string): T {
+  return typeof v === 'string' && allowed.includes(v) ? (v as T) : bad(w);
+}
+
+/**
+ * A 200 body, checked in full: field types, the transfer/chapter alternation,
+ * each transfer pointing at the chapter that follows it, exits chained to the
+ * previous chapter, and every chapter's tour among the pinned sources (and
+ * every pinned source used). Throws PlanContractError.
+ */
+export function parsePlanTourOk(value: unknown): PlanTourOk {
+  if (!isObj(value) || value.status !== 'ok') bad('status');
+  if (value.contract_version !== PLAN_CONTRACT_VERSION) bad('contract_version');
+  const planId = str(value, 'plan_id', 'body');
+  if (!UUIDISH.test(planId)) bad('plan_id');
+  const plannerVersion = str(value, 'planner_version', 'body');
+  if (!/^v\d+$/.test(plannerVersion)) bad('planner_version');
+  const contentHash = str(value, 'content_hash', 'body');
+  if (!HEX32.test(contentHash)) bad('content_hash');
+  const expiresAt = str(value, 'expires_at', 'body');
+  if (!Number.isFinite(Date.parse(expiresAt))) bad('expires_at');
+
+  const rawSources = Array.isArray(value.sources) ? value.sources : bad('sources');
+  const sources = rawSources.map((s, i): PlanSource => {
+    if (!isObj(s)) bad(`sources[${i}]`);
+    return { tour_id: str(s, 'tour_id', `sources[${i}]`), bundle_version_hash: str(s, 'bundle_version_hash', `sources[${i}]`) };
+  });
+  const sourceIds = new Set(sources.map((s) => s.tour_id));
+  if (sources.length === 0 || sourceIds.size !== sources.length) bad('sources (empty or repeated)');
+
+  const raw = Array.isArray(value.segments) ? value.segments : bad('segments');
+  if (raw.length === 0 || raw.length % 2 !== 0) bad('segments (must be transfer, chapter pairs)');
+  const segments: PlanSegment[] = [];
+  const usedTours = new Set<string>();
+  raw.forEach((s, i) => {
+    const w = `segments[${i}]`;
+    if (!isObj(s)) bad(w);
+    if (i % 2 === 0) {
+      if (s.kind !== 'transfer') bad(`${w}.kind (expected transfer)`);
+      const from = s.from;
+      if (!isObj(from)) bad(`${w}.from`);
+      let parsedFrom: TransferSegment['from'];
+      if (i === 0) {
+        if (from.kind !== 'origin' || 'point' in from) bad(`${w}.from (the first transfer starts at the origin, with no coordinates)`);
+        parsedFrom = { kind: 'origin' };
+      } else {
+        if (from.kind !== 'chapter_exit') bad(`${w}.from.kind`);
+        const prev = segments[i - 1] as ChapterSegment;
+        if (from.chapter_id !== prev.chapter_id) bad(`${w}.from.chapter_id (must be the previous chapter)`);
+        parsedFrom = { kind: 'chapter_exit', chapter_id: prev.chapter_id, point: point(from.point, `${w}.from.point`) };
+      }
+      const providers = strings(s, 'providers', w);
+      if (providers.length === 0 || !providers.every((p) => PROVIDERS.includes(p))) bad(`${w}.providers`);
+      segments.push({
+        kind: 'transfer',
+        from: parsedFrom,
+        to_chapter_id: str(s, 'to_chapter_id', w),
+        to: point(s.to, `${w}.to`),
+        mode: oneOf<TransitMode>(s.mode, MODES, `${w}.mode`),
+        duration_s: num(s, 'duration_s', w),
+        distance_m: num(s, 'distance_m', w),
+        cost_source: oneOf<CostSource>(s.cost_source, SOURCES, `${w}.cost_source`),
+        providers: providers as HandoffProvider[],
+      });
+    } else {
+      if (s.kind !== 'chapter') bad(`${w}.kind (expected chapter)`);
+      const chapterId = str(s, 'chapter_id', w);
+      if ((segments[i - 1] as TransferSegment).to_chapter_id !== chapterId) bad(`${w}.chapter_id (the transfer before it goes elsewhere)`);
+      const tourId = str(s, 'tour_id', w);
+      if (!sourceIds.has(tourId)) bad(`${w}.tour_id (not among the pinned sources)`);
+      usedTours.add(tourId);
+      const waypointIds = strings(s, 'waypoint_ids', w);
+      if (waypointIds.length === 0 || new Set(waypointIds).size !== waypointIds.length) bad(`${w}.waypoint_ids`);
+      segments.push({
+        kind: 'chapter',
+        tour_id: tourId,
+        chapter_id: chapterId,
+        transit_mode: oneOf<TransitMode>(s.transit_mode, MODES, `${w}.transit_mode`),
+        waypoint_ids: waypointIds,
+        kept_extension_ids: strings(s, 'kept_extension_ids', w),
+        dropped_extension_ids: strings(s, 'dropped_extension_ids', w),
+        travel_s: num(s, 'travel_s', w),
+        dwell_s: num(s, 'dwell_s', w),
+        cost_source: oneOf<CostSource>(s.cost_source, SOURCES, `${w}.cost_source`),
+      });
+    }
+  });
+  if (usedTours.size !== sourceIds.size) bad('sources (a pinned tour no chapter uses)');
+
+  const e = isObj(value.estimate) ? value.estimate : bad('estimate');
+  const estimate: PlanEstimate = {
+    budget_s: num(e, 'budget_s', 'estimate'),
+    total_s: num(e, 'total_s', 'estimate'),
+    transfer_s: num(e, 'transfer_s', 'estimate'),
+    chapter_travel_s: num(e, 'chapter_travel_s', 'estimate'),
+    dwell_s: num(e, 'dwell_s', 'estimate'),
+    deep_dive_extra_s: num(e, 'deep_dive_extra_s', 'estimate'),
+    slack_s: num(e, 'slack_s', 'estimate'),
+    pace_factor: num(e, 'pace_factor', 'estimate', 1),
+  };
+  if (estimate.total_s > estimate.budget_s) bad('estimate (total over budget)');
+  const q = isObj(value.quality) ? value.quality : bad('quality');
+  if (typeof q.search_truncated !== 'boolean') bad('quality.search_truncated');
+  const quality: PlanQuality = {
+    candidates_considered: num(q, 'candidates_considered', 'quality'),
+    legs_total: num(q, 'legs_total', 'quality'),
+    legs_estimated: num(q, 'legs_estimated', 'quality'),
+    search_truncated: q.search_truncated,
+    dropped_high_value_extensions: num(q, 'dropped_high_value_extensions', 'quality'),
+  };
+
+  return {
+    status: 'ok', contract_version: PLAN_CONTRACT_VERSION, plan_id: planId, planner_version: plannerVersion,
+    content_hash: contentHash, expires_at: expiresAt, sources, segments, estimate, quality,
+  };
+}
+
+export interface ParsedError {
+  code: string;
+  detail: string;
+  retryAfterS?: number;
+  shortfallS?: number;
+  staleTourIds?: string[];
+  requestId?: string;
+}
+
+/** A non-200 body's error fields, or null when it is not this contract's error shape (a gateway page, say). */
+export function parsePlanError(value: unknown): ParsedError | null {
+  if (!isObj(value) || value.status !== 'error' || typeof value.code !== 'string') return null;
+  const out: ParsedError = { code: value.code, detail: typeof value.detail === 'string' ? value.detail : '' };
+  if (typeof value.retry_after_s === 'number') out.retryAfterS = value.retry_after_s;
+  if (typeof value.shortfall_s === 'number') out.shortfallS = value.shortfall_s;
+  if (Array.isArray(value.stale_tour_ids)) out.staleTourIds = value.stale_tour_ids.filter((x): x is string => typeof x === 'string');
+  if (typeof value.request_id === 'string') out.requestId = value.request_id;
+  return out;
+}

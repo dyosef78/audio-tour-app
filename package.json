@@ -26,6 +26,7 @@
     "test:cms": "node backend/scripts/test-cms.ts",
     "test:routing": "node backend/scripts/test-routing.ts",
     "test:planner": "node backend/scripts/test-planner.ts",
+    "test:plan": "node mobile/scripts/test-plan-mode.ts",
     "planner:warm": "node --env-file-if-exists=.env --env-file-if-exists=mobile/.env backend/scripts/warm-planner.ts",
     "test:edge": "deno test --import-map=supabase/functions/import_map.json supabase/functions/",
     "check:edge": "deno check --import-map=supabase/functions/import_map.json supabase/functions/route-stops/index.ts supabase/functions/delete-account/index.ts supabase/functions/plan-tour/index.ts supabase/functions/warm-costs/index.ts",
