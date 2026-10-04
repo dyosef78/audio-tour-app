@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Alert, Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { TourBundleRepository } from '../services/bundle/TourBundleRepository';
 import type { BundleProgress } from '../services/bundle/types';
+import { PinnedBundleError, pinConflictCopy } from '../services/planner/planRepository';
 import { networkMonitor } from '../services/network/NetworkMonitor';
 import { useTourSession } from '../session/tourSessionStore';
 import type { TourDetailScreenProps } from '../navigation/types';
@@ -64,7 +65,22 @@ export default function TourDetailScreen({ route, navigation }: TourDetailScreen
     );
   }, [tourId]);
 
-  const startDownload = useCallback(async () => {
+  /**
+   * Epic 16 strict invalidation: an update or removal that would break a saved
+   * plan is refused until the visitor agrees to delete that plan. Asked here,
+   * never automatically - and a refused UPDATE leaves the tour 'available'
+   * rather than 'error', so the reconnect auto-resume below cannot re-trigger
+   * the dialog in a loop.
+   */
+  const confirmInvalidation = useCallback((err: PinnedBundleError, retry: (agreed: string[]) => void) => {
+    const copy = pinConflictCopy(err.blocking, err.action);
+    Alert.alert(copy.title, copy.message, [
+      { text: 'Keep plan', style: 'cancel' },
+      { text: copy.confirm, style: 'destructive', onPress: () => retry(err.blocking.map((b) => b.planId)) },
+    ]);
+  }, []);
+
+  const startDownload = useCallback(async (invalidatePlans: readonly string[] = []) => {
     const hadBundle = TourBundleRepository.isDownloaded(tourId);
     setState({
       phase: 'downloading',
@@ -73,6 +89,7 @@ export default function TourDetailScreen({ route, navigation }: TourDetailScreen
 
     try {
       await TourBundleRepository.download(tourId, {
+        invalidatePlans,
         onProgress: (progress) => {
           if (mounted.current) setState({ phase: 'downloading', progress });
         },
@@ -80,6 +97,11 @@ export default function TourDetailScreen({ route, navigation }: TourDetailScreen
       if (mounted.current) setState({ phase: 'ready', update: 'current' });
     } catch (err) {
       if (!mounted.current) return;
+      if (err instanceof PinnedBundleError) {
+        setState(hadBundle ? { phase: 'ready', update: 'available' } : { phase: 'idle' });
+        confirmInvalidation(err, (agreed) => void startDownload(agreed));
+        return;
+      }
       // A failed UPDATE must not take away a tour that still works: the old
       // bundle is untouched until the new one commits.
       if (hadBundle && TourBundleRepository.isDownloaded(tourId)) {
@@ -91,7 +113,7 @@ export default function TourDetailScreen({ route, navigation }: TourDetailScreen
         message: err instanceof Error ? err.message : 'Download failed.',
       });
     }
-  }, [tourId]);
+  }, [tourId, confirmInvalidation]);
 
   const checkForUpdate = useCallback(async () => {
     if (!mounted.current) return;
@@ -132,10 +154,19 @@ export default function TourDetailScreen({ route, navigation }: TourDetailScreen
     [startDownload, checkForUpdate],
   );
 
-  const removeDownload = useCallback(() => {
-    TourBundleRepository.remove(tourId);
-    setState({ phase: 'idle' });
-  }, [tourId]);
+  const removeDownload = useCallback(
+    (invalidatePlans: readonly string[] = []) => {
+      try {
+        TourBundleRepository.remove(tourId, { invalidatePlans });
+      } catch (err) {
+        if (!(err instanceof PinnedBundleError)) throw err;
+        confirmInvalidation(err, (agreed) => removeDownload(agreed));
+        return;
+      }
+      setState({ phase: 'idle' });
+    },
+    [tourId, confirmInvalidation],
+  );
 
   return (
     <View style={styles.container}>
@@ -204,7 +235,7 @@ export default function TourDetailScreen({ route, navigation }: TourDetailScreen
 
           {/* Removing the files a running tour plays from would silence it. */}
           {!tourRunning && (
-            <Pressable onPress={removeDownload} hitSlop={8}>
+            <Pressable onPress={() => removeDownload()} hitSlop={8}>
               <Text style={styles.link}>Remove download</Text>
             </Pressable>
           )}

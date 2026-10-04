@@ -21,6 +21,8 @@ import { refreshCities, useCityCatalogue } from '../personalization/cityCatalogu
 import { catalogueCityId, resolveCity } from '../personalization/onboardingFlow';
 import { usePreferences } from '../personalization/preferencesStore';
 import { TourBundleRepository } from '../services/bundle/TourBundleRepository';
+import { formatDuration } from '../services/planner/planForm';
+import { useSavedPlans } from '../services/planner/planRepositoryFile';
 import { networkMonitor } from '../services/network/NetworkMonitor';
 import { isSupabaseConfigured } from '../services/supabase/client';
 import { fetchTours } from '../services/supabase/tours';
@@ -82,6 +84,9 @@ export default function DiscoveryScreen({ navigation }: DiscoveryScreenProps) {
   const interests = usePreferences((s) => s.interests);
   const timeBudget = usePreferences((s) => s.timeBudget);
   const cityId = usePreferences((s) => s.cityId);
+  // Saved plans only: a draft is a plan the visitor has not kept.
+  const allPlans = useSavedPlans();
+  const plans = useMemo(() => allPlans.filter((p) => p.status === 'saved'), [allPlans]);
   const cities = useCityCatalogue((s) => s.cities);
   const cityName = cities?.find((c) => c.id === cityId)?.name ?? null;
   const multipleCities = (cities?.length ?? 0) >= 2;
@@ -252,6 +257,34 @@ export default function DiscoveryScreen({ navigation }: DiscoveryScreenProps) {
               </Text>
             </Pressable>
           ) : null}
+          {state.source === 'live' && !needsCity && (
+            <Pressable
+              style={({ pressed }) => [styles.planCta, pressed && styles.cardPressed]}
+              onPress={() => navigation.navigate('Plan')}
+              accessibilityRole="button"
+            >
+              <Text style={styles.planCtaTitle}>🗺️ Plan my day</Text>
+              <Text style={styles.planCtaText}>The best of this city's tours for the time you have, from where you are.</Text>
+            </Pressable>
+          )}
+          {plans.length > 0 && (
+            <View style={styles.plans}>
+              <Text style={styles.prefsEyebrow}>YOUR PLANS</Text>
+              {plans.map((p) => (
+                <Pressable
+                  key={p.plan.plan_id}
+                  style={({ pressed }) => [styles.planRow, pressed && styles.cardPressed]}
+                  onPress={() => navigation.navigate('PlanPreview', { planId: p.plan.plan_id })}
+                  accessibilityRole="button"
+                >
+                  <Text style={styles.planRowTitle}>From {p.originLabel}</Text>
+                  <Text style={styles.muted}>
+                    {formatDuration(p.plan.estimate.total_s)} · {new Date(p.savedAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+          )}
         </>
       }
       ListEmptyComponent={
@@ -297,6 +330,12 @@ const styles = StyleSheet.create({
   retry: { marginTop: 8, paddingVertical: 10, paddingHorizontal: 22, borderRadius: 8, backgroundColor: '#1C1C1E' },
   retryText: { color: '#FFFFFF', fontWeight: '600' },
   headerLink: { color: '#0C6C6A', fontSize: 15, fontWeight: '600' },
+  planCta: { padding: 16, borderRadius: 14, backgroundColor: '#1C1C1E', gap: 4, marginBottom: 12 },
+  planCtaTitle: { fontSize: 17, fontWeight: '700', color: '#FFFFFF' },
+  planCtaText: { fontSize: 14, lineHeight: 19, color: '#D1D1D6' },
+  plans: { gap: 8, marginBottom: 12 },
+  planRow: { padding: 14, borderRadius: 12, borderWidth: 1, borderColor: '#D1D1D6', gap: 2, alignItems: 'flex-start' },
+  planRowTitle: { fontSize: 15, fontWeight: '600' },
   offline: { padding: 14, borderRadius: 12, backgroundColor: '#FBF0E0', gap: 2, marginBottom: 12 },
   offlineTitle: { fontSize: 14, fontWeight: '700', color: '#8A5A00' },
   offlineText: { fontSize: 13, lineHeight: 18, color: '#6B4A12' },

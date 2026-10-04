@@ -6,12 +6,22 @@
  *   engineTourFromPlan      synthetic transfer chapters + the strict gate
  *   planChapters            what the chapter panel shows
  *   createPlanClient        HTTP mapping against a fake fetch
+ *   createPlanRepository    drafts vs saved plans, pins, the conflict copy
+ *   downloadPlanBundles     conflict / stale / invalid / ready
+ *   PlacesSession           session tokens, debounce, latest-wins, dispose
+ *   planForm                the request, error copy, preview rows
  */
 
-import { parsePlanTourOk, type PlanTourOk } from '../../shared/src/contracts/planTour.ts';
+import { parsePlanTourOk, type PlanTourOk, type PlanTourRequest } from '../../shared/src/contracts/planTour.ts';
 import { engineTourFromPlan, isTransferChapter, planChapters, planProblem } from '../src/engine/fromPlan.ts';
 import { sessionStops } from '../src/routing/stopSelection.ts';
 import { createPlanClient } from '../src/services/planner/PlanClient.ts';
+import { downloadPlanBundles, type PlanDownloadDeps } from '../src/services/planner/planDownload.ts';
+import { buildPlanRequest, estimateSummary, formatDistance, formatDuration, localIsoWithOffset, planErrorCopy, segmentRows, upsellCopy } from '../src/services/planner/planForm.ts';
+import { createPlanRepository, PinnedBundleError, pinConflictCopy } from '../src/services/planner/planRepository.ts';
+import { MAX_REQUESTS_PER_SESSION, MIN_QUERY, PlacesSession, SESSION_IDLE_MS, type PlacesCallResult, type PlacesClient } from '../src/services/planner/places.ts';
+import { checkPlanRequest } from '../../shared/src/planner/request.ts';
+import type { PlaceSuggestion } from '../../shared/src/contracts/places.ts';
 import type { WireBundle, WireWaypoint } from '../src/services/bundle/types.ts';
 import type { Waypoint } from '../src/types/domain.ts';
 
@@ -168,6 +178,241 @@ heading('createPlanClient');
   eq('GET 404 -> not_found', await get(404, { status: 'error', code: 'plan_not_found', detail: '', retryable: false, request_id: 'r' }), { kind: 'not_found' });
   const other = await client(reply(200, { ...rawPlan(), plan_id: uuid(501) }) as typeof fetch).fetchPlan(uuid(500));
   assert('a 200 for ANOTHER plan_id is refused', other.kind === 'error' && other.code === 'bad_response');
+}
+
+// -----------------------------------------------------------------------------
+// Final slice: plan repository (pins), plan downloads, Places session, plan form.
+
+{
+  heading('createPlanRepository - drafts pin nothing, saved plans pin their sources');
+  const store = new Map<string, string>();
+  const io = { read: () => store.get('f') ?? null, write: (t: string) => void store.set('f', t) };
+  const logs: string[] = [];
+  const repo = createPlanRepository(io, (m) => logs.push(m));
+  const request = { contract_version: 1, city_id: uuid(900) } as unknown as PlanTourRequest;
+  let notified = 0;
+  repo.subscribe(() => notified++);
+
+  repo.putDraft({ plan, request, originLabel: 'Dizengoff Center', savedAt: Date.UTC(2026, 9, 4) });
+  eq('a draft blocks nothing', repo.blockingPlans(TA, 'hashA-new'), []);
+  repo.markSaved(plan.plan_id);
+  eq('saved: blocks another version of a pinned tour', repo.blockingPlans(TA, 'hashA-new').map((b) => b.planId), [plan.plan_id]);
+  eq('saved: blocks removal (toHash null)', repo.blockingPlans(TB, null).map((b) => b.hash), ['hashB']);
+  eq('saved: the SAME version is no conflict', repo.blockingPlans(TA, 'hashA'), []);
+  eq('a tour the plan does not use is never blocked', repo.blockingPlans(uuid(3), null), []);
+  assert('the label names the origin', /Dizengoff Center/.test(repo.blockingPlans(TA, null)[0]!.label));
+  assert('subscribers hear every change', notified === 2, `got ${notified}`);
+
+  const second = parsePlanTourOk({ ...rawPlan(), plan_id: uuid(501) });
+  const third = parsePlanTourOk({ ...rawPlan(), plan_id: uuid(502) });
+  repo.putDraft({ plan: second, request, originLabel: 'A', savedAt: 1 });
+  repo.putDraft({ plan: third, request, originLabel: 'B', savedAt: 2 });
+  eq('at most ONE draft; saved plans are kept', repo.list().map((p) => `${p.plan.plan_id.slice(-1)}:${p.status}`), ['4:saved', '6:draft']);
+  throwsLike('markSaved of an unknown plan fails loudly', () => repo.markSaved(uuid(503)), /no plan/);
+
+  const reloaded = createPlanRepository(io, (m) => logs.push(m));
+  eq('persisted and re-parsed on load', reloaded.list().map((p) => p.status), ['saved', 'draft']);
+
+  const file = JSON.parse(store.get('f')!);
+  file.plans[1].plan.segments = [];
+  store.set('f', JSON.stringify(file));
+  const pruned = createPlanRepository(io, (m) => logs.push(m));
+  assert('a plan that no longer parses is dropped, loudly', pruned.list().length === 1 && logs.some((l) => /dropped an unreadable/.test(l)));
+  store.set('f', JSON.stringify({ v: 99, plans: [] }));
+  assert('an unknown file version starts empty, loudly', createPlanRepository(io, (m) => logs.push(m)).list().length === 0 && logs.some((l) => /version 99/.test(l)));
+
+  reloaded.remove([plan.plan_id]);
+  eq('remove drops the plan and its pins', reloaded.blockingPlans(TA, null), []);
+
+  heading("pinConflictCopy - the PM's strict-invalidation wording");
+  const holder = { planId: uuid(1), label: 'your plan from Dizengoff Center (Oct 4)', hash: 'h' };
+  const np = pinConflictCopy([holder], 'new_plan');
+  assert('new_plan: "requires updating a tour used in" + names the plan', np.message.startsWith('Planning this new route requires updating a tour used in your plan from Dizengoff Center'));
+  assert('new_plan: explicit that the old plan is overwritten', /Overwrite the old plan\?$/.test(np.message) && np.confirm === 'Overwrite old plan');
+  assert('several plans are counted, not listed', /2 of your saved plans/.test(pinConflictCopy([holder, { ...holder, planId: uuid(2) }], 'update').message));
+  assert('remove copy says the plan is deleted', /Removing it will delete that plan/.test(pinConflictCopy([holder], 'remove').message));
+}
+
+{
+  heading('downloadPlanBundles - pins, conflicts, stale bundles');
+  type Holder = { planId: string; label: string; hash: string };
+  const holderX: Holder = { planId: uuid(700), label: 'your plan from X', hash: 'hashA-old' };
+  const setup = (o: { local?: Record<string, string>; serve?: Record<string, string>; blocking?: Record<string, Holder[]>; fail?: Record<string, Error> } = {}) => {
+    const local = new Map(Object.entries(o.local ?? {}));
+    const calls: { tourId: string; invalidatePlans: readonly string[] }[] = [];
+    const deps: PlanDownloadDeps = {
+      localHash: (id) => local.get(id) ?? null,
+      async download(id, opts) {
+        calls.push({ tourId: id, invalidatePlans: opts.invalidatePlans ?? [] });
+        const err = o.fail?.[id];
+        if (err) throw err;
+        opts.onProgress?.(0.5);
+        const h = o.serve?.[id] ?? (id === TA ? 'hashA' : 'hashB');
+        local.set(id, h);
+        return { bundle_version_hash: h };
+      },
+      blockingPlans: (id) => o.blocking?.[id] ?? [],
+      manifest: (id) => (local.get(id) === manifests.get(id)?.bundle_version_hash ? manifests.get(id)! : null),
+    };
+    return { deps, calls };
+  };
+
+  const done = setup({ local: { [TA]: 'hashA', [TB]: 'hashB' } });
+  eq('everything already at its pin: ready, nothing fetched', [(await downloadPlanBundles(plan, done.deps)).kind, done.calls.length], ['ready', 0]);
+
+  const fresh = setup();
+  const progress: number[] = [];
+  const r1 = await downloadPlanBundles(plan, fresh.deps, { onProgress: (f) => progress.push(f) });
+  eq('fresh device: both tours fetched, ready', [r1.kind, fresh.calls.map((c) => c.tourId)], ['ready', [TA, TB]]);
+  assert('progress climbs and ends at 1', progress.every((f, i) => i === 0 || f >= progress[i - 1]!) && progress.at(-1) === 1, JSON.stringify(progress));
+
+  const pinned = setup({ local: { [TA]: 'hashA-old' }, blocking: { [TA]: [holderX] } });
+  const c1 = await downloadPlanBundles(plan, pinned.deps);
+  eq('a saved plan pins another version: conflict BEFORE any download', [c1.kind, c1.kind === 'conflict' ? c1.blocking.map((b) => b.planId) : null, pinned.calls.length], ['conflict', [uuid(700)], 0]);
+  const c2 = await downloadPlanBundles(plan, pinned.deps, { invalidatePlans: [uuid(700)] });
+  eq('agreed: downloads, passing the agreed plans to the guarded download', [c2.kind, pinned.calls[0]?.invalidatePlans], ['ready', [uuid(700)]]);
+
+  const self = setup({ local: { [TA]: 'hashA-old' }, blocking: { [TA]: [{ ...holderX, planId: plan.plan_id }] } });
+  eq('the plan being saved never blocks itself', (await downloadPlanBundles(plan, self.deps)).kind, 'ready');
+
+  const moved = setup({ serve: { [TA]: 'hashA-newer' } });
+  eq('the server bundle moved on since planning: stale', await downloadPlanBundles(plan, moved.deps), { kind: 'stale', tourId: TA });
+
+  const raced = setup({ fail: { [TB]: new PinnedBundleError(TB, [holderX], 'update') } });
+  const c3 = await downloadPlanBundles(plan, raced.deps);
+  assert('a guard refusal mid-run is a conflict, not a failure', c3.kind === 'conflict' && c3.tourId === TB);
+
+  const broken = setup({ fail: { [TA]: new Error('disk full') } });
+  eq('any other error: failed, with its message', await downloadPlanBundles(plan, broken.deps), { kind: 'failed', tourId: TA, message: 'disk full' });
+
+  const gone = setup();
+  const r2 = await downloadPlanBundles(plan, gone.deps, { cancelled: () => true });
+  assert('a screen that is gone stops before the next tour', r2.kind === 'failed' && r2.message === 'cancelled' && gone.calls.length === 0);
+
+  const mismatched = setup({ local: { [TA]: 'hashA', [TB]: 'hashB' } });
+  mismatched.deps.manifest = (id) => (id === TA ? ({ ...mA, waypoints: mA.waypoints.slice(0, 2) } as WireBundle) : mB);
+  assert('pins match but the plan does not fit the bundle: invalid', (await downloadPlanBundles(plan, mismatched.deps)).kind === 'invalid');
+}
+
+{
+  heading('PlacesSession - one token per search, debounce, latest wins, dispose');
+  type Pending = { input: string; token: string; signal: AbortSignal; resolve: (r: PlacesCallResult<PlaceSuggestion[]>) => void };
+  type PendingDetails = { placeId: string; token: string; signal: AbortSignal; resolve: (r: PlacesCallResult<{ lon: number; lat: number; label: string }>) => void };
+  const make = () => {
+    let clock = 0;
+    let tokens = 0;
+    const timers = new Map<number, () => void>();
+    let nextTimer = 1;
+    const auto: Pending[] = [];
+    const details: PendingDetails[] = [];
+    const picked: string[] = [];
+    const client: PlacesClient = {
+      autocomplete: (input, token, _city, signal) => new Promise((resolve) => auto.push({ input, token, signal, resolve })),
+      details: (placeId, token, signal) => new Promise((resolve) => details.push({ placeId, token, signal, resolve })),
+    };
+    const session = new PlacesSession({
+      client, cityId: uuid(900), uuid: () => `tok-${++tokens}`, now: () => clock,
+      setTimeout: (fn) => { const id = nextTimer++; timers.set(id, fn); return id; },
+      clearTimeout: (h) => void timers.delete(h as number),
+      onSelected: (o) => picked.push(o.label),
+    });
+    const flush = () => { const fns = [...timers.values()]; timers.clear(); fns.forEach((fn) => fn()); };
+    const tick = () => new Promise((r) => setTimeout(r, 0));
+    return { session, auto, details, picked, flush, tick, timers, advance: (ms: number) => { clock += ms; } };
+  };
+  const sug = (id: string): PlaceSuggestion => ({ place_id: id, primary: id, secondary: null });
+
+  const t = make();
+  t.session.setQuery('Di');
+  assert(`below ${MIN_QUERY} characters: no timer, no request`, t.timers.size === 0 && t.session.view.status === 'idle');
+  t.session.setQuery('Diz'); t.session.setQuery('Dize'); t.session.setQuery('Dizen');
+  assert('debounced: one timer pending', t.timers.size === 1 && t.session.view.status === 'searching');
+  t.flush();
+  eq('only the last keystroke is sent', t.auto.map((a) => a.input), ['Dizen']);
+  t.session.setQuery('Dizengoff');
+  t.flush();
+  assert('a newer query aborts the older request', t.auto[0]!.signal.aborted);
+  t.auto[1]!.resolve({ ok: true, value: [sug('new')] });
+  await t.tick();
+  t.auto[0]!.resolve({ ok: true, value: [sug('old')] });
+  await t.tick();
+  eq('latest wins: the late, older answer is dropped', t.session.view.suggestions.map((s) => s.place_id), ['new']);
+  assert('every keystroke of one search shares ONE token', t.auto[0]!.token === t.auto[1]!.token && t.auto[0]!.token === 'tok-1');
+
+  const sel = t.session.select(sug('new'));
+  assert("details carries the search's token (ends the billing session)", t.details[0]!.token === 'tok-1' && t.session.view.status === 'resolving');
+  t.details[0]!.resolve({ ok: true, value: { lon: 34.77, lat: 32.07, label: 'Dizengoff Center' } });
+  await sel;
+  eq('the pick resolves to the label and reaches the screen', [t.picked, t.session.view.query, t.session.view.status], [['Dizengoff Center'], 'Dizengoff Center', 'idle']);
+  t.session.setQuery('Rothschild'); t.flush();
+  assert('the next search gets a NEW token', t.auto.at(-1)!.token === 'tok-2');
+
+  const f = make();
+  f.session.setQuery('Jaffa'); f.flush();
+  const failedSel = f.session.select(sug('x'));
+  f.details[0]!.resolve({ ok: false, code: 'upstream', retryable: true });
+  await failedSel;
+  assert('a failed pick shows an error', f.session.view.status === 'error' && f.picked.length === 0);
+  f.session.setQuery('Jaffa port'); f.flush();
+  assert('a FAILED details call still rotates the token', f.auto.at(-1)!.token === 'tok-2');
+
+  const idle = make();
+  idle.session.setQuery('Habima'); idle.flush();
+  idle.advance(SESSION_IDLE_MS + 1);
+  idle.session.setQuery('Habima Sq'); idle.flush();
+  assert('a token idle past SESSION_IDLE_MS is rotated', idle.auto[0]!.token !== idle.auto[1]!.token);
+
+  const cap = make();
+  for (let i = 0; i < MAX_REQUESTS_PER_SESSION; i++) { cap.session.setQuery(`query ${i}`); cap.flush(); }
+  cap.session.setQuery('one too many');
+  assert(`past ${MAX_REQUESTS_PER_SESSION} requests in a session: refine, no request`, cap.session.view.status === 'refine' && cap.auto.length === MAX_REQUESTS_PER_SESSION && cap.timers.size === 0);
+
+  const d = make();
+  let heard = 0;
+  d.session.subscribe(() => heard++);
+  d.session.setQuery('Carmel'); d.flush();
+  const pending = d.session.select(sug('carmel'));
+  d.session.dispose();
+  assert('dispose aborts the details request in flight', d.details[0]!.signal.aborted);
+  const before = heard;
+  d.details[0]!.resolve({ ok: true, value: { lon: 1, lat: 1, label: 'late' } });
+  await pending;
+  d.session.setQuery('after dispose');
+  assert('after dispose: no onSelected, no notifications, no timers', d.picked.length === 0 && heard === before && d.timers.size === 0);
+}
+
+{
+  heading('planForm - request, copy, rows');
+  const iso = localIsoWithOffset(new Date(2026, 9, 4, 9, 5, 7));
+  assert('local time carries the wall clock and an offset', /^2026-10-04T09:05:07[+-]\d{2}:\d{2}$/.test(iso), iso);
+  const req = buildPlanRequest({
+    cityId: uuid(900), origin: { lon: 34.7749342, lat: 32.0751211, source: 'address', label: 'Dizengoff Center' },
+    minutes: 240, transitMode: 'walking', groupType: 'couple', interests: ['history', 'culinary'], includeDeepDives: false,
+  }, new Date());
+  const checked = checkPlanRequest(req);
+  assert("the built request passes the server's own validator", checked.ok, JSON.stringify(checked));
+  assert('the origin label never leaves the phone', !JSON.stringify(req).includes('Dizengoff'));
+  throwsLike('no interests is refused, not sent', () => buildPlanRequest({ cityId: uuid(900), origin: { lon: 0, lat: 0, source: 'gps', label: '' }, minutes: 60, transitMode: 'walking', groupType: 'solo', interests: [], includeDeepDives: false }, new Date()), /interest/);
+
+  eq('durations read naturally', [formatDuration(30), formatDuration(45 * 60), formatDuration(3600), formatDuration(5400)], ['1 min', '45 min', '1 h', '1 h 30 min']);
+  eq('distances', [formatDistance(437), formatDistance(5000)], ['440 m', '5.0 km']);
+
+  const withDrops = (n: number) => parsePlanTourOk(mutate((p) => { p.quality.dropped_high_value_extensions = n; }));
+  eq('upsell: none when nothing was dropped for time', upsellCopy(withDrops(0)), null);
+  assert('upsell: singular and plural', /^1 more stop that/.test(upsellCopy(withDrops(1))!) && /^3 more stops that/.test(upsellCopy(withDrops(3))!));
+
+  const rows = segmentRows(plan, { chapterTitle: (tid) => (tid === TA ? 'Old North' : null), tourTitle: (tid) => (tid === TB ? 'Coastal Drive' : null) });
+  eq('rows alternate transfer, chapter', rows.map((r) => r.kind), ['transfer', 'chapter', 'transfer', 'chapter']);
+  eq('titles: chapter, else tour', rows.flatMap((r) => (r.kind === 'chapter' ? [r.title] : [])), ['Old North', 'Coastal Drive']);
+  assert("the first transfer is from the visitor's start", rows[0]!.kind === 'transfer' && rows[0]!.fromOrigin && rows[0]!.estimated);
+  const untitled = segmentRows(plan, { chapterTitle: () => null, tourTitle: () => null });
+  eq('no titles anywhere: numbered placeholders', untitled.flatMap((r) => (r.kind === 'chapter' ? [r.title] : [])), ['Stop group 1', 'Stop group 2']);
+
+  const est = estimateSummary(plan);
+  assert('estimated legs make the total "about"', est.approximate === (plan.quality.legs_estimated > 0));
+  const infeasible = planErrorCopy({ kind: 'error', code: 'plan_infeasible', retryable: false, detail: '', shortfallS: 1800 });
+  assert('infeasible copy names the shortfall and is not a blind retry', /30 min more/.test(infeasible.message) && !infeasible.retry);
+  assert('network copy is a retry', planErrorCopy({ kind: 'error', code: 'network', retryable: true, detail: '' }).retry);
 }
 
 console.log(`\n${checks - failures}/${checks} checks passed`);

@@ -7,6 +7,8 @@ import { usePreferences, usePreferencesBoot } from '../personalization/preferenc
 import ActiveTourScreen from '../screens/ActiveTourScreen';
 import DeleteAccountScreen from '../screens/DeleteAccountScreen';
 import DiscoveryScreen from '../screens/DiscoveryScreen';
+import PlanPreviewScreen from '../screens/PlanPreviewScreen';
+import PlanScreen from '../screens/PlanScreen';
 import OnboardingCityScreen from '../screens/onboarding/OnboardingCityScreen';
 import OnboardingGroupScreen from '../screens/onboarding/OnboardingGroupScreen';
 import OnboardingInterestsScreen from '../screens/onboarding/OnboardingInterestsScreen';
@@ -109,6 +111,8 @@ export default function RootNavigator() {
           component={TourDetailScreen}
           options={({ route }) => ({ title: route.params.title })}
         />
+        <Stack.Screen name="Plan" component={PlanScreen} options={{ title: 'Plan my day' }} />
+        <Stack.Screen name="PlanPreview" component={PlanPreviewScreen} options={{ title: 'Your plan' }} />
         <Stack.Screen name="Settings" component={SettingsScreen} options={{ title: 'Settings' }} />
         <Stack.Screen
           name="DeleteAccount"

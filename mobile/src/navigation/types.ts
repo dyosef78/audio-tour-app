@@ -26,6 +26,14 @@ export type RootStackParamList = {
   ActiveTour: { tourId: string };
   Settings: undefined;
   DeleteAccount: undefined;
+  /** Epic 16: plan a day across the city's chapters. */
+  Plan: undefined;
+  /**
+   * A plan held in the plan repository (never the plan object itself - see
+   * above). `replanned` once the screen has already re-planned a stale plan,
+   * so a busy CMS cannot trap the visitor in a re-plan loop.
+   */
+  PlanPreview: { planId: string; replanned?: boolean };
 };
 
 export type WelcomeScreenProps = NativeStackScreenProps<RootStackParamList, 'Welcome'>;
@@ -38,6 +46,8 @@ export type TourDetailScreenProps = NativeStackScreenProps<RootStackParamList, '
 export type ActiveTourScreenProps = NativeStackScreenProps<RootStackParamList, 'ActiveTour'>;
 export type SettingsScreenProps = NativeStackScreenProps<RootStackParamList, 'Settings'>;
 export type DeleteAccountScreenProps = NativeStackScreenProps<RootStackParamList, 'DeleteAccount'>;
+export type PlanScreenProps = NativeStackScreenProps<RootStackParamList, 'Plan'>;
+export type PlanPreviewScreenProps = NativeStackScreenProps<RootStackParamList, 'PlanPreview'>;
 
 /** Makes useNavigation() typed app-wide without a cast at each call site. */
 declare global {

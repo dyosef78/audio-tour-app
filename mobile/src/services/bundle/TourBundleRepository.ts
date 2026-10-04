@@ -7,6 +7,8 @@ import { DownloadManager, type DownloadItem } from './DownloadManager';
 import { tourFromManifest } from './catalogue';
 import { planBundleFiles } from './plan';
 import { parseEncodedRoute } from '../../routing/routeGeometry';
+import { PinnedBundleError } from '../planner/planRepository';
+import { savedPlans } from '../planner/planRepositoryFile';
 import {
   bundleDir,
   bundlesRoot,
@@ -42,6 +44,21 @@ import type {
 export interface DownloadOptions {
   onProgress?: (progress: BundleProgress) => void;
   concurrency?: number;
+  /**
+   * Epic 16: saved plans the visitor agreed to give up. A download that would
+   * change a tour some saved plan pins is refused (PinnedBundleError) unless
+   * EVERY blocking plan is listed here; they are deleted only once the new
+   * bundle has committed - a failed update leaves them valid.
+   */
+  invalidatePlans?: readonly string[];
+}
+
+/** Every blocking plan must be among those the visitor agreed to give up. */
+function assertNotPinned(tourId: string, toHash: string | null, agreed: readonly string[] | undefined, action: 'update' | 'remove'): string[] {
+  const blocking = savedPlans.blockingPlans(tourId, toHash);
+  const ok = new Set(agreed ?? []);
+  if (blocking.some((b) => !ok.has(b.planId))) throw new PinnedBundleError(tourId, blocking, action);
+  return blocking.map((b) => b.planId);
 }
 
 export class TourBundleRepository {
@@ -84,6 +101,10 @@ export class TourBundleRepository {
       });
       return local;
     }
+
+    // Epic 16: this download CHANGES the tour. Refused if a saved plan pins
+    // another version, unless the visitor already agreed to drop that plan.
+    const invalidated = assertNotPinned(tourId, remote.bundle_version_hash, options.invalidatePlans, 'update');
 
     // Narration, Deep Dives and transcript sidecars, de-duplicated by path
     // (TASK-603). Every file lands at its bucket path inside the bundle, which
@@ -145,6 +166,8 @@ export class TourBundleRepository {
     if (final.exists) final.delete();
     staging.rename(tourId);
 
+    // Only now: until the rename, the old bundle - and the plans built on it - still worked.
+    if (invalidated.length > 0) savedPlans.remove(invalidated);
     return remote;
   }
 
@@ -155,10 +178,16 @@ export class TourBundleRepository {
     if (staging.exists) staging.delete();
   }
 
-  /** Delete a downloaded bundle. Used by eviction and by "remove download". */
-  static remove(tourId: string): void {
+  /**
+   * Delete a downloaded bundle. Used by eviction and by "remove download".
+   * Refused (PinnedBundleError) while a saved plan pins the tour, unless the
+   * visitor agreed to give those plans up.
+   */
+  static remove(tourId: string, options: { invalidatePlans?: readonly string[] } = {}): void {
+    const invalidated = assertNotPinned(tourId, null, options.invalidatePlans, 'remove');
     const dir = bundleDir(tourId);
     if (dir.exists) dir.delete();
+    if (invalidated.length > 0) savedPlans.remove(invalidated);
   }
 
   /** Every tourId currently holding a valid bundle. */
