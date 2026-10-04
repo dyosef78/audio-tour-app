@@ -1049,6 +1049,10 @@ export type Database = {
         Returns: Json
       }
       extensions_publishable: { Args: never; Returns: boolean }
+      get_plan_chapter_state: {
+        Args: { p_chapter_ids: string[] }
+        Returns: Json
+      }
       get_planner_candidates: {
         Args: {
           p_budget_seconds: number
@@ -1061,10 +1065,6 @@ export type Database = {
           p_origin_lon: number
           p_transit_mode: string
         }
-        Returns: Json
-      }
-      get_plan_chapter_state: {
-        Args: { p_chapter_ids: string[] }
         Returns: Json
       }
       get_tour_bundle: { Args: { p_tour_id: string }; Returns: Json }
