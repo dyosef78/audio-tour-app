@@ -4,31 +4,124 @@
 -- STATUS: DRAFT - awaiting approval. NOT APPLIED to the linked project.
 -- Requires 20261005120000 (same push).
 --
+--   0. extensions_publishable()    NEW deployment gate + triggers: no published
+--                                    tour holds an extension until it opens
 --   1. get_tour_bundle             + per-waypoint `stop_role`
 --   2. cms_replace_tour_chapters   items gain plannable, entry_point, exit_point
 --   3. cms_replace_tour_waypoints  items gain stop_role, dwell_seconds,
 --                                    interest_weights
---   4. cms_validate_tour           + 5 checks (17, 19-22), incl. the PM rule:
---                                    no extension in a chapter with anchors
+--   4. cms_validate_tour           route checks 5a-5c judge CORE stops only;
+--                                    + checks 17, 19-24, incl. the PM rules: no
+--                                    extension in a chapter with anchors, a
+--                                    transition connects core to core, and
+--                                    the gate (extensions_not_enabled)
 --   5. get_planner_candidates      NEW: the plan-tour Edge Function's single
 --                                    read - feasible chapters, their stops,
 --                                    and the cached costs between them
 --
--- 1-4 are reproduced from 20261001120100 (what production runs) with additions
--- only. No signature changes: CREATE OR REPLACE keeps their grants and adds no
--- overload (PGRST203 - see 20260915120100).
+-- 1-4 are reproduced from 20261001120100 (what production runs). 1-3 only add;
+-- 4 also narrows 5a-5c (see its header). No signature changes: CREATE OR
+-- REPLACE keeps their grants and adds no overload (PGRST203 - see
+-- 20260915120100).
 --
--- DEPLOY ORDER - THE DISCOVERY RULE (PM, 2 Oct 2026)
+-- THE DISCOVERY RULE (PM, 2 Oct; TASK-604 filtering retired 4 Oct 2026)
 --
--- A catalogue session plays CORE stops only; extensions belong to planned
--- bundles. Section 1 gives the device the data (`stop_role`), but every app
--- build in the field today ignores it and plays every stop. So: no tour may
--- PUBLISH an extension until an app build that filters on stop_role is the
--- minimum supported version. Nothing in SQL can enforce that; the CMS
--- operator must.
+-- A catalogue session plays EVERY core stop, transitions included, in
+-- authored order - and nothing else. Extensions belong to planned bundles;
+-- personalisation belongs to the planner. Section 1 gives the device the data
+-- (`stop_role`), but every app build in the field today ignores it and plays
+-- every stop - which is why section 0 hard-blocks publishing an extension
+-- until that is no longer true.
 -- =============================================================================
 
 SET search_path = public, extensions;
+
+-- -----------------------------------------------------------------------------
+-- 0. The extensions deployment gate (PM, 4 Oct 2026)
+--
+-- Every app build in the field before the core-only filter plays EVERY stop of
+-- a catalogue tour, so a published extension would be narrated in Discovery.
+-- The app has no minimum-version mechanism, so "do not publish extensions
+-- yet" cannot be left to people: it is a DATA invariant here.
+--
+--   While extensions_publishable() is false, no PUBLISHED tour may hold an
+--   extension. Drafts may - editors can prepare content.
+--
+-- Enforced on every write path, not only cms_publish_tour:
+--   waypoints  a stop becoming (or inserted as) an extension on a published
+--              tour - cms_replace_tour_waypoints edits published tours
+--              without re-validating
+--   tours      a tour becoming published while it holds an extension
+-- cms_validate_tour reports the same thing first (extensions_not_enabled), so
+-- an editor sees a sentence before they see a trigger.
+--
+-- SECURITY DEFINER: the check reads rows the caller's RLS might hide. An
+-- invoker whose policies filtered the EXISTS would pass the gate silently.
+--
+-- TO OPEN THE GATE: one migration that replaces extensions_publishable() with
+-- `SELECT true`, shipped only once every build in testers' hands filters on
+-- stop_role. test-cms pins the value, so the same PR must change that check.
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.extensions_publishable()
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SET search_path = ''
+AS $fn$
+    SELECT false;
+$fn$;
+
+COMMENT ON FUNCTION public.extensions_publishable() IS
+    'Epic 16 deployment gate. false: no published tour may hold an extension (old app builds play every stop). Opened by a migration once the core-only app filter is the minimum build in use.';
+
+REVOKE ALL ON FUNCTION public.extensions_publishable() FROM PUBLIC, anon;
+-- cms_validate_tour runs as the CMS admin and calls it.
+GRANT EXECUTE ON FUNCTION public.extensions_publishable() TO authenticated, service_role;
+
+CREATE OR REPLACE FUNCTION public.assert_extensions_gate()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, extensions
+AS $fn$
+BEGIN
+    IF public.extensions_publishable() THEN
+        RETURN NEW;
+    END IF;
+
+    IF TG_TABLE_NAME = 'waypoints' THEN
+        IF EXISTS (SELECT 1 FROM public.tours t WHERE t.id = NEW.tour_id AND t.status = 'published') THEN
+            RAISE EXCEPTION 'Waypoint "%" cannot be an extension: its tour is published, and extensions are not enabled yet (extensions_publishable() is false until every app build in use plays core stops only).',
+                NEW.name
+                USING ERRCODE = '23514';
+        END IF;
+    ELSIF TG_TABLE_NAME = 'tours' THEN
+        IF EXISTS (SELECT 1 FROM public.waypoints w WHERE w.tour_id = NEW.id AND w.stop_role = 'extension') THEN
+            RAISE EXCEPTION 'Tour % cannot be published: it holds extension stops, and extensions are not enabled yet (extensions_publishable() is false until every app build in use plays core stops only).',
+                NEW.id
+                USING ERRCODE = '23514';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$fn$;
+
+COMMENT ON FUNCTION public.assert_extensions_gate() IS
+    'Epic 16: enforces extensions_publishable() - no published tour holds an extension while the gate is closed. SECURITY DEFINER so the caller''s RLS cannot hide the rows it checks.';
+
+REVOKE ALL ON FUNCTION public.assert_extensions_gate() FROM PUBLIC, anon, authenticated;
+
+CREATE TRIGGER trg_waypoints_extensions_gate
+    BEFORE INSERT OR UPDATE OF stop_role, tour_id ON public.waypoints
+    FOR EACH ROW
+    WHEN (NEW.stop_role = 'extension')
+    EXECUTE FUNCTION public.assert_extensions_gate();
+
+CREATE TRIGGER trg_tours_extensions_gate
+    BEFORE INSERT OR UPDATE OF status ON public.tours
+    FOR EACH ROW
+    WHEN (NEW.status = 'published')
+    EXECUTE FUNCTION public.assert_extensions_gate();
 
 -- -----------------------------------------------------------------------------
 -- 1. get_tour_bundle  (+ per-waypoint stop_role)
@@ -918,9 +1011,13 @@ COMMENT ON FUNCTION public.cms_replace_tour_waypoints(uuid, jsonb) IS
 
 
 -- -----------------------------------------------------------------------------
--- 4. cms_validate_tour  (+ Epic 16 checks 17, 19-22)
+-- 4. cms_validate_tour  (+ Epic 16 checks 17, 19-24; 5a-5c narrowed)
 --
--- Reproduced from 20261001120100; checks 0-16 unchanged. New (all Epic 16):
+-- Reproduced from 20261001120100. Checks 0-16 unchanged EXCEPT 5a-5c, which
+-- now judge core stops only: tours.route is what a catalogue session draws
+-- and it runs core stops only, and an extension is a detour off that route
+-- by definition (requiring the route to reach it would force editors to draw
+-- the detours into every catalogue map). New (all Epic 16):
 --
 --   17 extension_in_anchored_chapter           (error)   PM rule, 2 Oct, in
 --        EVERY transit mode: a chapter cannot have rigid external anchors and
@@ -940,6 +1037,10 @@ COMMENT ON FUNCTION public.cms_replace_tour_waypoints(uuid, jsonb) IS
 --        the first/last core stop (walking/biking), or exit far from the
 --        chapter's own handoff destination - usually a swapped lon/lat or a
 --        stale pre-fill.
+--   23 transition_adjacent_to_extension        (error)   PM, 4 Oct: a
+--        transition connects core to core.
+--   24 extensions_not_enabled                  (error)   the deployment gate
+--        (section 0), as a sentence.
 -- -----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.cms_validate_tour(p_tour_id uuid)
 RETURNS TABLE (
@@ -1021,6 +1122,8 @@ AS $fn$
     UNION ALL
 
     -- 5a. A stop the route does not reach. Tolerance by CHAPTER mode (Epic 15).
+    --     CORE stops only (Epic 16): tours.route is the route a catalogue
+    --     session draws, and an extension is by definition a detour off it.
     SELECT 'error', 'route_far_from_waypoint', w.id,
            format('Waypoint %s is %s m from the tour route (limit %s m for %s). Following the route will not reach it: re-route, or check the polyline precision.',
                   w.name, round(ST_Distance(w.geom::geography, t.route::geography)),
@@ -1030,12 +1133,13 @@ AS $fn$
     JOIN public.tour_chapters c ON c.id = w.chapter_id
     WHERE t.id = p_tour_id
       AND t.route IS NOT NULL
+      AND w.stop_role = 'core'
       AND NOT ST_DWithin(w.geom::geography, t.route::geography,
                          public.route_tolerance_meters(c.transit_mode))
 
     UNION ALL
 
-    -- 5b. Warning. Near the stop, but never inside its trigger zone.
+    -- 5b. Warning. Near the stop, but never inside its trigger zone. Core only.
     SELECT 'warning', 'route_misses_geofence', w.id,
            format('The route passes waypoint %s but never enters its geofence, so someone following the route may not trigger its narration.', w.name)
     FROM public.tours t
@@ -1044,13 +1148,16 @@ AS $fn$
     JOIN public.geofence_zones g ON g.waypoint_id = w.id
     WHERE t.id = p_tour_id
       AND t.route IS NOT NULL
+      AND w.stop_role = 'core'
       AND ST_DWithin(w.geom::geography, t.route::geography,
                      public.route_tolerance_meters(c.transit_mode))
       AND NOT ST_Intersects(t.route, g.geom)
 
     UNION ALL
 
-    -- 5c. Warning. The route meets the stops out of sort_order.
+    -- 5c. Warning. The route meets the stops out of sort_order. Core only: the
+    --     "stop before it" is the previous CORE stop, as a catalogue session
+    --     sequences them.
     SELECT 'warning', 'route_order_mismatch', o.id,
            format('Waypoint %s (sort_order %s) lies earlier along the route than the stop before it, so walking the route reaches the stops out of order.',
                   o.name, o.sort_order)
@@ -1062,6 +1169,7 @@ AS $fn$
         JOIN public.waypoints w ON w.tour_id = t.id
         WHERE t.id = p_tour_id
           AND t.route IS NOT NULL
+          AND w.stop_role = 'core'
     ) o
     WHERE o.prev_pos IS NOT NULL
       AND o.pos + 0.001 < o.prev_pos
@@ -1298,11 +1406,51 @@ AS $fn$
           AND c.plannable
     ) e
     WHERE e.limit_m IS NOT NULL
-      AND e.metres > e.limit_m;
+      AND e.metres > e.limit_m
+
+    UNION ALL
+
+    -- 23. NEW (Epic 16, PM 4 Oct). A transition connects core to core. Its
+    --     neighbours in the chapter's authored order (the stop before and the
+    --     stop after) must both be core: a catalogue session always drops an
+    --     extension, so a transition beside one narrates a walk to - or from -
+    --     a stop that is not there. A chapter's first/last transition has one
+    --     neighbour; the entry/exit side is not a stop.
+    SELECT 'error', 'transition_adjacent_to_extension', n.id,
+           format('Transition %s (sort_order %s) is next to extension %s. A transition must connect two core stops: catalogue sessions skip extensions, so its directions would lead to a stop that is not there. Move the extension, or make it core.',
+                  n.name, n.sort_order, n.neighbour)
+    FROM (
+        SELECT o.id, o.name, o.sort_order, o.poi_type,
+               CASE WHEN o.prev_role = 'extension' THEN o.prev_name
+                    WHEN o.next_role = 'extension' THEN o.next_name END AS neighbour
+        FROM (
+            SELECT w.id, w.name, w.sort_order, w.poi_type,
+                   lag(w.stop_role)  OVER ch AS prev_role,
+                   lag(w.name)       OVER ch AS prev_name,
+                   lead(w.stop_role) OVER ch AS next_role,
+                   lead(w.name)      OVER ch AS next_name
+            FROM public.waypoints w
+            WHERE w.tour_id = p_tour_id
+            WINDOW ch AS (PARTITION BY w.chapter_id ORDER BY w.sort_order)
+        ) o
+    ) n
+    WHERE n.poi_type = 'transition'
+      AND n.neighbour IS NOT NULL
+
+    UNION ALL
+
+    -- 24. NEW (Epic 16, PM 4 Oct). The deployment gate, as a sentence: the
+    --     triggers in section 0 would refuse the publish anyway.
+    SELECT 'error', 'extensions_not_enabled', w.id,
+           format('Waypoint %s is an extension, and extensions cannot be published yet: app builds in use still play every stop. Keep the tour as a draft, or make the stop core.', w.name)
+    FROM public.waypoints w
+    WHERE w.tour_id = p_tour_id
+      AND w.stop_role = 'extension'
+      AND NOT public.extensions_publishable();
 $fn$;
 
 COMMENT ON FUNCTION public.cms_validate_tour(uuid) IS
-    'Pre-flight checks for publishing. One row per problem; errors block publication, warnings do not. Covers missing narration, missing storage objects, unreachable Deep Dives, route coverage and order, orphaned transcripts, untagged tours, tours with no city, and (Epic 15) chapter order, titles, handoff destinations, routing-anchor caps and walking-pace bearing checks, and (Epic 16) core/extension and planner-eligibility checks, including no extension in a chapter with routing anchors.';
+    'Pre-flight checks for publishing. One row per problem; errors block publication, warnings do not. Covers missing narration, missing storage objects, unreachable Deep Dives, route coverage and order, orphaned transcripts, untagged tours, tours with no city, and (Epic 15) chapter order, titles, handoff destinations, routing-anchor caps and walking-pace bearing checks, and (Epic 16) core/extension and planner-eligibility checks, including no extension in a chapter with routing anchors, transitions connecting core to core, and the extensions deployment gate. Route checks judge core stops only.';
 
 -- -----------------------------------------------------------------------------
 -- 5. get_planner_candidates

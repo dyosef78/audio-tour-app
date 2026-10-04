@@ -24,10 +24,8 @@ import {
 import { telemetry } from '../services/telemetry/TelemetryService';
 import { networkMonitor } from '../services/network/NetworkMonitor';
 import { signedAudioUrls } from '../services/supabase/client';
-import { routeCriteria } from '../personalization/options';
-import { usePreferences } from '../personalization/preferencesStore';
 import { decodeRoute } from '../routing/routeGeometry';
-import { selectStops } from '../routing/stopSelection';
+import { sessionStops, type SessionStops } from '../routing/stopSelection';
 import { remoteTranscripts } from '../transcript/TranscriptRepository';
 import { EngineRunner, type EngineRunnerPorts } from './EngineRunner';
 import { decideSnapshotResume, type TourProgressSnapshot } from './progressRepository';
@@ -135,7 +133,6 @@ interface SessionMeta {
   tourId: string;
   tourTitle: string;
   activeIds: string[];
-  skippedIds: string[];
   backgroundPermission: boolean;
   notificationPermission: boolean;
   startedAt: number;
@@ -261,14 +258,16 @@ class TourSessionController {
       return;
     }
 
-    // TASK-604: onboarding preferences decide which stops this session RUNS,
-    // snapshotted here - editing preferences mid-walk reshuffles nothing.
-    const selection = selectStops(waypoints, routeCriteria(usePreferences.getState()));
-
-    // A manifest the engine cannot represent faithfully (a newer server's
-    // mode, a malformed zone) is refused, not approximated.
+    // Epic 16: a catalogue session runs every core stop in authored order and
+    // nothing else - no extensions, and no preference filtering (TASK-604 is
+    // retired: it could drop a stop while keeping the transition that leads
+    // to it). A manifest the engine cannot represent faithfully (a newer
+    // server's mode, a malformed zone, a transition marked optional) is
+    // refused, not approximated.
+    let selection: SessionStops;
     let tour: EngineTour;
     try {
+      selection = sessionStops(waypoints, { kind: 'catalogue' });
       tour = engineTourFromManifest(manifest, selection.active.map((w) => w.id));
     } catch (err) {
       return this.failStart('unexpected', err);
@@ -297,7 +296,6 @@ class TourSessionController {
       tourId,
       tourTitle,
       activeIds: selection.active.map((w) => w.id),
-      skippedIds: selection.skippedIds,
       backgroundPermission: permissions.background,
       notificationPermission: permissions.notifications,
       startedAt: Date.now(),
@@ -330,7 +328,6 @@ class TourSessionController {
       transitMode: firstChapter.transitMode,
       backgroundPermission: permissions.background,
       notificationPermission: permissions.notifications,
-      skippedWaypointIds: selection.skippedIds,
     });
     this.publishStaticRoute(tourId, selection.active, firstChapter.transitMode);
 
@@ -649,7 +646,10 @@ class TourSessionController {
       tourId: meta.tourId,
       tourTitle: meta.tourTitle,
       activeIds: meta.activeIds,
-      skippedIds: meta.skippedIds,
+      // TASK-604's preference skips, retired in Epic 16. Still written so a v2
+      // checkpoint keeps one shape (a version bump would discard walks in
+      // progress on update); never read.
+      skippedIds: [],
       backgroundPermission: meta.backgroundPermission,
       notificationPermission: meta.notificationPermission,
       startedAt: meta.startedAt,
@@ -714,6 +714,11 @@ class TourSessionController {
     if (!active.every((w): w is Waypoint => w !== undefined)) {
       return discard('the downloaded tour no longer has every stop (updated since?)');
     }
+    // Epic 16: a catalogue session never runs an extension. A saved session
+    // naming one means the bundle was updated mid-walk and a stop became
+    // optional; replaying it would narrate a detour Discovery must not play.
+    const nowExtension = active.find((w) => w.stopRole !== 'core');
+    if (nowExtension) return discard(`stop ${nowExtension.id} is now an extension (updated since?)`);
 
     let tour: EngineTour;
     try {
@@ -733,7 +738,6 @@ class TourSessionController {
       tourId: snap.tourId,
       tourTitle: snap.tourTitle,
       activeIds: snap.activeIds,
-      skippedIds: snap.skippedIds,
       backgroundPermission: snap.backgroundPermission,
       notificationPermission: snap.notificationPermission,
       startedAt: snap.startedAt,
@@ -776,7 +780,6 @@ class TourSessionController {
       transitMode: chapter.transitMode,
       backgroundPermission: snap.backgroundPermission,
       notificationPermission: snap.notificationPermission,
-      skippedWaypointIds: snap.skippedIds,
     });
     this.publishStaticRoute(snap.tourId, active, chapter.transitMode);
     if (suspended) useTourSession.getState().setPaused(true);

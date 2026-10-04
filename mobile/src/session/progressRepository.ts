@@ -24,8 +24,13 @@ export interface TourProgressSnapshot {
   v: typeof SNAPSHOT_VERSION;
   tourId: string;
   tourTitle: string;
-  /** The stops this session runs (preference selection, TASK-604). Never re-derived. */
+  /** The stops this session runs (every core stop, Epic 16). Never re-derived. */
   activeIds: string[];
+  /**
+   * TASK-604's preference skips. Retired in Epic 16: written as [] and never
+   * read, kept so v2 checkpoints keep one shape - bumping the version would
+   * discard every walk in progress when the app updates.
+   */
   skippedIds: string[];
   backgroundPermission: boolean;
   notificationPermission: boolean;

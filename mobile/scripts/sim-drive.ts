@@ -19,6 +19,9 @@
  *     park; the listener starts chapter 2 by hand -> APPLY_TRANSIT_MODE walking
  *   Chapter 2 - WALK
  *     w1, w2, w3                                  -> each narrates
+ *     wx  an EXTENSION on the path (Epic 16)      -> never armed: a catalogue
+ *                                                    session runs core only
+ *     wt  a transition between w2 and w3          -> narrates (always core)
  *     sit 16 minutes                              -> idle timeout, tracking off
  *     tap Resume                                  -> tracking on
  *
@@ -26,6 +29,7 @@
  */
 
 import { engineTourFromManifest } from '../src/engine/fromManifest.ts';
+import { sessionStops } from '../src/routing/stopSelection.ts';
 import { createEngineState, freshProgress, missedStops } from '../src/engine/reduce.ts';
 import { EARTH_RADIUS_M } from '../src/engine/geo/sweep.ts';
 import type { Effect, GpsFix } from '../src/engine/types.ts';
@@ -64,11 +68,13 @@ function stop(
   radius: number,
   seconds: number,
   approach: WireWaypoint['approach'] = null,
+  kind: { poi_type?: string; stop_role?: string } = {},
 ): WireWaypoint {
   return {
     waypoint_id: id,
     name: id,
-    poi_type: 'anchor',
+    poi_type: kind.poi_type ?? 'anchor',
+    ...(kind.stop_role ? { stop_role: kind.stop_role } : {}),
     sort_order: sort,
     coordinates: lonLat(east, north),
     geofence: { type: 'radius', radius_meters: radius, center: lonLat(east, north) },
@@ -101,8 +107,12 @@ const manifest: WireBundle = {
     stop('h9', 9, 'drive', 19_500, 0, 150, 60),
     stop('h10', 10, 'drive', 21_000, 0, 150, 45),
     stop('w1', 11, 'walk', 22_000, 120, 25, 40),
-    stop('w2', 12, 'walk', 22_000, 320, 25, 40),
-    stop('w3', 13, 'walk', 22_250, 320, 25, 40),
+    // Epic 16: squarely on the walk from w1 to w2. A catalogue session must
+    // walk straight through its zone in silence.
+    stop('wx', 12, 'walk', 22_000, 220, 25, 40, null, { stop_role: 'extension' }),
+    stop('w2', 13, 'walk', 22_000, 320, 25, 40),
+    stop('wt', 14, 'walk', 22_125, 320, 25, 15, null, { poi_type: 'transition' }),
+    stop('w3', 15, 'walk', 22_250, 320, 25, 40),
   ],
 };
 
@@ -212,18 +222,21 @@ const repo = createProgressRepository(io);
 // Wiring - as TourSessionController does it
 // -----------------------------------------------------------------------------
 
-const allIds = manifest.waypoints.map((w) => w.waypoint_id);
-const tour = engineTourFromManifest(manifest, allIds);
 const domain = new Map<string, Waypoint>(
   manifest.waypoints.map((w) => [
     w.waypoint_id,
     {
-      id: w.waypoint_id, tourId: TOUR, name: w.name, poiType: 'anchor', sortOrder: w.sort_order,
+      id: w.waypoint_id, tourId: TOUR, name: w.name, poiType: w.poi_type as Waypoint['poiType'], sortOrder: w.sort_order,
       coordinate: { latitude: w.coordinates[1], longitude: w.coordinates[0] }, geofence: null,
       audio: { id: `${w.waypoint_id}:audio`, waypointId: w.waypoint_id, storagePath: `sim/${w.waypoint_id}.m4a`, audioTrackId: null, durationSeconds: w.media?.duration_seconds ?? null, format: 'm4a', sizeBytes: 1 },
+      stopRole: w.stop_role === 'extension' ? 'extension' : 'core',
     },
   ]),
 );
+// Epic 16: the catalogue session's stops, exactly as doStart chooses them.
+const selection = sessionStops([...domain.values()], { kind: 'catalogue' });
+const allIds = selection.active.map((w) => w.id);
+const tour = engineTourFromManifest(manifest, allIds);
 
 let writes = 0;
 let trackingOn = true;
@@ -388,6 +401,14 @@ assert(
 );
 assert('chapter 2 by hand -> transit mode switched to walking', transitModes.join() === 'walking');
 assert('w1, w2, w3 heard on foot', ['w1', 'w2', 'w3'].every((id) => played.includes(id)));
+assert(
+  'wx: an extension on the walking path is never armed and never fires (catalogue = core only)',
+  selection.excludedIds.join() === 'wx' && !tour.stops.some((s) => s.id === 'wx') && !fired.includes('wx')
+    && !telemetry.some((t) => 'stopId' in t && t.stopId === 'wx'),
+);
+assert('wt: the transition between two core stops narrates', played.includes('wt'));
+assert('walk window renumbered without the extension: w1 w2 wt w3 = 0 1 2 3',
+  tour.stops.filter((s) => s.chapterId === 'walk').map((s) => `${s.id}:${s.index}`).join() === 'w1:0,w2:1,wt:2,w3:3');
 assert('16 min sitting -> suspended once, resumed on tap', kinds('tour_suspended').length === 1 && kinds('tour_resumed').length === 1);
 assert('never two narrations at once', maxConcurrent === 1, `max ${maxConcurrent}`);
 assert('drive recap lists the stops not heard', missedStops(state, 'drive').map((s) => s.id).join() === 'h2,h4,h5,h6,h7,h8');

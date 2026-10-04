@@ -130,6 +130,11 @@ export interface ChapterSegment {
   /**
    * Core stops + kept extensions, in authored sort_order. The device arms
    * exactly these and nothing else from this chapter.
+   *
+   * ALWAYS every core stop of the chapter, transitions included (PM, 4 Oct
+   * 2026: core means core). The planner chooses chapters and extensions; it
+   * never drops a core stop. A device holding the bundle refuses a plan whose
+   * chapter omits one (plan_stale), exactly as a catalogue session runs them all.
    */
   waypoint_ids: readonly string[];
   /** Subset of waypoint_ids: the extensions the planner kept. */

@@ -20,7 +20,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 
 import { CmsIngestError } from '../cms/errors.ts';
 import { PROFILE_FOR_TRANSIT_MODE } from '../../shared/src/routing/valhalla.ts';
-import { GROUP_TYPE_IDS, INTEREST_IDS } from '../../shared/src/vocabulary.ts';
+import { GROUP_TYPE_IDS, INTEREST_IDS, STOP_ROLES } from '../../shared/src/vocabulary.ts';
 import { buildAudioStoragePath, transcriptPathFor } from '../cms/storage-path.ts';
 import { MAX_TRANSCRIPT_BYTES, checkTranscript } from '../cms/transcript-ingest.ts';
 import {
@@ -249,6 +249,23 @@ assert(
   "Epic 16: tour-level hash expression is Epic 15's, unchanged",
   normalisedChapters.includes(chaptersOuter) && normalisedPlanning.includes(chaptersOuter),
 );
+eq(
+  'Epic 16: waypoints_stop_role_check == shared STOP_ROLES',
+  /CHECK \(stop_role IN \(([^)]*)\)\)/.exec(read('20261005120000_epic16_planning_schema.sql'))?.[1]?.match(/'(\w+)'/g)?.map((v) => v.slice(1, -1)),
+  [...STOP_ROLES],
+);
+// THE DEPLOYMENT GATE. Opening it is a deliberate act: a migration that makes
+// extensions_publishable() true, shipped only once every app build in use
+// plays core stops only - and this assertion changes in the same PR.
+{
+  const definitions = readdirSync(MIGRATIONS)
+    .filter((f) => f.endsWith('.sql'))
+    .sort()
+    .map((f) => read(f).replace(/--[^\n]*/g, ''))
+    .flatMap((sql) => [...sql.matchAll(/FUNCTION public\.extensions_publishable\(\)[\s\S]*?\$fn\$\s*SELECT (true|false);/g)].map((m) => m[1]));
+  assert('Epic 16: extensions_publishable() is defined', definitions.length > 0);
+  eq('Epic 16: the extensions gate is CLOSED (latest definition)', definitions.at(-1), 'false');
+}
 assert(
   'Epic 16: the stop_role column defaults to the value the hash treats as plain',
   /stop_role text NOT NULL DEFAULT 'core'/.test(read('20261005120000_epic16_planning_schema.sql')),

@@ -1,49 +1,51 @@
-import type { RouteCriteria } from '../personalization/options';
 import type { Waypoint } from '../types/domain';
 
 /**
- * Which stops a session runs, from the onboarding preferences (TASK-604).
+ * Which stops a session runs (Epic 16). Replaces TASK-604's selectStops.
  *
- * Pure. The rule, per stop:
- *   audiences empty OR includes the group type
- *   AND interests empty OR shares at least one interest
- * Empty tags mean "not restricted" (TASK-603), so an untagged catalogue - every
- * tour in production today - filters nothing.
+ * Pure. A CATALOGUE session - a tour started from Discovery - runs every core
+ * stop, transitions included, in authored sort_order, and nothing else
+ * (PM, 2 + 4 Oct 2026):
  *
- * Skipped stops leave the SESSION, not just the map: the geofence engine never
- * sees them, so a hidden stop cannot start narrating as someone walks past it
- * along the route. The time budget is not applied per stop; it selects tours.
+ *   * Extensions never run here. They exist for planner bundles, and the
+ *     narrative is authored so that core stands alone without them
+ *     (cms_validate_tour: a transition connects core to core).
+ *   * Onboarding preferences no longer remove stops. TASK-604 filtered by tag,
+ *     which could drop a core stop while keeping the transition that walks you
+ *     to it. Core means core; personalisation is the planner's job.
+ *
+ * A planned session will add a `{ kind: 'plan' }` mode here, so the engine
+ * keeps one entry point for "which stops run".
  */
 
-export interface StopSelection {
+export type SessionMode = { kind: 'catalogue' };
+
+export interface SessionStops {
+  /** The stops this session runs, in authored sort_order. */
   active: Waypoint[];
-  skippedIds: string[];
-  /** True only when at least one stop was actually removed. */
-  filtered: boolean;
+  /** Extensions present in the bundle that this session never arms. Not "skipped": never part of it. */
+  excludedIds: string[];
 }
 
-/** Below this the preference is ignored rather than the tour. */
-export const MIN_ACTIVE_STOPS = 2;
+/**
+ * @throws RangeError on a bundle that breaks a server invariant - a
+ *   transition marked as an extension (waypoints_transition_is_core_check), or
+ *   no core stop at all. The caller refuses to start; running a tour that is
+ *   not the authored one is worse than not running it.
+ */
+export function sessionStops(waypoints: readonly Waypoint[], mode: SessionMode): SessionStops {
+  const sorted = [...waypoints].sort((a, b) => a.sortOrder - b.sortOrder);
 
-export function stopMatches(stop: Waypoint, criteria: RouteCriteria): boolean {
-  const audiences = stop.audiences ?? [];
-  const interests = stop.interests ?? [];
-  const audienceOk = audiences.length === 0 || audiences.includes(criteria.groupType);
-  const interestOk = interests.length === 0 || interests.some((i) => criteria.interests.includes(i));
-  return audienceOk && interestOk;
-}
+  const optionalTransition = sorted.find((w) => w.poiType === 'transition' && w.stopRole === 'extension');
+  if (optionalTransition) {
+    throw new RangeError(`transition ${optionalTransition.id} is marked as an extension; transitions are always core`);
+  }
 
-export function selectStops(waypoints: readonly Waypoint[], criteria: RouteCriteria | null): StopSelection {
-  const everything: StopSelection = { active: [...waypoints], skippedIds: [], filtered: false };
-  if (criteria === null) return everything;
-
-  const active = waypoints.filter((w) => stopMatches(w, criteria));
-  if (active.length === waypoints.length) return everything;
-
-  // A tour narrowed to one stop, or none, is not a tour. Better to run it whole
-  // than to hand someone an empty map.
-  if (active.length < MIN_ACTIVE_STOPS) return everything;
-
-  const kept = new Set(active.map((w) => w.id));
-  return { active, skippedIds: waypoints.filter((w) => !kept.has(w.id)).map((w) => w.id), filtered: true };
+  switch (mode.kind) {
+    case 'catalogue': {
+      const active = sorted.filter((w) => w.stopRole === 'core');
+      if (active.length === 0) throw new RangeError('the tour has no core stops');
+      return { active, excludedIds: sorted.filter((w) => w.stopRole !== 'core').map((w) => w.id) };
+    }
+  }
 }

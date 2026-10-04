@@ -16,3 +16,11 @@ export const INTEREST_IDS = ['history', 'culinary', 'nature', 'architecture', 'a
 
 export type GroupType = (typeof GROUP_TYPE_IDS)[number];
 export type Interest = (typeof INTEREST_IDS)[number];
+
+/**
+ * Epic 16: a waypoint's role (waypoints_stop_role_check). A catalogue session
+ * plays every 'core' stop and nothing else; 'extension' stops exist only in
+ * planned bundles. A manifest saved before Epic 16 has no role: read as core.
+ */
+export const STOP_ROLES = ['core', 'extension'] as const;
+export type StopRole = (typeof STOP_ROLES)[number];

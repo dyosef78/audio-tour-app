@@ -50,7 +50,6 @@ export default function ActiveTourScreen({ route, navigation }: ActiveTourScreen
   const completed = useTourSession((s) => s.completionPrompted);
   // `mapRoute`, not `route`: that name is the navigation prop above.
   const mapRoute = useTourSession((s) => s.route);
-  const skippedCount = useTourSession((s) => s.skippedWaypointIds.length);
 
   // Requests a start; a no-op if this tour is already running. Safe under
   // StrictMode's mount/unmount/remount precisely because it is idempotent.
@@ -147,9 +146,6 @@ export default function ActiveTourScreen({ route, navigation }: ActiveTourScreen
               tell "live route" from "offline route" without reading logs. */}
           <Text style={styles.cardMeta}>
             {ROUTE_LABEL[mapRoute.source]}
-            {skippedCount > 0
-              ? ` · ${skippedCount} stop${skippedCount === 1 ? '' : 's'} hidden by your preferences`
-              : ''}
           </Text>
         </View>
 

@@ -1045,6 +1045,7 @@ export type Database = {
         }
         Returns: Json
       }
+      extensions_publishable: { Args: never; Returns: boolean }
       get_planner_candidates: {
         Args: {
           p_budget_seconds: number

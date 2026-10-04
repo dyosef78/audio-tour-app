@@ -264,6 +264,8 @@ export class TourBundleRepository {
       // Absent in pre-TASK-603 manifests, which parse as untagged.
       audiences: parseGroupTypes(w.audiences),
       interests: parseInterests(w.interests),
+      // isWireBundle refused any other value; absent = a pre-Epic-16 manifest.
+      stopRole: w.stop_role === 'extension' ? 'extension' : 'core',
     };
   }
 

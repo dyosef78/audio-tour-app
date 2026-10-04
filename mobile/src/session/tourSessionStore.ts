@@ -27,13 +27,11 @@ export interface TourSessionState {
   tourTitle: string | null;
   transitMode: TransitMode | null;
   /**
-   * The stops this session RUNS - after onboarding filtering (TASK-604) - in
+   * The stops this session RUNS - every core stop (Epic 16) - in
    * the order they narrate: authored order, until a live route supplies its
    * own (TASK-902, setStopOrder).
    */
   waypoints: Waypoint[];
-  /** Stops removed by the preferences: no pin, no geofence. */
-  skippedWaypointIds: string[];
   /** What the map draws, maintained by RouteManager as connectivity changes. */
   route: RouteDisplay;
 
@@ -98,7 +96,6 @@ export interface TourSessionActions {
     transitMode: TransitMode;
     backgroundPermission: boolean;
     notificationPermission?: boolean;
-    skippedWaypointIds?: string[];
   }) => void;
   setRoute: (route: RouteDisplay) => void;
   sessionFailed: (message: string) => void;
@@ -149,7 +146,6 @@ const initial: TourSessionState = {
   tourTitle: null,
   transitMode: null,
   waypoints: [],
-  skippedWaypointIds: [],
   route: { source: 'straight', points: null },
   currentFix: null,
   accuracyMeters: null,
@@ -176,8 +172,8 @@ export const useTourSession = create<TourSessionState & TourSessionActions>((set
   beginStart: (tourId, tourTitle) =>
     set({ ...initial, status: 'starting', tourId, tourTitle }),
 
-  sessionStarted: ({ waypoints, transitMode, backgroundPermission, notificationPermission = true, skippedWaypointIds = [] }) =>
-    set({ status: 'active', waypoints, transitMode, backgroundPermission, notificationPermission, skippedWaypointIds, error: null }),
+  sessionStarted: ({ waypoints, transitMode, backgroundPermission, notificationPermission = true }) =>
+    set({ status: 'active', waypoints, transitMode, backgroundPermission, notificationPermission, error: null }),
 
   setRoute: (route) => set({ route }),
 

@@ -399,6 +399,7 @@ function fixtures(): { track: AudioTrack; waypoint: Waypoint } {
     sortOrder: 1,
     geofence: null,
     audio: track,
+    stopRole: 'core',
   };
   return { track, waypoint };
 }

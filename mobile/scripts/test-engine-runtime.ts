@@ -375,7 +375,7 @@ function fakePlayer() {
   };
 }
 const track = (id: string): AudioTrack => ({ id, waypointId: id, storagePath: `p/${id}.m4a`, audioTrackId: null, durationSeconds: 60, format: 'm4a', sizeBytes: 1 });
-const waypointOf = (id: string): Waypoint => ({ id, tourId: TOUR, name: id, poiType: 'anchor', coordinate: { latitude: 0, longitude: 0 }, sortOrder: 0, geofence: null, audio: null });
+const waypointOf = (id: string): Waypoint => ({ id, tourId: TOUR, name: id, poiType: 'anchor', coordinate: { latitude: 0, longitude: 0 }, sortOrder: 0, geofence: null, audio: null, stopRole: 'core' });
 function actorHarness(source?: (stopId: string) => Promise<{ track: AudioTrack; uri: string; waypoint: Waypoint } | null>) {
   const p = fakePlayer();
   const events: AudioEngineEvent[] = [];

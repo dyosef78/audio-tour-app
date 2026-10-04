@@ -38,7 +38,7 @@ import { contrastRatio, INTEREST_TINTS } from '../src/ui/interestTints.ts';
 import { colors } from '../src/ui/theme.ts';
 import { planBundleFiles } from '../src/services/bundle/plan.ts';
 import { tourFromManifest } from '../src/services/bundle/catalogue.ts';
-import type { WireBundle } from '../src/services/bundle/types.ts';
+import { isWireBundle, type WireBundle } from '../src/services/bundle/types.ts';
 import { transcriptPathFor } from '../src/transcript/sidecar.ts';
 import { migratePreferences, usePreferences, usePreferencesBoot } from '../src/personalization/preferencesStore.ts';
 import { AudioService, type PlaybackError } from '../src/services/audio/AudioService.ts';
@@ -56,7 +56,7 @@ import {
   type RouteDisplay,
 } from '../src/routing/routeDecision.ts';
 import { decodeRoute, parseEncodedRoute } from '../src/routing/routeGeometry.ts';
-import { selectStops } from '../src/routing/stopSelection.ts';
+import { sessionStops } from '../src/routing/stopSelection.ts';
 import {
   adoptableStopOrder,
   deviceLocalTime,
@@ -333,7 +333,9 @@ heading('TASK-1103: the wizard produces the route-stops contract');
   store.setTimeBudget(contract.wizard.time_budget);
   store.completeOnboarding();
 
-  // The same two calls TourSessionController.start() makes.
+  // The route-stops wire contract (TASK-1103). Since Epic 15 a session makes no
+  // route-stops call, and since Epic 16 a catalogue session runs every core
+  // stop - so the request names them all.
   const criteria = routeCriteria(usePreferences.getState());
   const preferences = routePreferencesOf(criteria);
   const stops: Waypoint[] = contract.stops.map((s) => ({
@@ -347,10 +349,11 @@ heading('TASK-1103: the wizard produces the route-stops contract');
     audio: null,
     audiences: s.audiences,
     interests: s.interests,
+    stopRole: 'core',
   }));
   const body = routeRequestBody({
     tourId: contract.request.tour_id,
-    waypointIds: selectStops(stops, criteria).active.map((w) => w.id),
+    waypointIds: sessionStops(stops, { kind: 'catalogue' }).active.map((w) => w.id),
     transitMode: 'walking',
     localTime: formatLocalTime(Date.parse(contract.request.context.local_time), 180),
     preferences,
@@ -465,6 +468,7 @@ function waypoint(id: string, sortOrder: number): Waypoint {
     sortOrder,
     geofence: null,
     audio: null,
+    stopRole: 'core',
   };
 }
 
@@ -631,14 +635,14 @@ eq('no audio extension, no sidecar (never the file itself)', transcriptPathFor('
 // TASK-604: which stops run, which route is drawn, and what the network does
 // -----------------------------------------------------------------------------
 
-heading('selectStops');
+heading('sessionStops (Epic 16: catalogue = every core stop)');
 
 const stopAt = (
   id: string,
   sort: number,
   lat: number,
   lng: number,
-  tags: Partial<Pick<Waypoint, 'audiences' | 'interests'>> = {},
+  tags: Partial<Pick<Waypoint, 'audiences' | 'interests' | 'stopRole' | 'poiType'>> = {},
 ): Waypoint => ({
   id,
   tourId: 'jlm',
@@ -648,6 +652,7 @@ const stopAt = (
   sortOrder: sort,
   geofence: null,
   audio: null,
+  stopRole: 'core',
   ...tags,
 });
 
@@ -659,26 +664,40 @@ const WALL = stopAt('wall', 4, 31.7767, 35.2344); // untagged: never filtered ou
 const ALL_STOPS = [JAFFA, DAVID, CARDO, WALL];
 const HISTORY_COUPLE = { groupType: 'couple' as const, interests: ['history' as const], maxMinutes: 60 };
 
-const selection = selectStops(ALL_STOPS, HISTORY_COUPLE);
-eq('keeps matching and untagged stops, in order', selection.active.map((s) => s.id), ['jaffa', 'wall']);
-eq('reports the skipped stops', selection.skippedIds, ['david', 'cardo']);
-eq('marks the session as filtered', selection.filtered, true);
-eq('no preferences: nothing filtered', selectStops(ALL_STOPS, null).filtered, false);
+const catalogue = { kind: 'catalogue' } as const;
+const ext = (s: Waypoint): Waypoint => ({ ...s, stopRole: 'extension' });
+const T_A = stopAt('a', 1, 0, 0, { interests: ['history'] });
+const T_T = stopAt('t', 2, 0, 0, { poiType: 'transition' });
+const T_B = stopAt('b', 3, 0, 0, { interests: ['culinary'] });
+const T_E = ext(stopAt('e', 4, 0, 0, { interests: ['nature'] }));
+const T_C = stopAt('c', 5, 0, 0);
+
+const cat = sessionStops([T_C, T_E, T_B, T_T, T_A], catalogue);
+eq('every core stop, transitions included, in authored order (input order ignored)', cat.active.map((s) => s.id), ['a', 't', 'b', 'c']);
+eq('the extension is excluded, and reported as excluded', cat.excludedIds, ['e']);
+eq('an all-core tour runs whole', sessionStops(ALL_STOPS, catalogue).active.map((s) => s.id), ['jaffa', 'david', 'cardo', 'wall']);
 eq(
-  'every stop matches: not "filtered", so no live route is ever requested',
-  selectStops(ALL_STOPS, { ...HISTORY_COUPLE, interests: ['history', 'architecture', 'culinary'] }).filtered,
-  false,
+  'preferences no longer remove stops: tags are ignored by the session (TASK-604 retired)',
+  sessionStops([stopAt('bar', 1, 0, 0, { audiences: ['couple'] }), stopAt('zoo', 2, 0, 0, { audiences: ['family_kids'], interests: ['nature'] })], catalogue).active.length,
+  2,
 );
-const oneLeft = selectStops([JAFFA, DAVID, CARDO], { ...HISTORY_COUPLE, interests: ['culinary'] });
-eq('fewer than 2 stops would remain: the whole tour runs instead', [oneLeft.active.length, oneLeft.filtered], [3, false]);
-eq(
-  'audience tags filter too',
-  selectStops(
-    [stopAt('bar', 1, 0, 0, { audiences: ['couple'] }), stopAt('park', 2, 0, 0), stopAt('zoo', 3, 0, 0, { audiences: ['family_kids'] })],
-    { groupType: 'family_kids', interests: ['nature'], maxMinutes: 60 },
-  ).skippedIds,
-  ['bar'],
-);
+let threw = '';
+try { sessionStops([T_A, ext(T_T), T_B], catalogue); } catch (e) { threw = e instanceof RangeError ? e.message : `not a RangeError: ${String(e)}`; }
+assert('a transition marked as an extension is refused (server invariant broken)', /transition t is marked as an extension/.test(threw), threw);
+threw = '';
+try { sessionStops([ext(T_A), ext(T_B)], catalogue); } catch (e) { threw = e instanceof RangeError ? e.message : String(e); }
+assert('a tour with no core stop is refused, never run empty', /no core stops/.test(threw), threw);
+
+heading('isWireBundle: stop_role (Epic 16)');
+
+const wireWith = (role: unknown): unknown => ({
+  bundle_version_hash: 'h',
+  tour_metadata: { tour_id: 't' },
+  waypoints: [{ waypoint_id: 'w', coordinates: [34.78, 32.08], ...(role === undefined ? {} : { stop_role: role }) }],
+});
+assert('no stop_role (a pre-Epic-16 manifest) is accepted', isWireBundle(wireWith(undefined)));
+assert("'core' and 'extension' are accepted", isWireBundle(wireWith('core')) && isWireBundle(wireWith('extension')));
+assert("an unknown role (a newer server's) is refused, never read as core", !isWireBundle(wireWith('bonus')) && !isWireBundle(wireWith(1)));
 
 heading('connectivityOf');
 

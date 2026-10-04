@@ -11,6 +11,8 @@
  * must still parse.
  */
 
+import { STOP_ROLES } from '../../../../shared/src/vocabulary.ts';
+
 /** [longitude, latitude] - GeoJSON axis order, as the manifest spec defines. */
 export type LonLat = [number, number];
 
@@ -63,6 +65,8 @@ export interface WireWaypoint {
   chapter_id?: string;
   /** Direction-of-travel check (Epic 15). null = no check; absent before 20261001120100. */
   approach?: WireApproach | null;
+  /** 'core' | 'extension' (Epic 16). Absent before 20261005120100: core. Checked by isWireBundle. */
+  stop_role?: string;
 }
 
 /** Epic 15. Present only when the waypoint's bearing_policy is not 'ignore'. */
@@ -158,7 +162,10 @@ export function isWireBundle(value: unknown): value is WireBundle {
       typeof w?.waypoint_id === 'string' &&
       Array.isArray(w?.coordinates) &&
       w.coordinates.length === 2 &&
-      w.coordinates.every((n) => typeof n === 'number' && Number.isFinite(n)),
+      w.coordinates.every((n) => typeof n === 'number' && Number.isFinite(n)) &&
+      // Epic 16. A role this build does not know is a newer server's: refused,
+      // never guessed - reading it as core could narrate an extension.
+      (w.stop_role === undefined || (STOP_ROLES as readonly string[]).includes(w.stop_role)),
   );
   if (!waypointsOk) return false;
 

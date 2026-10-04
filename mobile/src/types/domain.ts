@@ -15,6 +15,7 @@
  */
 
 import type { PolylinePrecision } from '../../../shared/src/polyline';
+import type { StopRole } from '../../../shared/src/vocabulary';
 import type { GroupType, Interest } from '../personalization/options';
 
 /** Longitude/latitude in WGS84 (SRID 4326), matching raw GPS fixes. */
@@ -120,9 +121,15 @@ export interface Waypoint {
    * exit from stopping it (the exit only stops `<waypoint_id>:audio`).
    */
   deepDive?: AudioTrack | null;
-  /** Preference tags for route filtering (TASK-603). Empty = not restricted. */
+  /** Preference tags (TASK-603). Empty = not restricted. Read by the planner, not the session (Epic 16). */
   audiences?: readonly GroupType[];
   interests?: readonly Interest[];
+  /**
+   * Epic 16. A catalogue session runs core stops only (routing/stopSelection.ts).
+   * Required, not optional: every place that builds a Waypoint must decide.
+   * A manifest saved before Epic 16 has no role and reads as 'core'.
+   */
+  stopRole: StopRole;
 }
 
 /**

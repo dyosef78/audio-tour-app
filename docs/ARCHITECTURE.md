@@ -60,13 +60,15 @@ Onboarding asks three questions: **group type** (`solo`, `couple`, `friends`,
 `full_day` 480). These ids are also the database tag vocabulary. Culinary is
 one tag: street food, markets and fine dining are how the screen presents it,
 not separate ids (PM, Epic 11). Before them, the app picks the **city**, which
-scopes Discovery (§4). The preferences personalise a tour in three layers:
+scopes Discovery (§4). In a catalogue (Discovery) session the preferences
+only choose the tour; they never change which stops run or their order:
 
 | Layer | Where | Effect |
 |---|---|---|
 | **Tour fit** | Device | Discovery lists tours that fit the time budget first. |
-| **Stop selection** | Device, offline | Stops whose audience/interest tags do not match are dropped from the session: no pin, no geofence. Untagged stops always stay. A tour is never narrowed below 2 stops. |
-| **Visiting order** | Server Smart Sorter; device predicts it offline | The order the stops are walked and narrated, scored from preferences and the visitor's local time of day. |
+| **Stop selection** | Device, offline (`routing/stopSelection.ts`, `sessionStops`) | **Every core stop, transitions included, and nothing else** (Epic 16, PM 2 + 4 Oct 2026). Extension stops run only in planner bundles. TASK-604's tag filtering is retired: it could drop a stop while keeping the transition that walks you to it. |
+| **Visiting order** | Device engine | Authored `sort_order`, per chapter. Since Epic 15 a session makes no `route-stops` call, so the Smart Sorter order below does not apply to sessions. |
+| **Personalised stops** | Server, `plan-tour` (Epic 16, in progress) | Chooses chapters and extensions from interests, mode and time budget. |
 
 ### 1.3 Hands-free background audio
 
