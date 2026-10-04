@@ -10,7 +10,7 @@
  * from elsewhere - a database export, a support ticket, another log - could
  * hash them and join them to our lines. With a secret key they cannot; only
  * someone holding LOG_PSEUDONYM_KEY can turn an id into its ref. (Same reasoning
- * as the rate limiter's IP buckets, route-stops/rateLimit.ts.)
+ * as the rate limiter's IP buckets, _shared/rateLimit.ts.)
  *
  * A dedicated key rather than the service role key: support needs the key to
  * look a user up, and must not need the service role to do it. Rotating it

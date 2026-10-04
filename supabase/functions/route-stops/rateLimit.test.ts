@@ -19,7 +19,7 @@ import {
   type BucketOutcome,
   type BucketRequest,
   type BucketStore,
-} from './rateLimit.ts';
+} from '../_shared/rateLimit.ts';
 import { RouteMemoryCache } from './routeCache.ts';
 
 const TOUR = 'aaaaaaaa-0000-4000-8000-000000000001';

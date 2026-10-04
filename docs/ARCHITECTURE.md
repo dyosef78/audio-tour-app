@@ -445,6 +445,39 @@ This runs before the body is read or the database is asked:
 
 ---
 
+### 3.5 `plan-tour` Edge Function & the planner (Epic 16)
+
+`POST /functions/v1/plan-tour` turns a visitor's constraints into a bundle of
+whole chapters (contract: `shared/src/contracts/planTour.ts`). The planner is
+pure TypeScript in `shared/src/planner/`; the function only wires it to the
+database. **The request path never calls Valhalla.**
+
+1. One read, `get_planner_candidates` (service role): plannable chapters of
+   published tours, pruned only by provable reasons, plus cached costs.
+2. **Cost book:** each cost is a cached Valhalla value whose `coords_key` still
+   matches, an explicit *unroutable*, or an **estimate** (straight line × 1.4 at
+   a realistic speed), flagged in `quality.legs_estimated`.
+3. **Inside a chapter:** core stops are fixed, so the extensions between two of
+   them form an independent *slot*. An exact DP over (last kept stop, value)
+   per slot, combined across slots, gives each chapter a curve "value → least
+   time". Ties: **less detour time first**, then fewer estimated legs, then
+   earlier stops (PM, 4 Oct 2026).
+4. **Which chapters:** depth-first branch-and-bound from the origin, folding
+   each chapter's curve into an exact multiple-choice knapsack; plans fill at
+   most 90 % of the budget. Capped at 5,000 nodes, deterministically
+   (`quality.search_truncated`).
+5. **Idempotent:** `request_hash` (rounded origin, preferences, user, planner
+   version, and a hash of the candidates answer) is UNIQUE on `tour_plans`; the
+   write is an upsert, so retries and double taps return one `plan_id`.
+6. **Enrichment, strictly bounded:** after the response, at most **5** missing
+   cells in **one** Valhalla `/route` request (its legs are the cells), behind a
+   global token bucket (5/min). Never a sweep (PM, 4 Oct 2026).
+
+`GET ?plan_id=` re-derives `content_hash` from current bundle hashes and
+chapter endpoints (`get_plan_chapter_state`): any change is `409 plan_stale`.
+`backend/scripts/test-planner.ts` checks the DP and the search against brute
+force on seeded random instances.
+
 ## 4. Mobile client
 
 React Native + Expo SDK 57, Zustand stores. **Screens observe, they never
@@ -826,7 +859,8 @@ good practice rather than an App Store rejection risk on its own.
 | Area | Path |
 |---|---|
 | Migrations & seeds | `supabase/migrations/`, `supabase/seed.sql`, `prod_test_seed.sql` |
-| Edge Functions | `supabase/functions/route-stops/` (`handler.ts` contract, `legCache.ts`, `routeCache.ts`, `rateLimit.ts`); `supabase/functions/delete-account/` (`handler.ts` contract, `appleRevoke.ts`, `googleRevoke.ts`) |
+| Edge Functions | `supabase/functions/plan-tour/` (`handler.ts` contract, `index.ts` wiring); `supabase/functions/route-stops/` (`handler.ts` contract, `legCache.ts`, `routeCache.ts`); `supabase/functions/delete-account/` (`handler.ts` contract, `appleRevoke.ts`, `googleRevoke.ts`); `supabase/functions/_shared/` (`rateLimit.ts`, `logger.ts`) |
+| Planner | `shared/src/planner/` (pure: `costBook.ts`, `chapterOptions.ts`, `sequence.ts`, `plan.ts`); contract `shared/src/contracts/planTour.ts` |
 | Shared (Deno + Node + Metro) | `shared/src/` (`smartSorter.ts`, `polyline.ts`, `routeTolerance.ts`, `routing/valhalla.ts`) |
 | CMS ingest | `backend/cms/` |
 | Media pipeline | `backend/media/` (`presets.ts` is the audio standard, per-file limit and bitrate planning) |

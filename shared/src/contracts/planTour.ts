@@ -74,7 +74,11 @@ export interface PlanTourOk {
   plan_id: string;
   /** 'v1'... Bumped whenever the same request can produce a different plan. */
   planner_version: string;
-  /** md5 over planner_version, the ordered chapters/waypoints and every source bundle hash. */
+  /**
+   * First 128 bits of SHA-256 (32 hex) over planner_version, the ordered
+   * chapters and waypoints, each chapter's entry/exit point and every source
+   * bundle hash. A GET recomputes it; any difference is plan_stale.
+   */
   content_hash: string;
   /** ISO 8601. GET after this -> plan_expired. */
   expires_at: string;
@@ -173,6 +177,11 @@ export interface PlanQuality {
   legs_total: number;
   /** Legs priced by estimate. > 0 means the totals are approximate; UI may say "about". */
   legs_estimated: number;
+  /**
+   * The chapter search hit its node cap and returned the best plan found so
+   * far. Deterministic: the same request truncates at the same place.
+   */
+  search_truncated: boolean;
 }
 
 // -----------------------------------------------------------------------------

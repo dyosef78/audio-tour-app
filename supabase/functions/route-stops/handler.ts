@@ -52,7 +52,7 @@ import { PROFILE_FOR_TRANSIT_MODE, type LonLat, type RoutingError, type Valhalla
 import { SORTER_VERSION, parseLocalTime, smartSort, type SortablePoi, type SortContext, type SortPreferences } from '@shared/smartSorter.ts';
 
 import { routeViaLegCache, type LegStore } from './legCache.ts';
-import type { RateLimiter } from './rateLimit.ts';
+import type { RateLimiter } from '../_shared/rateLimit.ts';
 import { RouteMemoryCache, routeCacheKey, routeEtag } from './routeCache.ts';
 
 /** Matches DEFAULT_MAX_LOCATIONS; also bounds the work a single anonymous request can cause. */

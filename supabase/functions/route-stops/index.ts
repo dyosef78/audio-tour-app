@@ -11,7 +11,7 @@
  *   STADIA_API_KEY                    `supabase secrets set STADIA_API_KEY=...`
  *   VALHALLA_ROUTE_URL                optional; defaults to Stadia Maps
  *   ROUTE_RATE_LIMIT_{CLIENT,GLOBAL}_{BURST,PER_MINUTE}
- *                                     optional; rate limit overrides (TASK-1001, rateLimit.ts).
+ *                                     optional; rate limit overrides (TASK-1001, _shared/rateLimit.ts).
  *                                     The limiter also needs the service role key; without it
  *                                     requests are not limited
  *   LOG_PSEUDONYM_KEY, AXIOM_TOKEN, AXIOM_DATASET, AXIOM_DOMAIN
@@ -27,7 +27,7 @@ import { ValhallaClient, isRoutingError, valhallaConfigFromEnv } from '@shared/r
 
 import { handleRouteStops, type RouteStopsDeps } from './handler.ts';
 import type { CachedLeg, LegStore } from './legCache.ts';
-import { createRateLimiter, rateLimitPolicyFromEnv, type BucketOutcome, type RateLimiter } from './rateLimit.ts';
+import { createRateLimiter, rateLimitPolicyFromEnv, type BucketOutcome, type RateLimiter } from '../_shared/rateLimit.ts';
 import { RouteMemoryCache } from './routeCache.ts';
 import { loggerFromEnv } from '../_shared/logger.ts';
 

@@ -347,14 +347,21 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.chapter_leg_costs TO servic
 --     (CHECK), and origin_approx is rounded to 3 decimals (~110 m), also
 --     CHECKed so a writer bug fails loudly instead of storing a precise fix.
 --
--- 6c. content_hash = md5 over planner_version, the ordered
---     (chapter_id, [waypoint_id...]) list, and each source tour's
+-- 6c. content_hash = the first 128 bits of SHA-256 (32 hex: Web Crypto has
+--     no MD5) over planner_version, the ordered (chapter_id, [waypoint_id...])
+--     list, each chapter's entry/exit point, and each source tour's
 --     bundle_version_hash (also stored in source_tour_hashes, so a stale plan
---     can say WHICH tour changed). Computed in shared TypeScript, one
---     implementation for server and device.
+--     can say WHICH tour changed). Computed in shared TypeScript.
 --
 -- 6d. Feasibility is an invariant, not a hope: a plan whose estimate exceeds
 --     its budget cannot be stored.
+--
+-- 6f. request_hash (PM, 4 Oct 2026): sha256 of the canonical plan request -
+--     rounded origin, preferences, user_id, planner version, and a hash of
+--     the get_planner_candidates answer. The planner is a pure function of
+--     exactly those inputs, so one hash is one plan. UNIQUE makes plan-tour's
+--     write an idempotent upsert: a double tap or a retry after a timeout gets
+--     the same plan_id, race-free, and repeats do not grow the table.
 --
 -- 6e. Retention: expires_at is enforced by the reader (410 plan_expired).
 --     There is no pg_cron in this project yet; a purge job is a follow-up.
@@ -381,6 +388,9 @@ CREATE TABLE public.tour_plans (
                            CHECK (jsonb_typeof(source_tour_hashes) = 'object'),
     content_hash       text        NOT NULL
                        CONSTRAINT tour_plans_content_hash_check CHECK (content_hash ~ '^[0-9a-f]{32}$'),
+    request_hash       text        NOT NULL
+                       CONSTRAINT tour_plans_request_hash_check CHECK (request_hash ~ '^[0-9a-f]{64}$')
+                       CONSTRAINT tour_plans_request_hash_key UNIQUE,
     budget_seconds     integer     NOT NULL
                        CONSTRAINT tour_plans_budget_check CHECK (budget_seconds BETWEEN 900 AND 86400),
     estimated_seconds  integer     NOT NULL

@@ -18,6 +18,8 @@
 --   5. get_planner_candidates      NEW: the plan-tour Edge Function's single
 --                                    read - feasible chapters, their stops,
 --                                    and the cached costs between them
+--   6. get_plan_chapter_state      NEW: plan-tour's freshness check for a
+--                                    stored plan (service_role only)
 --
 -- 1-4 are reproduced from 20261001120100 (what production runs). 1-3 only add;
 -- 4 also narrows 5a-5c (see its header). No signature changes: CREATE OR
@@ -1851,6 +1853,58 @@ BEGIN
     END IF;
     IF NOT has_function_privilege('service_role', v_sig, 'EXECUTE') THEN
         RAISE EXCEPTION 'get_planner_candidates is not executable by service_role.';
+    END IF;
+END
+$check$;
+
+-- -----------------------------------------------------------------------------
+-- 6. get_plan_chapter_state - plan-tour's freshness check for a stored plan
+--
+-- A GET of a saved plan recomputes its content_hash from what is true NOW:
+-- each chapter's entry/exit point and whether its tour is still published
+-- (bundle hashes come from get_tour_bundle). A chapter that is gone, no longer
+-- plannable, moved, or in an unpublished tour makes the plan plan_stale.
+--
+-- Points as [lon, lat] numbers - PostgREST would return the geometry columns
+-- as hex EWKB, and a second hand-written decoder is a second formatter that
+-- can disagree with the first. ST_X/ST_Y here match get_planner_candidates
+-- exactly, so equal points hash equal.
+--
+-- service_role only, like get_planner_candidates: it names unpublished
+-- chapters, which is fine for the plan's own freshness check and nothing else.
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.get_plan_chapter_state(p_chapter_ids uuid[])
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+SET search_path = public, extensions
+AS $fn$
+    SELECT coalesce(jsonb_object_agg(c.id, jsonb_build_object(
+               'tour_id',        c.tour_id,
+               'tour_published', t.status = 'published',
+               'plannable',      c.plannable,
+               'entry', CASE WHEN c.entry_point IS NULL THEN NULL
+                             ELSE jsonb_build_array(ST_X(c.entry_point), ST_Y(c.entry_point)) END,
+               'exit',  CASE WHEN c.exit_point IS NULL THEN NULL
+                             ELSE jsonb_build_array(ST_X(c.exit_point), ST_Y(c.exit_point)) END
+           )), '{}'::jsonb)
+      FROM public.tour_chapters c
+      JOIN public.tours t ON t.id = c.tour_id
+     WHERE c.id = ANY (p_chapter_ids);
+$fn$;
+
+COMMENT ON FUNCTION public.get_plan_chapter_state(uuid[]) IS
+    'Epic 16: current entry/exit, plannable flag and tour publication of the given chapters, keyed by chapter id - plan-tour''s freshness check for a stored plan. service_role only.';
+
+REVOKE ALL ON FUNCTION public.get_plan_chapter_state(uuid[]) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.get_plan_chapter_state(uuid[]) TO service_role;
+
+DO $check$
+BEGIN
+    IF has_function_privilege('anon', 'public.get_plan_chapter_state(uuid[])', 'EXECUTE')
+       OR has_function_privilege('authenticated', 'public.get_plan_chapter_state(uuid[])', 'EXECUTE') THEN
+        RAISE EXCEPTION 'get_plan_chapter_state is executable by anon or authenticated; it must be service_role only.';
     END IF;
 END
 $check$;

@@ -195,11 +195,18 @@ export type RateLimitDecision =
 
 export type RateLimiter = (request: Request) => Promise<RateLimitDecision>;
 
-const KEY_PREFIX = 'route-stops';
-export const GLOBAL_BUCKET_KEY = `${KEY_PREFIX}:global`;
+const DEFAULT_NAME = 'route-stops';
+/** route-stops' global bucket. Another function's is `${name}:global`. */
+export const GLOBAL_BUCKET_KEY = `${DEFAULT_NAME}:global`;
 
 export interface RateLimiterOptions {
   store: BucketStore;
+  /**
+   * Bucket key prefix and log event prefix, so two functions never share or
+   * drain each other's buckets (Epic 16: plan-tour). Default 'route-stops',
+   * which keeps every bucket key and log event route-stops has always used.
+   */
+  name?: string;
   policy?: RateLimitPolicy;
   /**
    * HMAC key for client addresses, so the table never holds a raw IP. Without
@@ -212,6 +219,8 @@ export interface RateLimiterOptions {
 
 export function createRateLimiter(options: RateLimiterOptions): RateLimiter {
   const policy = options.policy ?? DEFAULT_RATE_LIMIT_POLICY;
+  const name = options.name ?? DEFAULT_NAME;
+  const eventPrefix = name.replace(/-/g, '_');
   const log = options.log ?? ((event) => console.log(JSON.stringify(event)));
   const hmacKey = crypto.subtle.importKey(
     'raw',
@@ -229,7 +238,7 @@ export function createRateLimiter(options: RateLimiterOptions): RateLimiter {
   });
 
   return async (request) => {
-    const buckets = [bucket(GLOBAL_BUCKET_KEY, policy.global)];
+    const buckets = [bucket(`${name}:global`, policy.global)];
     const address = clientAddress(request.headers);
     let clientKey: string | null = null;
 
@@ -237,20 +246,20 @@ export function createRateLimiter(options: RateLimiterOptions): RateLimiter {
       const mac = await crypto.subtle.sign('HMAC', await hmacKey, new TextEncoder().encode(address.key));
       // 128 bits of the MAC: collision-free at any realistic address count,
       // and well inside the key length the table allows.
-      clientKey = `${KEY_PREFIX}:ip:${hex(new Uint8Array(mac).slice(0, 16))}`;
+      clientKey = `${name}:ip:${hex(new Uint8Array(mac).slice(0, 16))}`;
       buckets.push(bucket(clientKey, policy.client));
     } else if (!warnedNoAddress) {
       // Once per isolate. If this appears in production, the gateway is not
       // forwarding any address header and ONLY the global bucket is working.
       warnedNoAddress = true;
-      log({ event: 'route_stops_rate_limit_no_client_address' });
+      log({ event: `${eventPrefix}_rate_limit_no_client_address` });
     }
 
     let outcome: BucketOutcome;
     try {
       outcome = await options.store(buckets);
     } catch (cause) {
-      log({ event: 'route_stops_rate_limit_unavailable', message: String(cause) });
+      log({ event: `${eventPrefix}_rate_limit_unavailable`, message: String(cause) });
       return { allowed: true, remaining: -1 };
     }
 

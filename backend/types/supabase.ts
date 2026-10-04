@@ -509,6 +509,7 @@ export type Database = {
           plan: Json
           planner_version: string
           request: Json
+          request_hash: string
           source_tour_hashes: Json
           user_id: string | null
         }
@@ -526,6 +527,7 @@ export type Database = {
           plan: Json
           planner_version: string
           request: Json
+          request_hash: string
           source_tour_hashes: Json
           user_id?: string | null
         }
@@ -543,6 +545,7 @@ export type Database = {
           plan?: Json
           planner_version?: string
           request?: Json
+          request_hash?: string
           source_tour_hashes?: Json
           user_id?: string | null
         }
@@ -1058,6 +1061,10 @@ export type Database = {
           p_origin_lon: number
           p_transit_mode: string
         }
+        Returns: Json
+      }
+      get_plan_chapter_state: {
+        Args: { p_chapter_ids: string[] }
         Returns: Json
       }
       get_tour_bundle: { Args: { p_tour_id: string }; Returns: Json }

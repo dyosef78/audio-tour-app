@@ -57,6 +57,10 @@ jobs:
       - name: Routing client tests
         run: npm run test:routing
 
+      # Epic 16: the planner's DP and branch-and-bound against brute force.
+      - name: Planner tests
+        run: npm run test:planner
+
       - name: CMS contract tests
         run: npm run test:cms
 

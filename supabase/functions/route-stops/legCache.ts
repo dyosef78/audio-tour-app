@@ -26,6 +26,7 @@
 
 import { PolylineError, decodePolyline, distanceToRouteMeters } from '@shared/polyline.ts';
 import { RoutingError, joinLegPolylines, type LonLat, type RouteLeg, type ValhallaProfile, type ValhallaRoute } from '@shared/routing/index.ts';
+import { coordsKey } from '@shared/routing/coordsKey.ts';
 
 export const LEG_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 
@@ -76,9 +77,9 @@ export interface LegRouteResult {
   fetchedLegs: number;
 }
 
-/** "lon,lat;lon,lat" to 6 decimals - the precision the polyline carries, as routeCacheKey. */
+/** "lon,lat;lon,lat" to 6 decimals. The one formatter lives in @shared/routing/coordsKey.ts. */
 export function legCoordsKey(from: LegStop, to: LegStop): string {
-  return `${from.lon.toFixed(6)},${from.lat.toFixed(6)};${to.lon.toFixed(6)},${to.lat.toFixed(6)}`;
+  return coordsKey(from, to);
 }
 
 export async function routeViaLegCache(
