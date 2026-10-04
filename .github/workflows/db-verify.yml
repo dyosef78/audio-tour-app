@@ -21,6 +21,9 @@ on:
       - 'supabase/seed.sql'
       - 'supabase/config.toml'
       - 'backend/scripts/verify-bundle.ts'
+      # The types diff below guards this file; a types-only fix must re-run it
+      # (Epic 16: one slipped through the filter and needed a manual dispatch).
+      - 'backend/types/supabase.ts'
       - '.github/workflows/db-verify.yml'
   pull_request:
     paths:
@@ -28,6 +31,9 @@ on:
       - 'supabase/seed.sql'
       - 'supabase/config.toml'
       - 'backend/scripts/verify-bundle.ts'
+      # The types diff below guards this file; a types-only fix must re-run it
+      # (Epic 16: one slipped through the filter and needed a manual dispatch).
+      - 'backend/types/supabase.ts'
       - '.github/workflows/db-verify.yml'
   workflow_dispatch:
 
