@@ -27,7 +27,8 @@ import { ValhallaClient, isRoutingError, valhallaConfigFromEnv } from '@shared/r
 
 import { handleRouteStops, type RouteStopsDeps } from './handler.ts';
 import type { CachedLeg, LegStore } from './legCache.ts';
-import { createRateLimiter, rateLimitPolicyFromEnv, type BucketOutcome, type RateLimiter } from '../_shared/rateLimit.ts';
+import { createRateLimiter, rateLimitPolicyFromEnv, type BucketOutcome, type BucketRequest, type RateLimiter } from '../_shared/rateLimit.ts';
+import { budgetedRouter, takeValhallaToken, valhallaGlobalBucket } from '../_shared/valhallaBudget.ts';
 import { RouteMemoryCache } from './routeCache.ts';
 import { loggerFromEnv } from '../_shared/logger.ts';
 
@@ -146,7 +147,27 @@ if (!legStore) log({ event: 'route_legs_cache_disabled', reason: 'SUPABASE_SERVI
 /** Every request pays this round trip, so it is kept short. Past it, fail open. */
 const RATE_LIMIT_TIMEOUT_MS = 1_000;
 
-const rateLimit: RateLimiter | null = admin
+const consumeBuckets = admin
+  ? async (buckets: BucketRequest[]): Promise<BucketOutcome> => {
+      const { data, error } = await admin
+        .rpc('consume_rate_limit', {
+          p_keys: buckets.map((b) => b.key),
+          p_capacities: buckets.map((b) => b.capacity),
+          p_refill_per_second: buckets.map((b) => b.refillPerSecond),
+        })
+        .abortSignal(AbortSignal.timeout(RATE_LIMIT_TIMEOUT_MS));
+      if (error) throw new Error(`consume_rate_limit: ${error.message}`);
+      const r = data as { allowed: boolean; retry_after_seconds: number; remaining: number; exhausted: string[] };
+      return {
+        allowed: r.allowed,
+        retryAfterSeconds: r.retry_after_seconds,
+        remaining: r.remaining,
+        exhausted: r.exhausted,
+      };
+    }
+  : null;
+
+const rateLimit: RateLimiter | null = consumeBuckets
   ? createRateLimiter({
       policy: rateLimitPolicyFromEnv(env),
       // An HMAC key the table's readers cannot see, so a stored bucket key
@@ -154,27 +175,21 @@ const rateLimit: RateLimiter | null = admin
       // just starts every client bucket afresh.
       secret: serviceKey as string,
       log,
-      store: async (buckets) => {
-        const { data, error } = await admin
-          .rpc('consume_rate_limit', {
-            p_keys: buckets.map((b) => b.key),
-            p_capacities: buckets.map((b) => b.capacity),
-            p_refill_per_second: buckets.map((b) => b.refillPerSecond),
-          })
-          .abortSignal(AbortSignal.timeout(RATE_LIMIT_TIMEOUT_MS));
-        if (error) throw new Error(`consume_rate_limit: ${error.message}`);
-        const r = data as { allowed: boolean; retry_after_seconds: number; remaining: number; exhausted: string[] };
-        return {
-          allowed: r.allowed,
-          retryAfterSeconds: r.retry_after_seconds,
-          remaining: r.remaining,
-          exhausted: r.exhausted,
-        } satisfies BucketOutcome;
-      },
+      store: consumeBuckets,
     })
   : null;
 
 if (!rateLimit) log({ event: 'route_stops_rate_limit_disabled', reason: 'SUPABASE_SERVICE_ROLE_KEY missing' });
+
+// Epic 16 Part 4: every Valhalla request spends a token from the budget shared
+// with plan-tour and warm-costs. FAIL-OPEN here: a visitor is waiting, and a
+// bucket store outage is no reason to break their route. Out of budget, the
+// router throws rate_limited, which this function already answers as 429 +
+// Retry-After - a status every app build retries.
+if (router && consumeBuckets) {
+  const globalBucket = valhallaGlobalBucket(env);
+  router = budgetedRouter(router, () => takeValhallaToken(consumeBuckets, [globalBucket], 'fail-open', log));
+}
 
 // The response is sent before the cache write finishes. waitUntil keeps the
 // isolate alive for it; without it the write can be cut off mid-flight.

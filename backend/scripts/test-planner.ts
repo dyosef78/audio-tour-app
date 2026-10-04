@@ -24,6 +24,10 @@ import {
   requestHash,
   roundOrigin,
   searchSequence,
+  missingCellKey,
+  neededCells,
+  parseWarmState,
+  reconcile,
   type ChapterModel,
   type ChapterOption,
   type MissingCell,
@@ -465,6 +469,98 @@ heading('planTour: contract, margin, determinism, bounds');
 }
 
 // -----------------------------------------------------------------------------
+heading('quality: dropped_high_value_extensions (the "add more time" upsell)');
+{
+  // core - E1 (w3, 10 min) - E2 (w3, 10 min) - E3 (w1, 10 min) - X (w3, ineligible) - core
+  const ch: ChapterSpec = { id: uuid(7000), entry: at(0, 0), exit: at(500, 0), coreWeight: 1, stops: [
+    { id: uuid(7001), sort: 1, role: 'core', pos: at(0, 0), dwell: 300 },
+    { id: uuid(7002), sort: 2, role: 'extension', pos: at(100, 0), dwell: 600, weight: 3 },
+    { id: uuid(7003), sort: 3, role: 'extension', pos: at(200, 0), dwell: 600, weight: 3 },
+    { id: uuid(7004), sort: 4, role: 'extension', pos: at(300, 0), dwell: 600, weight: 1 },
+    { id: uuid(7005), sort: 5, role: 'extension', pos: at(400, 0), dwell: 600, weight: 3, eligible: false },
+    { id: uuid(7006), sort: 6, role: 'core', pos: at(500, 0), dwell: 300 },
+  ] };
+  const raw = rpc([ch], { legs: allLegs(ch, () => 30) });
+  const count = (minutes: number) => {
+    const out = planTour(request({ available_minutes: minutes }), parseCandidates(raw), at(0, 0));
+    return out.ok ? [out.draft.droppedHighValueExtensions, out.draft.segments.filter((x) => x.kind === 'chapter').flatMap((x) => (x as { kept_extension_ids: readonly string[] }).kept_extension_ids).length] : null;
+  };
+  // 30 min * 0.9 = 1620 s: cores 600 + travel ~ + ONE 600 s extension fits.
+  eq('tight budget: one w3 kept, the other w3 counted; w1 and the ineligible w3 never counted', count(30), [1, 1]);
+  eq('generous budget: everything keepable kept, nothing counted', count(120), [0, 3]);
+}
+
+heading('Reconciler (warm-costs): needed, present, missing');
+{
+  const warmRaw = (chapters: ChapterSpec[], legs: { chapter: string; from: string; to: string; profile: string; key: string }[] = [], transfers: { from: string; to: string; profile: string; key: string }[] = []) => ({
+    chapters: chapters.map((c) => ({
+      chapter_id: c.id, tour_id: uuid(9000), transit_mode: c.mode ?? 'walking', profile: PROFILE[c.mode ?? 'walking'], entry: c.entry, exit: c.exit,
+      stops: c.stops.map((x) => ({ waypoint_id: x.id, sort_order: x.sort, stop_role: x.role, coordinates: x.pos })),
+    })),
+    legs: legs.map((l) => ({ chapter_id: l.chapter, from_node: l.from, to_node: l.to, profile: l.profile, unroutable: false, coords_key: l.key })),
+    transfers: transfers.map((t) => ({ from_chapter_id: t.from, to_chapter_id: t.to, profile: t.profile, unroutable: false, coords_key: t.key })),
+  });
+  // entry - C1 - E1 - E2 - C2 - exit : slots [entry,C1] [C1,E1,E2,C2] [C2,exit] -> 1 + 6 + 1 legs
+  const c: ChapterSpec = { id: uuid(8000), entry: at(0, 0), exit: at(400, 0), stops: [
+    { id: uuid(8001), sort: 1, role: 'core', pos: at(50, 0) },
+    { id: uuid(8002), sort: 2, role: 'extension', pos: at(150, 30) },
+    { id: uuid(8003), sort: 3, role: 'extension', pos: at(250, 30) },
+    { id: uuid(8004), sort: 4, role: 'core', pos: at(350, 0) },
+  ] };
+  const legsOnly = neededCells(parseWarmState(warmRaw([c]))).filter((x) => x.kind === 'leg');
+  eq('legs: forward pairs within each slot (1 + 6 + 1)', legsOnly.length, 8);
+
+  // Property: every leg the planner can read is a needed leg (200 random chapters).
+  const rand = rng(77);
+  let uncovered = '';
+  for (let t = 0; t < 200 && !uncovered; t++) {
+    const n = 2 + Math.floor(rand() * 6);
+    const stops: StopSpec[] = Array.from({ length: n }, (_, i) => ({ id: uuid(8100 + i), sort: i + 1, role: i === 0 || rand() < 0.4 ? 'core' : 'extension', pos: at(80 * (i + 1), Math.round(rand() * 100)), weight: 1 + Math.floor(rand() * 3) } as StopSpec));
+    const ch: ChapterSpec = { id: uuid(8090), entry: at(0, 0), exit: at(80 * (n + 1), 0), stops };
+    const answer = parseCandidates(rpc([ch]));
+    const book = new CostBook(answer, 'walking');
+    chapterOptions(answer.candidates[0]!, book, PARAMS);
+    const needed = new Set(neededCells(parseWarmState(warmRaw([ch]))).map(missingCellKey));
+    const miss = book.missingCells().find((m) => !needed.has(missingCellKey(m)));
+    if (miss) uncovered = `trial ${t}: ${missingCellKey(miss)}`;
+  }
+  assert('every leg the planner can read is in the needed set (200 random chapters)', uncovered === '', uncovered);
+
+  // Transfers: profile eligibility and radius.
+  const walkA: ChapterSpec = { id: uuid(8200), entry: at(0, 0), exit: at(100, 0), stops: [{ id: uuid(8201), sort: 1, role: 'core', pos: at(50, 0) }] };
+  const walkB: ChapterSpec = { id: uuid(8210), entry: at(3000, 0), exit: at(3100, 0), stops: [{ id: uuid(8211), sort: 1, role: 'core', pos: at(3050, 0) }] };
+  const walkFar: ChapterSpec = { id: uuid(8220), entry: at(20_000, 0), exit: at(20_100, 0), stops: [{ id: uuid(8221), sort: 1, role: 'core', pos: at(20_050, 0) }] };
+  const drive: ChapterSpec = { id: uuid(8230), mode: 'driving', entry: at(1000, 0), exit: at(9000, 0), stops: [{ id: uuid(8231), sort: 1, role: 'core', pos: at(5000, 0) }] };
+  const tr = neededCells(parseWarmState(warmRaw([walkA, walkB, walkFar, drive]))).filter((x) => x.kind === 'transfer');
+  const has = (p: string, a: string, b: string) => tr.some((x) => x.kind === 'transfer' && x.profile === p && x.fromChapterId === a && x.toChapterId === b);
+  assert('pedestrian: walking <-> walking within 5 km', has('pedestrian', walkA.id, walkB.id) && has('pedestrian', walkB.id, walkA.id));
+  assert('pedestrian: never to a 20 km chapter, never to a driving chapter', !has('pedestrian', walkA.id, walkFar.id) && !has('pedestrian', walkA.id, drive.id));
+  assert('auto: walking and driving chapters, within 80 km', has('auto', walkA.id, drive.id) && has('auto', drive.id, walkFar.id));
+  assert('bicycle: never a driving chapter', !tr.some((x) => x.kind === 'transfer' && x.profile === 'bicycle' && (x.fromChapterId === drive.id || x.toChapterId === drive.id)));
+  const firstTransfer = neededCells(parseWarmState(warmRaw([walkA, walkB, walkFar, drive]))).findIndex((x) => x.kind === 'transfer');
+  assert('legs come before transfers', neededCells(parseWarmState(warmRaw([walkA, walkB, walkFar, drive]))).slice(firstTransfer).every((x) => x.kind === 'transfer'));
+
+  // Present vs stale.
+  const pt = (p: Pair) => ({ lon: p[0], lat: p[1] });
+  const good = { chapter: c.id, from: 'entry', to: uuid(8001), profile: 'pedestrian', key: coordsKey(pt(c.entry), pt(c.stops[0]!.pos)) };
+  const stale = { chapter: c.id, from: uuid(8004), to: 'exit', profile: 'pedestrian', key: coordsKey(pt(at(1, 1)), pt(c.exit)) };
+  const r = reconcile(parseWarmState(warmRaw([c], [good, stale])));
+  eq('a matching row is present; a stale-keyed row is missing again', [r.needed.legs, r.missing.length], [8, 7]);
+  assert('the stale cell is among the missing', r.missing.some((m) => m.kind === 'leg' && m.fromNode === uuid(8004) && m.toNode === 'exit'));
+
+  // The fill loop converges in bounded chains: 8 legs -> at most 5 per request.
+  let left = r.missing;
+  let requests = 0;
+  while (left.length > 0 && requests < 20) {
+    const chain = chooseFillChain([], left);
+    assert(`chain ${requests + 1} has 1..5 cells`, chain.length >= 1 && chain.length <= MAX_FILL_CELLS);
+    const done = new Set(chain.map(missingCellKey));
+    left = left.filter((m) => !done.has(missingCellKey(m)));
+    requests++;
+  }
+  assert('every missing cell is eventually chained', left.length === 0, String(left.length));
+}
+
 heading('Request, hashing, origin');
 {
   const ok = checkPlanRequest({ ...request(), exclude_chapter_ids: [uuid(7).toUpperCase()] });

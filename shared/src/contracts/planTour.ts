@@ -182,6 +182,14 @@ export interface PlanQuality {
    * far. Deterministic: the same request truncates at the same place.
    */
   search_truncated: boolean;
+  /**
+   * Extensions with matched weight >= 2, in chapters this plan INCLUDES, that
+   * the chapter would keep with unlimited time but this plan dropped - i.e.
+   * strictly for lack of time. Never counted: extensions excluded by audience,
+   * unroutable or driving-queue constraints, or no matching interest. Feeds the
+   * "add more time" suggestion. Planner v2+.
+   */
+  dropped_high_value_extensions: number;
 }
 
 // -----------------------------------------------------------------------------

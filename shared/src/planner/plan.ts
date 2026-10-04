@@ -16,7 +16,7 @@ import type { ChapterSegment, PlanEstimate, PlanSegment, PlanTourRequest, Transf
 import type { Candidate, Pair, PlannerCandidates } from './candidates.ts';
 import { chapterOptions, coreIds, extensionIds, type ChapterModel } from './chapterOptions.ts';
 import { CostBook, missingCellKey, type MissingCell } from './costBook.ts';
-import { BASE_CHAPTER_VALUE, MAX_FILL_CELLS, PLANNING_MARGIN, WALKING_PACE } from './constants.ts';
+import { BASE_CHAPTER_VALUE, HIGH_VALUE_WEIGHT, MAX_FILL_CELLS, PLANNING_MARGIN, WALKING_PACE } from './constants.ts';
 import { searchSequence, type PlannedChapter } from './sequence.ts';
 
 export interface PlanDraft {
@@ -25,6 +25,8 @@ export interface PlanDraft {
   legsTotal: number;
   legsEstimated: number;
   searchTruncated: boolean;
+  /** See PlanQuality.dropped_high_value_extensions. */
+  droppedHighValueExtensions: number;
   /** Chosen chapters, for content_hash and the stale check. */
   chapters: { chapterId: string; tourId: string; waypointIds: string[]; entry: Pair; exit: Pair }[];
 }
@@ -80,6 +82,7 @@ export function planTour(request: PlanTourRequest, answer: PlannerCandidates, or
   let deepDiveExtraS = 0;
   let legsTotal = 0;
   let legsEstimated = 0;
+  let droppedHighValue = 0;
   let previous: Candidate | null = null;
   const chapters: PlanDraft['chapters'] = [];
   const planCells: MissingCell[] = [];
@@ -108,6 +111,11 @@ export function planTour(request: PlanTourRequest, answer: PlannerCandidates, or
     }
 
     const kept = new Set(p.option.keptIds);
+    // With unlimited time the chapter takes its highest-value option; what that
+    // keeps and this plan does not was dropped strictly for lack of time.
+    const unlimited = p.model.options[p.model.options.length - 1]!;
+    const weightOf = new Map(c.stops.map((s) => [s.waypointId, s.matchedWeight]));
+    droppedHighValue += unlimited.keptIds.filter((id) => !kept.has(id) && (weightOf.get(id) ?? 0) >= HIGH_VALUE_WEIGHT).length;
     const waypointIds = c.stops.filter((s) => s.stopRole === 'core' || kept.has(s.waypointId)).map((s) => s.waypointId);
     const chapter: ChapterSegment = {
       kind: 'chapter',
@@ -168,6 +176,7 @@ export function planTour(request: PlanTourRequest, answer: PlannerCandidates, or
       legsTotal,
       legsEstimated,
       searchTruncated: result.truncated,
+      droppedHighValueExtensions: droppedHighValue,
       chapters,
     },
     missing: book.missingCells(),

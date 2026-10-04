@@ -27,7 +27,6 @@ import {
   CandidatesShapeError,
   chooseFillChain,
   contentHash,
-  MAX_FILL_CELLS,
   parseCandidates,
   PLAN_TTL_DAYS,
   PLANNER_VERSION,
@@ -47,9 +46,11 @@ import type {
   PlanTourOk,
   PlanTourRequest,
 } from '@shared/contracts/planTour.ts';
-import { coordsKey } from '@shared/routing/coordsKey.ts';
-import { isRoutingError, type LonLat, type ValhallaProfile, type ValhallaRoute } from '@shared/routing/index.ts';
 import type { RateLimiter } from '../_shared/rateLimit.ts';
+import { fillMissingCosts, type FillDeps } from '../_shared/costFill.ts';
+
+export { fillMissingCosts } from '../_shared/costFill.ts';
+export type { FillDeps, FillOutcome, LegCostWrite, TransferCostWrite } from '../_shared/costFill.ts';
 
 // -----------------------------------------------------------------------------
 // Ports
@@ -108,33 +109,6 @@ export interface ChapterState {
   plannable: boolean;
   entry: Pair | null;
   exit: Pair | null;
-}
-
-export interface LegCostWrite {
-  chapterId: string;
-  fromNode: string;
-  toNode: string;
-  profile: ValhallaProfile;
-  durationS: number | null;
-  distanceM: number | null;
-  coordsKey: string;
-}
-
-export interface TransferCostWrite {
-  fromChapterId: string;
-  toChapterId: string;
-  profile: ValhallaProfile;
-  durationS: number | null;
-  distanceM: number | null;
-  coordsKey: string;
-}
-
-export interface FillDeps {
-  /** One token from the global Valhalla-fill bucket. false = skip this time. */
-  takeToken(): Promise<boolean>;
-  route(locations: LonLat[], profile: ValhallaProfile): Promise<ValhallaRoute>;
-  saveLegs(rows: LegCostWrite[]): Promise<void>;
-  saveTransfers(rows: TransferCostWrite[]): Promise<void>;
 }
 
 export interface PlanTourDeps {
@@ -299,6 +273,7 @@ async function post(request: Request, deps: PlanTourDeps, requestId: string): Pr
       legs_total: draft.legsTotal,
       legs_estimated: draft.legsEstimated,
       search_truncated: draft.searchTruncated,
+      dropped_high_value_extensions: draft.droppedHighValueExtensions,
     },
   };
 
@@ -393,60 +368,4 @@ function scheduleFill(deps: PlanTourDeps, chain: MissingCell[], requestId: strin
     fillMissingCosts(chain, deps.fill, deps.log).catch((cause) =>
       deps.log({ event: 'plan_tour_fill_failed', request_id: requestId, message: cause instanceof Error ? cause.message : String(cause) })),
   );
-}
-
-/**
- * ONE Valhalla request, through the chain's points: its legs are the cells.
- * Never more than MAX_FILL_CELLS cells, never a second request, never a retry.
- */
-export async function fillMissingCosts(chain: readonly MissingCell[], fill: FillDeps, log: PlanTourDeps['log']): Promise<void> {
-  if (chain.length === 0) return;
-  if (chain.length > MAX_FILL_CELLS) throw new Error(`fill chain of ${chain.length} cells exceeds ${MAX_FILL_CELLS}`);
-  for (let i = 1; i < chain.length; i++) {
-    const a = chain[i - 1]!;
-    const b = chain[i]!;
-    if (a.kind !== 'leg' || b.kind !== 'leg' || a.chapterId !== b.chapterId || a.toNode !== b.fromNode || a.profile !== b.profile) {
-      throw new Error('fill chain is not one contiguous path');
-    }
-  }
-  if (!(await fill.takeToken())) {
-    log({ event: 'plan_tour_fill_skipped', reason: 'fill_bucket_empty', cells: chain.length });
-    return;
-  }
-
-  const first = chain[0]!;
-  const locations: LonLat[] = [first.from, ...chain.map((c) => c.to)].map(([lon, lat]) => [lon, lat] as LonLat);
-  let durations: (number | null)[];
-  let distances: (number | null)[];
-  try {
-    const route = await fill.route(locations, first.profile);
-    if (route.legs.length !== chain.length) {
-      log({ event: 'plan_tour_fill_mismatch', legs: route.legs.length, cells: chain.length });
-      return;
-    }
-    durations = route.legs.map((l) => l.durationSeconds);
-    distances = route.legs.map((l) => l.distanceMeters);
-  } catch (cause) {
-    // Only a SINGLE-cell "no route" is attributable to one pair: store it as
-    // unroutable so it is never asked again (until a point moves). For a
-    // longer chain we cannot tell which hop failed, so nothing is written.
-    if (isRoutingError(cause) && cause.code === 'unroutable' && chain.length === 1) {
-      durations = [null];
-      distances = [null];
-    } else {
-      log({ event: 'plan_tour_fill_routing_error', code: isRoutingError(cause) ? cause.code : 'unknown', cells: chain.length });
-      return;
-    }
-  }
-
-  const key = (c: MissingCell) => coordsKey({ lon: c.from[0], lat: c.from[1] }, { lon: c.to[0], lat: c.to[1] });
-  if (first.kind === 'transfer') {
-    await fill.saveTransfers([{ fromChapterId: first.fromChapterId, toChapterId: first.toChapterId, profile: first.profile, durationS: durations[0] ?? null, distanceM: distances[0] ?? null, coordsKey: key(first) }]);
-  } else {
-    await fill.saveLegs(chain.map((c, i) => {
-      const leg = c as Extract<MissingCell, { kind: 'leg' }>;
-      return { chapterId: leg.chapterId, fromNode: leg.fromNode, toNode: leg.toNode, profile: leg.profile, durationS: durations[i] ?? null, distanceM: distances[i] ?? null, coordsKey: key(c) };
-    }));
-  }
-  log({ event: 'plan_tour_fill_done', cells: chain.length, kind: first.kind, unroutable: durations[0] === null });
 }

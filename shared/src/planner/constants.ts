@@ -11,10 +11,17 @@
 import type { GroupType } from '../vocabulary.ts';
 import type { TransitMode } from '../contracts/planTour.ts';
 
-export const PLANNER_VERSION = 'v1';
+/** v2 (Part 4): quality.dropped_high_value_extensions. Same plans, richer metadata. */
+export const PLANNER_VERSION = 'v2';
 
 /** Plans fill at most (1 - margin) of the budget: slack absorbs pace error. */
 export const PLANNING_MARGIN = 0.1;
+
+/**
+ * An extension counts toward quality.dropped_high_value_extensions (the
+ * "add more time" upsell) only at this matched weight or above.
+ */
+export const HIGH_VALUE_WEIGHT = 2;
 
 /** Value of a chapter merely for being in the plan, so content beats idle time. */
 export const BASE_CHAPTER_VALUE = 1;

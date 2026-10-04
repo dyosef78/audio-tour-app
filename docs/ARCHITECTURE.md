@@ -475,6 +475,23 @@ database. **The request path never calls Valhalla.**
 
 `GET ?plan_id=` re-derives `content_hash` from current bundle hashes and
 chapter endpoints (`get_plan_chapter_state`): any change is `409 plan_stale`.
+
+**Warming the costs: a reconciler, not a queue (Part 4).** `warm-costs` (CMS
+admins only) reads `get_warm_state(city)`, computes every cell the city
+*needs* from current state (`shared/src/planner/warm.ts`), subtracts what is
+cached with a matching `coords_key`, and fills one bounded batch: up to 20
+requests of at most 5 chained cells. Nothing is enqueued, so no CMS edit,
+cascade or invalidation can be missed; a call that dies leaves only correct
+rows. Run `npm run planner:warm -- --city <slug>` after publishing (it signs
+in as a CMS admin and calls until done; `--dry-run` only counts). Phase 2:
+the same function on `pg_cron`.
+
+**One Valhalla budget.** `route-stops`, `plan-tour`'s fill and `warm-costs`
+each spend a token from `valhalla:global` (120/min, `VALHALLA_BUDGET_*`) in
+the same atomic `consume_rate_limit` call as their own sub-bucket
+(`functions/_shared/valhallaBudget.ts`). `route-stops` fails open (a visitor is
+waiting; out of budget it answers 429 + Retry-After, which every build
+retries); the fill and the warmer fail closed.
 `backend/scripts/test-planner.ts` checks the DP and the search against brute
 force on seeded random instances.
 
@@ -859,7 +876,7 @@ good practice rather than an App Store rejection risk on its own.
 | Area | Path |
 |---|---|
 | Migrations & seeds | `supabase/migrations/`, `supabase/seed.sql`, `prod_test_seed.sql` |
-| Edge Functions | `supabase/functions/plan-tour/` (`handler.ts` contract, `index.ts` wiring); `supabase/functions/route-stops/` (`handler.ts` contract, `legCache.ts`, `routeCache.ts`); `supabase/functions/delete-account/` (`handler.ts` contract, `appleRevoke.ts`, `googleRevoke.ts`); `supabase/functions/_shared/` (`rateLimit.ts`, `logger.ts`) |
+| Edge Functions | `supabase/functions/plan-tour/` (`handler.ts` contract, `index.ts` wiring); `supabase/functions/warm-costs/` (the cost reconciler); `supabase/functions/route-stops/` (`handler.ts` contract, `legCache.ts`, `routeCache.ts`); `supabase/functions/delete-account/` (`handler.ts` contract, `appleRevoke.ts`, `googleRevoke.ts`); `supabase/functions/_shared/` (`rateLimit.ts`, `valhallaBudget.ts`, `costFill.ts`, `costWriters.ts`, `logger.ts`) |
 | Planner | `shared/src/planner/` (pure: `costBook.ts`, `chapterOptions.ts`, `sequence.ts`, `plan.ts`); contract `shared/src/contracts/planTour.ts` |
 | Shared (Deno + Node + Metro) | `shared/src/` (`smartSorter.ts`, `polyline.ts`, `routeTolerance.ts`, `routing/valhalla.ts`) |
 | CMS ingest | `backend/cms/` |

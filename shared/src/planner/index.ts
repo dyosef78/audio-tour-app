@@ -17,3 +17,5 @@ export { checkPlanRequest, roundOrigin } from './request.ts';
 export type { RequestCheck } from './request.ts';
 export { canonicalJson, contentHash, requestHash, sha256Hex } from './hash.ts';
 export type { HashedChapter } from './hash.ts';
+export { neededCells, parseWarmState, reconcile, TRANSFER_RADIUS_M, WarmStateShapeError } from './warm.ts';
+export type { Reconciliation, WarmChapter, WarmState } from './warm.ts';

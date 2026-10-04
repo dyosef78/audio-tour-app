@@ -22,6 +22,8 @@ import { ValhallaClient, isRoutingError, valhallaConfigFromEnv } from '@shared/r
 
 import { handlePlanTour, RpcError, type ChapterState, type FillDeps, type PlanTourDeps, type StoredPlan } from './handler.ts';
 import { createRateLimiter, type BucketOutcome, type BucketRequest } from '../_shared/rateLimit.ts';
+import { takeValhallaToken, valhallaGlobalBucket } from '../_shared/valhallaBudget.ts';
+import { costWriters } from '../_shared/costWriters.ts';
 import { loggerFromEnv } from '../_shared/logger.ts';
 
 const env = Deno.env.toObject();
@@ -72,50 +74,23 @@ async function consume(buckets: BucketRequest[]): Promise<BucketOutcome> {
 }
 
 /**
- * The Valhalla budget for enrichment, across every isolate: 5 requests at
- * once, 5 per minute sustained. Each request fills at most 5 cells.
+ * Enrichment's own share, across every isolate: 5 requests at once, 5 per
+ * minute sustained, each filling at most 5 cells - AND a token from the
+ * Valhalla budget shared with route-stops and warm-costs (Part 4).
  */
 const FILL_BUCKET: BucketRequest = { key: 'plan-tour:valhalla-fill', capacity: 5, refillPerSecond: 5 / 60 };
+const VALHALLA_GLOBAL = valhallaGlobalBucket(env);
 
 let fill: FillDeps | null = null;
 if (admin) {
   try {
     const router = new ValhallaClient(valhallaConfigFromEnv(env));
     fill = {
-      async takeToken() {
-        try {
-          return (await consume([FILL_BUCKET])).allowed;
-        } catch (cause) {
-          // Fail CLOSED here, unlike the request limiter: enrichment is
-          // optional, and an unmetered Valhalla is what the bound prevents.
-          log({ event: 'plan_tour_fill_bucket_unavailable', message: String(cause) });
-          return false;
-        }
-      },
+      // Fail CLOSED, unlike the request limiter: enrichment is optional, and
+      // an unmetered Valhalla is what the bound prevents.
+      takeToken: async () => (await takeValhallaToken(consume, [FILL_BUCKET, VALHALLA_GLOBAL], 'fail-closed', log)).ok,
       route: (locations, profile) => router.route(locations, profile),
-      async saveLegs(rows) {
-        const { error } = await admin.from('chapter_leg_costs').upsert(
-          rows.map((r) => ({
-            chapter_id: r.chapterId, from_node: r.fromNode, to_node: r.toNode, profile: r.profile,
-            duration_seconds: r.durationS, distance_meters: r.distanceM, coords_key: r.coordsKey,
-            // An upsert that refreshes a row must restamp it; the default only fires on insert.
-            computed_at: new Date().toISOString(),
-          })),
-          { onConflict: 'chapter_id,from_node,to_node,profile' },
-        );
-        if (error) throw new Error(`chapter_leg_costs write: ${error.message}`);
-      },
-      async saveTransfers(rows) {
-        const { error } = await admin.from('chapter_travel_matrix').upsert(
-          rows.map((r) => ({
-            from_chapter_id: r.fromChapterId, to_chapter_id: r.toChapterId, profile: r.profile,
-            duration_seconds: r.durationS, distance_meters: r.distanceM, coords_key: r.coordsKey,
-            computed_at: new Date().toISOString(),
-          })),
-          { onConflict: 'from_chapter_id,to_chapter_id,profile' },
-        );
-        if (error) throw new Error(`chapter_travel_matrix write: ${error.message}`);
-      },
+      ...costWriters(admin),
     };
   } catch (cause) {
     log({ event: 'plan_tour_fill_disabled', reason: isRoutingError(cause) ? cause.message : String(cause) });

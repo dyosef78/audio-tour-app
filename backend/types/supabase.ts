@@ -1068,6 +1068,7 @@ export type Database = {
         Returns: Json
       }
       get_tour_bundle: { Args: { p_tour_id: string }; Returns: Json }
+      get_warm_state: { Args: { p_city_id: string }; Returns: Json }
       interest_tag_vocabulary: { Args: never; Returns: string[] }
       is_cms_admin: { Args: never; Returns: boolean }
       max_route_anchors: { Args: never; Returns: number }

@@ -571,7 +571,7 @@ heading('Epic 15: no CMS function is executable by anon');
 // would be a compute endpoint that bypasses plan-tour's rate limit.
   const SEALED = (name: string): boolean =>
     /^cms_\w+$/.test(name) || name === 'assert_cms_admin' || name === 'is_cms_admin'
-    || name === 'get_planner_candidates' || name === 'get_plan_chapter_state';
+    || name === 'get_planner_candidates' || name === 'get_plan_chapter_state' || name === 'get_warm_state';
   const stream = migrationFiles.map((file) => read(file).replace(/--[^\n]*/g, '')).join('\n');
 
   const closedByDefault = stream.search(
