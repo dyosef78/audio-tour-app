@@ -19,7 +19,7 @@ import { utf8Decode, utf8Encode } from './utf8';
  *
  * KEYCHAIN ACCESSIBILITY - AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY, not the default
  * WHEN_UNLOCKED. A tour runs with the phone locked in a pocket: the background
- * location task, the telemetry flush and route-stops all reach this client
+ * location task and the telemetry flush both reach this client
  * then. Under WHEN_UNLOCKED the key read fails and a signed-in walker silently
  * becomes anonymous mid-tour. THIS_DEVICE_ONLY keeps the key out of backups, so
  * a refresh token restored onto another phone is unreadable there.

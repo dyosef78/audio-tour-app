@@ -53,8 +53,9 @@ const PROFILES: ReadonlySet<string> = new Set<ValhallaProfile>(['pedestrian', 'b
 export const STADIA_ROUTE_URL = 'https://api.stadiamaps.com/route/v1';
 
 /**
- * Inside the device's 10 s ROUTE_REQUEST_TIMEOUT_MS (DynamicRouteClient.ts),
- * leaving the Edge Function time to load stops and answer before the phone
+ * Inside the 10 s request timeout the Epic 9-14 app builds gave route-stops
+ * (their DynamicRouteClient; the app's route client was deleted in Epic 16),
+ * leaving the Edge Function time to load stops and answer before such a phone
  * gives up and a routing request we paid for is thrown away.
  */
 export const DEFAULT_TIMEOUT_MS = 7_000;

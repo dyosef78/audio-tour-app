@@ -1,7 +1,7 @@
 import { Platform, StyleSheet, View } from 'react-native';
 import MapView, { Circle, Marker, Polygon, Polyline, PROVIDER_GOOGLE, type Region } from 'react-native-maps';
 
-import type { RouteSource } from '../routing/routeDecision';
+import type { RouteSource } from '../routing/routeDisplay';
 import type { LatLng, Waypoint } from '../types/domain';
 
 /**
@@ -14,15 +14,15 @@ import type { LatLng, Waypoint } from '../types/domain';
  *    below is rendered from the store instead, so what you see is provably what
  *    the engine is acting on.
  *
- * 2. The line follows the ROUTE (TASK-604) - a live one through the selected
- *    stops, or the one from the offline bundle - already decoded and checked
- *    against the stops by RouteManager. Only when a tour has no route does it
+ * 2. The line follows the tour's authored ROUTE from the offline bundle
+ *    (TASK-604), decoded and checked against the session's stops at start
+ *    (routeGeometry.decodeRoute). Only when a tour has no usable route does it
  *    fall back to joining the stops directly, and then it is DASHED, so the
  *    placeholder cannot be mistaken for a path through the buildings.
  *
- * `waypoints` are the stops this session runs. Stops the preferences skipped
- * never reach this component, so their pins are simply absent while the
- * bundled route still runs past them.
+ * `waypoints` are the stops this session runs - every core stop (Epic 16).
+ * Extensions never reach this component, and the authored route does not
+ * detour to them (cms_validate_tour checks the route against core stops).
  */
 
 interface Props {
@@ -44,8 +44,6 @@ interface Props {
 }
 
 const ROUTE_STYLE: Record<RouteSource, { color: string; width: number; dash?: number[] }> = {
-  // Teal marks a route drawn for YOUR stops; ink, the tour's standard route.
-  dynamic: { color: 'rgba(12,108,106,0.92)', width: 5 },
   static: { color: 'rgba(28,28,30,0.8)', width: 5 },
   straight: { color: 'rgba(28,28,30,0.55)', width: 3, dash: [10, 8] },
 };

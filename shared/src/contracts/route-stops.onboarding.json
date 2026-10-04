@@ -1,8 +1,8 @@
 {
   "//": [
     "TASK-1103: the route-stops request a finished onboarding produces, pinned for BOTH sides.",
-    "mobile/scripts/test-ui-logic.ts drives the real preferences store through the wizard and must build `request` byte-for-byte;",
-    "supabase/functions/route-stops/route-stops.test.ts sends `request` to the real handler and must get `expected_order`.",
+    "Epic 16: the app no longer calls route-stops (it plays core stops in authored order), so the mobile half of this contract was deleted.",
+    "supabase/functions/route-stops/route-stops.test.ts still sends `request` to the real handler and must get `expected_order`.",
     "Interests are listed in TAP order (nature before culinary) on purpose: the answer must not depend on it.",
     "`stops` are chosen so ONLY the full preferences reorder them: stop 3 is 820 m out, inside the 800-840 m band where group type",
     "alone, interests alone, or just the first interest all leave the authored order. A side that drops a field fails.",

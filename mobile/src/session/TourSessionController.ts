@@ -29,7 +29,6 @@ import { sessionStops, type SessionStops } from '../routing/stopSelection';
 import { remoteTranscripts } from '../transcript/TranscriptRepository';
 import { EngineRunner, type EngineRunnerPorts } from './EngineRunner';
 import { decideSnapshotResume, type TourProgressSnapshot } from './progressRepository';
-import { routeManager } from './routing';
 import { tourProgress } from './sessionCheckpointFile';
 import { useTourSession, type ChapterView } from './tourSessionStore';
 import type { GpsFix } from '../engine/types';
@@ -1058,9 +1057,6 @@ class TourSessionController {
     } catch (err) {
       console.warn('[TourSession] tour notifications could not be dismissed:', err);
     }
-
-    // Aborts any route request a pre-Epic-15 path left in flight.
-    routeManager.stop();
 
     useTourSession.getState().reset();
   }

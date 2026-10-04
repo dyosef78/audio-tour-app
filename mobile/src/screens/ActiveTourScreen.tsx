@@ -6,12 +6,13 @@ import TourMap from '../components/TourMap';
 import { SessionStartError, tourSession } from '../session/TourSessionController';
 import { useTourSession } from '../session/tourSessionStore';
 import type { ActiveTourScreenProps } from '../navigation/types';
-import type { RouteSource } from '../routing/routeDecision';
+import type { RouteSource } from '../routing/routeDisplay';
 
+// Nothing replaces the drawn route mid-walk any more (Epic 16), so neither
+// label promises an update.
 const ROUTE_LABEL: Record<RouteSource, string> = {
-  dynamic: 'Route updated for your stops',
-  static: 'Offline route',
-  straight: 'No route yet - stops joined directly',
+  static: 'Tour route',
+  straight: 'No route - stops joined directly',
 };
 
 /**

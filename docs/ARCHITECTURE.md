@@ -83,12 +83,10 @@ when the visitor ends it; reaching the last stop just offers to.
 
 ```mermaid
 flowchart LR
-  subgraph Device["📱 Mobile client (offline-capable)"]
-    GPS[Adaptive GPS] --> GEO[Geofence engine<br/>StopSequence]
-    GEO --> AUD[AudioService]
-    RM[RouteManager] --> GEO
-    RM <--> RC[(Route cache<br/>AsyncStorage)]
-    BUNDLE[(Offline bundle<br/>files + manifest)] --> GEO
+  subgraph Device["📱 Mobile client: an executor, not a planner"]
+    GPS[Adaptive GPS] --> ENG[Engine<br/>loose-sequence, per chapter]
+    ENG --> AUD[AudioService]
+    BUNDLE[(Offline bundle<br/>files + manifest)] --> ENG
     BUNDLE --> AUD
     TEL[Telemetry queue]
   end
@@ -96,9 +94,8 @@ flowchart LR
   subgraph Supabase["☁️ Supabase"]
     PG[(PostgreSQL + PostGIS<br/>RLS)]
     ST[(Storage<br/>audio-tracks, private)]
-    EF[Edge Function<br/>route-stops]
-    LEG[(route_legs_cache)]
-    RL[(rate_limit_buckets)]
+    PT[Edge Function<br/>plan-tour - Epic 16, in progress]
+    EF[Edge Function<br/>route-stops - no app caller since Epic 15]
     AUTH[Auth<br/>Google / Apple OAuth]
   end
 
@@ -108,11 +105,9 @@ flowchart LR
 
   Device -->|get_tour_bundle RPC| PG
   Device -->|signed URLs, download| ST
-  RM -->|POST route-stops| EF
-  EF -->|get_tour_bundle as caller| PG
-  EF <-->|service role| LEG
-  EF <-->|service role| RL
-  EF -->|missing legs only| VAL[Valhalla<br/>Stadia Maps]
+  Device -.->|plan request - Part 3| PT
+  PT -->|get_planner_candidates, service role| PG
+  ENG -.->|chapter handoff| NAV[Google Maps / Waze]
   TEL -->|insert-only| PG
 ```
 
@@ -315,6 +310,10 @@ audio before upload (see §5.2).
 
 ### 3.4 `route-stops` Edge Function & the Smart Sorter
 
+> **No app caller since Epic 15** (the app plays authored order; Epic 16 deleted
+> its client). Still deployed for TestFlight builds from Epic 9-14. Whether to
+> retire it and `route_legs_cache` is an open PM decision.
+
 `POST /functions/v1/route-stops`: a Deno Edge Function that orders a tour's
 stops and returns a walkable route through them.
 
@@ -451,6 +450,13 @@ This runs before the body is read or the database is asked:
 React Native + Expo SDK 57, Zustand stores. **Screens observe, they never
 own:** `TourSessionController` is the single owner of GPS and audio hardware.
 
+**The client is a dumb executor (Epic 16).** It plans nothing, orders nothing and
+calls no routing service. It runs either a tour's **authored sequence** from the
+offline bundle (a catalogue session: every core stop, §1.2) or, once Part 3
+lands, a **server-planned bundle** from `plan-tour`. Routing between chapters is
+handed to Google Maps / Waze. Every decision about which stops run, in what
+order, lives on the server; the device only executes it faithfully offline.
+
 ```mermaid
 flowchart LR
   Welcome[Welcome<br/>optional sign-in] --> City[City<br/>only if 2+] --> Prefs[Group → Interests → Time] --> Discovery --> Detail[Tour Detail<br/>download] --> Active[Active Tour<br/>map + player sheet]
@@ -527,6 +533,13 @@ that cannot track.
 
 ### 4.3 Local geofencing engine — strictly linear
 
+> **Superseded (Epic 15).** `StopSequence` below was deleted in Epic 15 and
+> replaced by the loose-sequence engine in `mobile/src/engine/` (`reduce.ts`,
+> `zone.ts`, `geo/`, `fromManifest.ts`): per-chapter windowed or strict
+> sequencing, swept-segment zone tests, bearing gating, a narration queue with
+> expiry. `npm run sim:drive` is its executable specification. This section is
+> kept until it is rewritten; trust the code and the sim over it.
+
 Containment is computed on the device, not with OS geofencing. iOS caps OS
 regions at 20 and supports no polygons, and OS events cannot be tuned for
 hysteresis. Radius zones use haversine; polygon zones use ray casting.
@@ -568,54 +581,33 @@ Per GPS fix:
 > **Authoring rule:** space stops so that `gap > (r_a + r_b) × exitHysteresisFactor`.
 > Clearing the *entry* radii is not enough.
 
-### 4.4 Routing & adherence to the server's `waypoint_ids`
+### 4.4 Which stops run, and what the map draws (Epic 16)
 
-`RouteManager` keeps the map's route right as connectivity changes, and keeps
-**narration order identical to the drawn route**.
+**Stops.** `routing/stopSelection.ts` (`sessionStops`) is the one place that
+decides. A catalogue session runs every **core** stop, transitions included, in
+authored `sort_order`, and nothing else; extensions are never armed. A bundle
+with an unknown `stop_role` is refused at the wire boundary (`isWireBundle`),
+and one marking a transition as an extension is refused at start. Preferences do
+not remove stops (TASK-604 retired, PM 4 Oct 2026). A planned session will add a
+second mode to the same function.
 
-**What is drawn**, best first:
+**Map.** One of two things, chosen once at session start:
 
-1. **`dynamic`**: a live or cached route in the Smart Sorter's order.
-2. **`static`**: the bundled route, in authored order.
-3. **`straight`**: dashed lines between stops in narration order.
+1. **`static`**: the tour's authored route from the bundle, decoded at its
+   declared precision and checked to pass every session stop
+   (`routeGeometry.decodeRoute`). `cms_validate_tour` checks that route against
+   core stops only, so it never detours to an extension.
+2. **`straight`**: dashed lines between the stops in authored order, when the
+   tour has no usable route.
 
-**Fetch policy.** Every session requests a live route whenever online, filtered
-or not, once the cache has been read, until one live route arrives. Each attempt
-carries `context.local_time` (device wall clock **with its UTC offset**, stamped
-per attempt) and the **preferences snapshot taken at session start**. Editing
-preferences mid-walk reshuffles nothing. The app makes up to 3 attempts, with
-backoff of 5 s then 20 s. A reconnect retries at once, and a connection dropped
-mid-request does not spend an attempt.
+Nothing replaces the line mid-walk.
 
-**Adherence rules:**
-
-| Situation | Map | Narration order | Cache |
-|---|---|---|---|
-| Live route validates and `waypoint_ids` names exactly the session's stops | Live route | **`waypoint_ids`** | Written under that order |
-| Live route without `waypoint_ids` (pre-Epic-8 server) | Live route | The authored order it was sent | Written under that order |
-| `waypoint_ids` does not match the session's stops | Rejected | Unchanged | Not written |
-| Route fails validation (wrong precision, misses a stop) | Rejected | Unchanged | Not written |
-| Offline, cache hit for the **predicted** order | Cached route | Predicted order | — |
-| Offline, no cached route for that order | Static or straight | Authored | — |
-
-Every route, whether live, cached or bundled, is decoded at its **declared**
-precision and checked to pass within tolerance of every stop before it is drawn.
-A new order arriving mid-walk re-sequences the engine and keeps progress.
-
-#### Order-dependent cache
-
-- **Key:** `route:dynamic:v2:<tourId>:<bundleHash>:<ordered waypoint ids>`. A
-  morning order and a sunset order for the same stops are separate entries.
-- **Written only under the order the server actually routed**, so a hit always
-  pairs a route with a matching narration order.
-- **Offline lookup needs the order before the server can give it**, so the app
-  runs the **same Smart Sorter** (`predictStopOrder`) with the session's
-  preferences and current local time, then reads that key. If the prediction
-  diverges from the server (for example a newer sorter version), the cost is a
-  cache miss, never a mismatched route.
-- **Online, the server is asked even on a hit**, and its answer replaces the
-  cached route and order.
-- No bundle hash means no caching. `v1` keys (unordered) are never read.
+**Deleted in Epic 16** (dead since Epic 15, when sessions stopped calling it):
+`RouteManager`, `DynamicRouteClient`, `RouteCache`, `routeRequest`
+(`predictStopOrder`, the on-device Smart Sorter prediction) and the `dynamic`
+route. Devices that ran Epic 9-14 builds keep a few kB of
+`route:dynamic:v2:*` AsyncStorage entries that nothing reads; they were left
+rather than purged at every app start.
 
 ### 4.5 Telemetry
 
@@ -721,13 +713,9 @@ The extension must match the codec because AVFoundation infers the format from i
 - **Keep `shared/` free of npm imports and use real `.ts` specifiers:** Deno,
   Node and Metro all consume it.
 - **The onboarding → `route-stops` payload is a pinned contract** (TASK-1103):
-  `shared/src/contracts/route-stops.onboarding.json`. `test:ui` drives the real
-  preferences store through the wizard and must build its `request` exactly;
-  `test:edge` sends that request to the real handler and must get its
-  `expected_order`. The stops are placed so ONLY the full preferences reorder
-  them, so a side that drops `group_type` or an interest fails. Change the wire
-  shape there first. The time budget and city are deliberately not in the
-  request: they pick the tour, not the route.
+  `shared/src/contracts/route-stops.onboarding.json`. Since Epic 16 only the
+  server half remains: `test:edge` sends that request to the real handler and
+  must get its `expected_order`. The app no longer calls `route-stops`.
 - **Engine simulation** (in CI, no network): `npm run sim:drive` - the real
   Epic 15 engine path (manifest → EngineRunner → AudioActor, real progress
   repository) on a simulated drive-then-walk day with a tunnel, a detour, a
@@ -843,9 +831,9 @@ good practice rather than an App Store rejection risk on its own.
 | CMS ingest | `backend/cms/` |
 | Media pipeline | `backend/media/` (`presets.ts` is the audio standard, per-file limit and bitrate planning) |
 | Session owner | `mobile/src/session/TourSessionController.ts` |
-| GPS + geofencing | `mobile/src/services/location/` (`LocationService.ts`, `stopSequence.ts`, `geometry.ts`) |
+| GPS + geofencing | `mobile/src/services/location/LocationService.ts` (transport); `mobile/src/engine/` (the Epic 15 engine) |
 | Transit profiles | `mobile/src/config/transitProfiles.ts` |
-| Routing | `mobile/src/routing/` (`RouteManager.ts`, `routeDecision.ts`, `routeRequest.ts`), `mobile/src/services/routing/` |
+| Which stops run, what is drawn | `mobile/src/routing/` (`stopSelection.ts` sessionStops, `routeDisplay.ts`, `routeGeometry.ts`) |
 | Offline bundle | `mobile/src/services/bundle/` |
 | Audio | `mobile/src/services/audio/AudioService.ts` |
 | Transcripts | `mobile/src/transcript/` |

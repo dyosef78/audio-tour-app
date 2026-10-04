@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 
-import type { RouteDisplay } from '../routing/routeDecision';
+import type { RouteDisplay } from '../routing/routeDisplay';
 import type { LatLng, TransitMode, Waypoint } from '../types/domain';
 
 /**
@@ -27,12 +27,11 @@ export interface TourSessionState {
   tourTitle: string | null;
   transitMode: TransitMode | null;
   /**
-   * The stops this session RUNS - every core stop (Epic 16) - in
-   * the order they narrate: authored order, until a live route supplies its
-   * own (TASK-902, setStopOrder).
+   * The stops this session RUNS - every core stop (Epic 16) - in the order
+   * they narrate: authored sort_order.
    */
   waypoints: Waypoint[];
-  /** What the map draws, maintained by RouteManager as connectivity changes. */
+  /** What the map draws: the bundled route or straight lines, set once at session start. */
   route: RouteDisplay;
 
   /** Live position, for the map dot. Highest-frequency field in the store. */
