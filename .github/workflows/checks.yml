@@ -65,6 +65,10 @@ jobs:
       - name: Plan mode tests
         run: npm run test:plan
 
+      # Epic 16 Part 5: admin CLIs sign in by emailed one-time code.
+      - name: Admin OTP sign-in tests
+        run: npm run test:admin-auth
+
       - name: CMS contract tests
         run: npm run test:cms
 

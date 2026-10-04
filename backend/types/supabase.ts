@@ -234,6 +234,8 @@ export type Database = {
       cities: {
         Row: {
           center: unknown
+          center_lat: number | null
+          center_lon: number | null
           country_code: string
           created_at: string
           id: string
@@ -242,6 +244,8 @@ export type Database = {
         }
         Insert: {
           center: unknown
+          center_lat?: never
+          center_lon?: never
           country_code: string
           created_at?: string
           id?: string
@@ -250,6 +254,8 @@ export type Database = {
         }
         Update: {
           center?: unknown
+          center_lat?: never
+          center_lon?: never
           country_code?: string
           created_at?: string
           id?: string

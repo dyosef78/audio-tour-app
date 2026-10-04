@@ -34,7 +34,8 @@
  *
  * Env:
  *   SUPABASE_URL, SUPABASE_ANON_KEY
- *   SUPABASE_ADMIN_EMAIL, SUPABASE_ADMIN_PASSWORD   - a row in public.app_admins
+ *   SUPABASE_ADMIN_EMAIL                            - a row in public.app_admins; signs in
+ *                                                     by an emailed one-time code (no passwords)
  *   FFMPEG_PATH, FFPROBE_PATH                       - if not on PATH
  *
  * There is no service_role path, by design. Every cms_* function calls
@@ -50,6 +51,7 @@ import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 
 import { MediaPipelineError } from '../media/index.ts';
 import { CmsIngestError, ingestWaypointAudio } from '../cms/index.ts';
+import { adminSessionFromEnv } from '../cms/adminSession.ts';
 
 // =============================================================================
 // 1. The spacing rule
@@ -512,41 +514,11 @@ interface WaypointRow {
 }
 
 async function adminClient(): Promise<SupabaseClient> {
-  const url = process.env['SUPABASE_URL'];
-  const anonKey = process.env['SUPABASE_ANON_KEY'];
-  const email = process.env['SUPABASE_ADMIN_EMAIL'];
-  const password = process.env['SUPABASE_ADMIN_PASSWORD'];
-
-  if (!url || !anonKey) throw new Error('SUPABASE_URL and SUPABASE_ANON_KEY must be set.');
-  if (!email || !password) {
-    throw new Error(
-      'SUPABASE_ADMIN_EMAIL and SUPABASE_ADMIN_PASSWORD must be set - they must name an ' +
-        'account that has a row in public.app_admins.\n' +
-        'There is no service_role fallback: every cms_* function resolves auth.uid(), which a ' +
-        'service key leaves NULL, so the guard rejects it. See backend/cms/client.ts.\n' +
-        'Use --dry-run to exercise TTS and the media pipeline without any credentials.',
-    );
-  }
-
-  const supabase = createClient(url, anonKey, {
-    auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
-  });
-
-  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-  if (error || !data.session) {
-    throw new Error(`Could not sign in as ${email}: ${error?.message ?? 'no session returned'}`);
-  }
-
-  const { data: isAdmin, error: adminError } = await supabase.rpc('is_cms_admin');
-  if (adminError) throw new Error(`is_cms_admin() failed: ${adminError.message}`);
-  if (isAdmin !== true) {
-    throw new Error(
-      `${email} signed in but is not a CMS admin - there is no row for it in public.app_admins. ` +
-        'Every write below would fail with 42501.',
-    );
-  }
-
-  return supabase;
+  // Email one-time code, then is_cms_admin() (backend/cms/adminSession.ts).
+  // There is no service_role fallback: every cms_* function resolves
+  // auth.uid(), which a service key leaves NULL, so the guard rejects it.
+  // Use --dry-run to exercise TTS and the media pipeline without any credentials.
+  return (await adminSessionFromEnv()).supabase;
 }
 
 async function accessTokenOf(supabase: SupabaseClient): Promise<string> {

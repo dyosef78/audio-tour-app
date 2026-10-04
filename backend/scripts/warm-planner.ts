@@ -6,15 +6,15 @@
  * budgeted batch on the server; this loop only decides WHEN to call next.
  * Safe to stop and re-run at any time - the server recomputes what is missing.
  *
- * Signs in as a CMS ADMIN (SUPABASE_ADMIN_EMAIL / SUPABASE_ADMIN_PASSWORD):
- * no service-role key ever sits on a laptop. Also needs SUPABASE_URL and
+ * Signs in as a CMS ADMIN by an emailed one-time code (SUPABASE_ADMIN_EMAIL;
+ * no passwords, no service-role key on a laptop). Also needs SUPABASE_URL and
  * SUPABASE_ANON_KEY. The npm script reads .env and mobile/.env.
  *
  * Exit codes: 0 complete (or dry run), 2 time ran out with cells remaining,
  * 1 an error.
  */
 
-import { createClient } from '@supabase/supabase-js';
+import { adminSessionFromEnv } from '../cms/adminSession.ts';
 
 interface Args {
   city: string;
@@ -58,22 +58,12 @@ async function main(): Promise<number> {
   const args = parseArgs(process.argv.slice(2));
   const url = process.env.SUPABASE_URL;
   const anonKey = process.env.SUPABASE_ANON_KEY;
-  const email = process.env.SUPABASE_ADMIN_EMAIL;
-  const password = process.env.SUPABASE_ADMIN_PASSWORD;
-  if (!url || !anonKey || !email || !password) {
-    console.error('Needs SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_ADMIN_EMAIL and SUPABASE_ADMIN_PASSWORD (mobile/.env).');
+  if (!url || !anonKey) {
+    console.error('Needs SUPABASE_URL and SUPABASE_ANON_KEY (mobile/.env).');
     return 1;
   }
-
-  // No auto-refresh: its timer would keep the process alive after the loop
-  // ends. A run is bounded by --max-minutes (<= 240), and each batch re-reads
-  // the session, so an expiring token is refreshed explicitly below.
-  const supabase = createClient(url, anonKey, { auth: { persistSession: false, autoRefreshToken: false } });
-  const { error: signInError } = await supabase.auth.signInWithPassword({ email, password });
-  if (signInError) {
-    console.error(`Sign-in failed: ${signInError.message}`);
-    return 1;
-  }
+  // Email one-time code, then is_cms_admin() (backend/cms/adminSession.ts).
+  const { supabase } = await adminSessionFromEnv();
 
   const deadline = Date.now() + args.maxMinutes * 60_000;
   let totalFilled = 0;

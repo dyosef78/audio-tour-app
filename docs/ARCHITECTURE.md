@@ -486,6 +486,22 @@ rows. Run `npm run planner:warm -- --city <slug>` after publishing (it signs
 in as a CMS admin and calls until done; `--dry-run` only counts). Phase 2:
 the same function on `pg_cron`.
 
+**Origin search: `places-search` (Part 5).** The planner's origin is the
+current location or a Google Places (New) search, proxied so the key never
+ships in the app (`GOOGLE_PLACES_API_KEY`, server only). Autocomplete is
+biased to the city (`cities.center_lon/center_lat`, generated columns);
+details ask only for `id,location,formattedAddress`. One UUID v4 session
+token per search, ended by the details call, so Google bills one session.
+Rate limited per IP and globally - the anon key is public, so the global
+bucket is the spend ceiling; a daily quota in Google Cloud is the backstop.
+What the visitor types is never logged.
+
+**Admin CLIs sign in by email code (Part 5).** `cms:ingest`, `seed:telaviv`,
+`planner:warm` and `test:db -- --admin` use `backend/cms/adminSession.ts`:
+`signInWithOtp` (never creates an account), the admin types the emailed
+code, `verifyOtp`, then `is_cms_admin()`. No password, no persisted session,
+no non-interactive bypass.
+
 **One Valhalla budget.** `route-stops`, `plan-tour`'s fill and `warm-costs`
 each spend a token from `valhalla:global` (120/min, `VALHALLA_BUDGET_*`) in
 the same atomic `consume_rate_limit` call as their own sub-bucket
@@ -876,7 +892,7 @@ good practice rather than an App Store rejection risk on its own.
 | Area | Path |
 |---|---|
 | Migrations & seeds | `supabase/migrations/`, `supabase/seed.sql`, `prod_test_seed.sql` |
-| Edge Functions | `supabase/functions/plan-tour/` (`handler.ts` contract, `index.ts` wiring); `supabase/functions/warm-costs/` (the cost reconciler); `supabase/functions/route-stops/` (`handler.ts` contract, `legCache.ts`, `routeCache.ts`); `supabase/functions/delete-account/` (`handler.ts` contract, `appleRevoke.ts`, `googleRevoke.ts`); `supabase/functions/_shared/` (`rateLimit.ts`, `valhallaBudget.ts`, `costFill.ts`, `costWriters.ts`, `logger.ts`) |
+| Edge Functions | `supabase/functions/plan-tour/` (`handler.ts` contract, `index.ts` wiring); `supabase/functions/warm-costs/` (the cost reconciler); `supabase/functions/places-search/` (Google Places proxy); `supabase/functions/route-stops/` (`handler.ts` contract, `legCache.ts`, `routeCache.ts`); `supabase/functions/delete-account/` (`handler.ts` contract, `appleRevoke.ts`, `googleRevoke.ts`); `supabase/functions/_shared/` (`rateLimit.ts`, `valhallaBudget.ts`, `costFill.ts`, `costWriters.ts`, `logger.ts`) |
 | Planner | `shared/src/planner/` (pure: `costBook.ts`, `chapterOptions.ts`, `sequence.ts`, `plan.ts`); contract `shared/src/contracts/planTour.ts` |
 | Shared (Deno + Node + Metro) | `shared/src/` (`smartSorter.ts`, `polyline.ts`, `routeTolerance.ts`, `routing/valhalla.ts`) |
 | CMS ingest | `backend/cms/` |

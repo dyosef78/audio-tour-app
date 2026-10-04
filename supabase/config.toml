@@ -475,6 +475,11 @@ enabled = true
 verify_jwt = true
 import_map = "./functions/import_map.json"
 
+[functions.places-search]
+enabled = true
+verify_jwt = true
+import_map = "./functions/import_map.json"
+
 [functions.delete-account]
 enabled = true
 verify_jwt = true

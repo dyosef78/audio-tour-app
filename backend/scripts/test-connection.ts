@@ -23,7 +23,8 @@
  *
  * Run:  npm run test:db
  * Env:  SUPABASE_URL, SUPABASE_ANON_KEY               (see .env.example)
- *       SUPABASE_ADMIN_EMAIL, SUPABASE_ADMIN_PASSWORD (optional, see below)
+ *       SUPABASE_ADMIN_EMAIL + `-- --admin`             (optional: the admin path,
+ *                                                       signing in by emailed code)
  *       TEST_TOUR_ID                                  (optional, see below)
  *
  * Uses the ANON key deliberately. A service_role key bypasses RLS and would
@@ -39,6 +40,7 @@
  */
 
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+import { adminSessionFromEnv } from '../cms/adminSession.ts';
 
 const BUCKET = 'audio-tracks';
 
@@ -71,7 +73,8 @@ const SIGNED_URL_TTL_SECONDS = 60;
 const url = process.env.SUPABASE_URL;
 const anonKey = process.env.SUPABASE_ANON_KEY;
 const adminEmail = process.env.SUPABASE_ADMIN_EMAIL;
-const adminPassword = process.env.SUPABASE_ADMIN_PASSWORD;
+/** The admin path signs in by emailed code, so it runs only when asked: `npm run test:db -- --admin`. */
+const runAdminPath = process.argv.includes('--admin');
 
 if (!url || !anonKey) {
   console.error(
@@ -434,26 +437,19 @@ async function main(): Promise<void> {
 async function checkAdminPath(samplePath: string | undefined): Promise<void> {
   console.log('\nAdmin storage access');
 
-  if (!adminEmail || !adminPassword) {
-    skip(
-      'admin session',
-      'SUPABASE_ADMIN_EMAIL / SUPABASE_ADMIN_PASSWORD not set (see .env.example)',
-    );
+  if (!runAdminPath || !adminEmail) {
+    skip('admin session', 'run `npm run test:db -- --admin` with SUPABASE_ADMIN_EMAIL set (emailed code)');
     return;
   }
 
-  // A separate client. Signing in on `supabase` would silently upgrade every
-  // check above from anon to admin on a re-run, which is the kind of thing that
-  // makes a green suite meaningless.
-  const admin: SupabaseClient = createClient(url as string, anonKey as string);
-
-  const { error: signInError } = await admin.auth.signInWithPassword({
-    email: adminEmail,
-    password: adminPassword,
-  });
-
-  if (signInError) {
-    assert('admin sign-in', false, signInError.message);
+  // A separate client (adminSessionFromEnv makes its own). Signing in on
+  // `supabase` would silently upgrade every check above from anon to admin on
+  // a re-run, which is the kind of thing that makes a green suite meaningless.
+  let admin: SupabaseClient;
+  try {
+    admin = (await adminSessionFromEnv()).supabase;
+  } catch (cause) {
+    assert('admin sign-in', false, cause instanceof Error ? cause.message : String(cause));
     return;
   }
 

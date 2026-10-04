@@ -24,7 +24,8 @@
  *
  * Env:
  *   SUPABASE_URL, SUPABASE_ANON_KEY
- *   SUPABASE_ADMIN_EMAIL, SUPABASE_ADMIN_PASSWORD   - an app_admins account
+ *   SUPABASE_ADMIN_EMAIL                            - an app_admins account; a one-time
+ *                                                     code is emailed and typed in (no passwords)
  *   FFMPEG_PATH, FFPROBE_PATH                       - if not on PATH
  *
  * The admin credentials are the point, not a convenience: there is no
@@ -33,7 +34,6 @@
 
 import { readFile } from 'node:fs/promises';
 
-import { createClient } from '@supabase/supabase-js';
 
 import { MediaPipelineError } from '../media/index.ts';
 import {
@@ -46,6 +46,7 @@ import {
   type TrackKind,
   type TranscriptIngestResult,
 } from '../cms/index.ts';
+import { AdminSignInError, adminSessionFromEnv } from '../cms/adminSession.ts';
 
 interface Args {
   file: string;
@@ -129,37 +130,17 @@ function parseArgs(argv: readonly string[]): Args {
 }
 
 /**
- * Trade the admin's email and password for an access token.
- *
- * A browser CMS would already hold this from its session; the CLI has to sign
- * in for itself. Email/password SIGNUP is disabled project-wide, which does not
- * prevent sign-in for an account that already exists.
+ * The admin's access token, by email one-time code (Epic 16 Part 5 - no
+ * static passwords for production admin access). backend/cms/adminSession.ts.
  */
 async function adminAccessToken(): Promise<string> {
-  const url = process.env['SUPABASE_URL'];
-  const anonKey = process.env['SUPABASE_ANON_KEY'];
-  const email = process.env['SUPABASE_ADMIN_EMAIL'];
-  const password = process.env['SUPABASE_ADMIN_PASSWORD'];
-
-  if (!url || !anonKey) fail('SUPABASE_URL and SUPABASE_ANON_KEY must be set. See .env.example.');
-  if (!email || !password) {
-    fail(
-      'SUPABASE_ADMIN_EMAIL and SUPABASE_ADMIN_PASSWORD must be set for a real ingest.\n' +
-        'Use --dry-run to process and name a file without touching Storage or the database.',
-    );
+  try {
+    return (await adminSessionFromEnv()).accessToken;
+  } catch (cause) {
+    if (cause instanceof AdminSignInError) fail(`${cause.message}
+Use --dry-run to process and name a file without touching Storage or the database.`);
+    throw cause;
   }
-
-  const supabase = createClient(url, anonKey, {
-    auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
-  });
-
-  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-
-  if (error || !data.session) {
-    fail(`Could not sign in as ${email}: ${error?.message ?? 'no session returned'}`);
-  }
-
-  return data.session.access_token;
 }
 
 function report(result: AudioIngestResult, dryRun: boolean): void {
