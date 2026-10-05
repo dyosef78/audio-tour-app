@@ -28,6 +28,7 @@
     "test:planner": "node backend/scripts/test-planner.ts",
     "test:plan": "node mobile/scripts/test-plan-mode.ts",
     "test:admin-auth": "node backend/scripts/test-admin-auth.ts",
+    "auth:inspect-amr": "node --env-file-if-exists=.env --env-file-if-exists=mobile/.env backend/scripts/inspect-admin-amr.ts",
     "planner:warm": "node --env-file-if-exists=.env --env-file-if-exists=mobile/.env backend/scripts/warm-planner.ts",
     "test:edge": "deno test --import-map=supabase/functions/import_map.json supabase/functions/",
     "check:edge": "deno check --import-map=supabase/functions/import_map.json supabase/functions/route-stops/index.ts supabase/functions/delete-account/index.ts supabase/functions/plan-tour/index.ts supabase/functions/warm-costs/index.ts supabase/functions/places-search/index.ts",

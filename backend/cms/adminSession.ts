@@ -88,7 +88,9 @@ export async function signInAdminWithOtp(client: OtpAuthClient, email: string, i
     if (!error && data.session) {
       const { data: isAdmin, error: adminError } = await client.rpc('is_cms_admin');
       if (adminError) throw new AdminSignInError(`Signed in, but is_cms_admin() failed: ${adminError.message}`);
-      if (isAdmin !== true) throw new AdminSignInError(`${maskEmail(email)} signed in but is not a CMS admin (no row in public.app_admins).`);
+      // Since 20261008120000 there are two reasons: no app_admins row, or a
+      // token whose amr lacks "otp" (npm run auth:inspect-amr shows which).
+      if (isAdmin !== true) throw new AdminSignInError(`${maskEmail(email)} signed in but is not a CMS admin: no row in public.app_admins, or the session token does not record an email-code sign-in (run npm run auth:inspect-amr).`);
       return { accessToken: data.session.access_token };
     }
     io.say(`That code was not accepted (${error?.message ?? 'no session'}).`);

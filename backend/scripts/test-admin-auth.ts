@@ -4,6 +4,7 @@
  */
 
 import { AdminSignInError, maskEmail, MAX_CODE_ATTEMPTS, signInAdminWithOtp, type OtpAuthClient, type OtpIo } from '../cms/adminSession.ts';
+import { decodeJwtPayload, describeAmr, hasOtpAmr } from '../cms/jwtClaims.ts';
 
 let checks = 0;
 let failures = 0;
@@ -83,6 +84,26 @@ await rejects('signed in but not an admin -> stop', signInAdminWithOtp(fake({ is
   assert('the address is masked on screen', t.said.some((l) => l.includes('a****@example.com')) && !t.said.some((l) => l.includes(EMAIL)), JSON.stringify(t.said));
 }
 assert('maskEmail keeps the domain, hides the user', maskEmail('dana@x.io') === 'd***@x.io' && maskEmail('nope') === '***');
+
+
+// jwtClaims - what auth:inspect-amr reports, and the twin of 20261008120000's predicate.
+{
+  const b64url = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const jwt = (claims: unknown) => `${b64url({ alg: 'HS256' })}.${b64url(claims)}.sig`;
+  const otp = { amr: [{ method: 'otp', timestamp: 1759650000 }], aal: 'aal1', role: 'authenticated' };
+  const decoded = decodeJwtPayload(jwt(otp));
+  assert('a token payload decodes (base64url)', JSON.stringify(decoded.amr) === JSON.stringify(otp.amr));
+  assert('Supabase shape (objects with method "otp") passes', hasOtpAmr(decoded) && describeAmr(decoded).shape === 'array_of_objects');
+  assert('password sign-in fails', !hasOtpAmr({ amr: [{ method: 'password', timestamp: 1 }] }));
+  assert('Apple/Google (oauth) fails', !hasOtpAmr({ amr: [{ method: 'oauth', timestamp: 1 }] }));
+  assert('otp among several methods passes', hasOtpAmr({ amr: [{ method: 'password', timestamp: 1 }, { method: 'otp', timestamp: 2 }] }));
+  assert('RFC 8176 strings ["otp"] FAIL - the lockout shape the inspection exists to catch', !hasOtpAmr({ amr: ['otp'] }) && describeAmr({ amr: ['otp'] }).shape === 'array_of_strings');
+  assert('no amr fails, and is reported as absent', !hasOtpAmr({}) && describeAmr({}).shape === 'absent');
+  assert('a non-array amr fails without throwing', !hasOtpAmr({ amr: { method: 'otp' } }) && describeAmr({ amr: 'otp' }).shape === 'other');
+  let threw = false;
+  try { decodeJwtPayload('not-a-token'); } catch { threw = true; }
+  assert('a non-JWT is refused loudly', threw);
+}
 
 console.log(`\n${checks - failures}/${checks} checks passed`);
 if (failures > 0) process.exit(1);

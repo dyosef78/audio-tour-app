@@ -650,5 +650,21 @@ heading('Telemetry vocabulary: database == app');
   eq('telemetry_events_event_type_check == TelemetryEventType', db, app);
 }
 
+
+// is_cms_admin() requires an email-code sign-in (Epic 16, PM 5 Oct 2026).
+// Read from the LAST migration that defines it: a later CREATE OR REPLACE that
+// drops the amr predicate would quietly reopen password-based admin access.
+{
+  const defining = migrationFiles.filter((f) => /CREATE\s+OR\s+REPLACE\s+FUNCTION\s+public\.is_cms_admin\s*\(/i.test(read(f)));
+  const last = defining[defining.length - 1] ?? '';
+  const body = read(last).replace(/--[^\n]*/g, '');
+  assert(
+    `is_cms_admin() (latest: ${last.split(/[\\/]/).pop()}) requires amr method "otp"`,
+    /jsonb_path_exists\s*\(\s*auth\.jwt\(\)\s*,\s*'\$\.amr\[\*\]\s*\?\s*\(@\.method\s*==\s*"otp"\)'\s*\)/.test(body),
+  );
+  assert('...only when amr is an ARRAY (lax jsonpath would accept a bare object)', /jsonb_typeof\s*\(\s*auth\.jwt\(\)\s*->\s*'amr'\s*\)\s*=\s*'array'/.test(body));
+  assert('...and still requires an app_admins row and a non-anonymous caller', /app_admins\s+a\s+WHERE\s+a\.user_id\s*=\s*auth\.uid\(\)/i.test(body) && /is_anonymous/.test(body));
+}
+
 console.log(`\n${checks - failures}/${checks} checks passed`);
 if (failures > 0) process.exit(1);
