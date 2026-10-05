@@ -10,13 +10,17 @@
  *   downloadPlanBundles     conflict / stale / invalid / ready
  *   PlacesSession           session tokens, debounce, latest-wins, dispose
  *   planForm                the request, error copy, preview rows
+ *   planReconciler          plan file vs bundles on disk: promote, remove, leave
+ *   createPlanDownloadJobs  one job per plan, write-ahead intent, outcomes kept
  */
 
 import { parsePlanTourOk, type PlanTourOk, type PlanTourRequest } from '../../shared/src/contracts/planTour.ts';
 import { engineTourFromPlan, isTransferChapter, planChapters, planProblem } from '../src/engine/fromPlan.ts';
 import { sessionStops } from '../src/routing/stopSelection.ts';
 import { createPlanClient } from '../src/services/planner/PlanClient.ts';
-import { downloadPlanBundles, type PlanDownloadDeps } from '../src/services/planner/planDownload.ts';
+import { downloadPlanBundles, type PlanDownloadDeps, type PlanDownloadOutcome } from '../src/services/planner/planDownload.ts';
+import { createPlanDownloadJobs } from '../src/services/planner/planDownloadJobs.ts';
+import { reconcileActions, reconcilePlans } from '../src/services/planner/planReconciler.ts';
 import { buildPlanRequest, estimateSummary, formatDistance, formatDuration, localIsoWithOffset, planErrorCopy, segmentRows, upsellCopy } from '../src/services/planner/planForm.ts';
 import { createPlanRepository, PinnedBundleError, pinConflictCopy } from '../src/services/planner/planRepository.ts';
 import { MAX_REQUESTS_PER_SESSION, MIN_QUERY, PlacesSession, SESSION_IDLE_MS, type PlacesCallResult, type PlacesClient } from '../src/services/planner/places.ts';
@@ -413,6 +417,130 @@ heading('createPlanClient');
   const infeasible = planErrorCopy({ kind: 'error', code: 'plan_infeasible', retryable: false, detail: '', shortfallS: 1800 });
   assert('infeasible copy names the shortfall and is not a blind retry', /30 min more/.test(infeasible.message) && !infeasible.retry);
   assert('network copy is a retry', planErrorCopy({ kind: 'error', code: 'network', retryable: true, detail: '' }).retry);
+}
+
+{
+  heading('planReconciler - the plan file squared with the bundles on disk');
+  const store = new Map<string, string>();
+  const io = { read: () => store.get('f') ?? null, write: (t: string) => void store.set('f', t) };
+  const req = { contract_version: 1, city_id: uuid(900) } as unknown as PlanTourRequest;
+  const fresh = () => {
+    store.clear();
+    return createPlanRepository(io, () => {});
+  };
+  const onDisk = (entries: [string, WireBundle][]) => {
+    const m = new Map(entries);
+    let reads = 0;
+    return { disk: { manifest: (id: string) => { reads++; return m.get(id) ?? null; } }, reads: () => reads };
+  };
+  const both = onDisk([[TA, mA], [TB, mB]]);
+  const logs: string[] = [];
+  const log = (m: string) => logs.push(m);
+
+  let repo = fresh();
+  repo.putDraft({ plan, request: req, originLabel: 'X', savedAt: 1 });
+  eq('a previewed draft is never promoted, even with every tour on disk', reconcilePlans(repo, both.disk, log).actions, []);
+  assert('...and stays a draft', repo.get(plan.plan_id)!.status === 'draft');
+
+  repo.requestDownload(plan.plan_id, 5);
+  assert('requestDownload is durable (on disk before any byte)', JSON.parse(store.get('f')!).plans[0].downloadRequestedAt === 5);
+  eq('intent + incomplete download: nothing (resume is offered)', reconcilePlans(repo, onDisk([[TA, mA]]).disk, log).actions, []);
+  eq('intent + every pin verified: promoted (the lost save)', reconcilePlans(repo, both.disk, log).actions, [{ kind: 'mark_saved', planId: plan.plan_id }]);
+  assert('...now saved, intent cleared', repo.get(plan.plan_id)!.status === 'saved' && repo.get(plan.plan_id)!.downloadRequestedAt === null);
+  eq('idempotent: a second run finds nothing', reconcilePlans(repo, both.disk, log).actions, []);
+  throwsLike('requestDownload on a saved plan is a bug, loudly', () => repo.requestDownload(plan.plan_id, 6), /not a draft/);
+
+  const gone = reconcilePlans(repo, onDisk([[TA, mA]]).disk, log);
+  eq('saved plan, a bundle missing: removed', gone.actions.map((a) => a.kind === 'remove' && a.reason), ['bundle_missing']);
+  assert('...removed from the store and logged', repo.get(plan.plan_id) === null && logs.some((l) => /bundle_missing/.test(l)));
+
+  repo = fresh();
+  repo.putDraft({ plan, request: req, originLabel: 'X', savedAt: 1 });
+  repo.markSaved(plan.plan_id);
+  const swapped = reconcilePlans(repo, onDisk([[TA, { ...mA, bundle_version_hash: 'hashA2' } as WireBundle], [TB, mB]]).disk, log);
+  eq('saved plan, another version on disk: removed as bundle_changed', swapped.actions.map((a) => a.kind === 'remove' && a.reason), ['bundle_changed']);
+
+  repo = fresh();
+  repo.putDraft({ plan, request: req, originLabel: 'X', savedAt: 1 });
+  repo.markSaved(plan.plan_id);
+  const shrunk = { ...mA, waypoints: mA.waypoints.slice(0, 2) } as WireBundle;
+  eq('saved plan, pins match but the plan no longer fits: removed as plan_invalid', reconcilePlans(repo, onDisk([[TA, shrunk], [TB, mB]]).disk, log).actions.map((a) => a.kind === 'remove' && a.reason), ['plan_invalid']);
+
+  repo = fresh();
+  const p2 = parsePlanTourOk({ ...rawPlan(), plan_id: uuid(501) });
+  repo.putDraft({ plan, request: req, originLabel: 'X', savedAt: 1 });
+  repo.markSaved(plan.plan_id);
+  repo.putDraft({ plan: p2, request: req, originLabel: 'Y', savedAt: 2 });
+  repo.requestDownload(p2.plan_id, 3);
+  const counted = onDisk([[TA, mA], [TB, mB]]);
+  reconcilePlans(repo, counted.disk, log);
+  assert('one manifest read per tour per run, however many plans share it', counted.reads() === 2, `reads ${counted.reads()}`);
+  const oldPin = parsePlanTourOk(mutate((p) => { p.plan_id = uuid(502); p.sources[1].bundle_version_hash = 'hashB-old'; }));
+  const draftWithIntent = { ...repo.get(p2.plan_id)!, status: 'draft' as const, downloadRequestedAt: 3 };
+  const savedOnOldPin = { ...repo.get(plan.plan_id)!, plan: oldPin };
+  const mixed = reconcileActions([draftWithIntent, savedOnOldPin], onDisk([[TA, mA], [TB, mB]]).disk);
+  eq('removals are ordered before promotions', mixed.map((a) => a.kind), ['remove', 'mark_saved']);
+}
+
+{
+  heading('createPlanDownloadJobs - one job per plan, owned by the app');
+  const store = new Map<string, string>();
+  const io = { read: () => store.get('f') ?? null, write: (t: string) => void store.set('f', t) };
+  const repo = createPlanRepository(io, () => {});
+  const req = { contract_version: 1, city_id: uuid(900) } as unknown as PlanTourRequest;
+  repo.putDraft({ plan, request: req, originLabel: 'X', savedAt: 1 });
+
+  const logs: string[] = [];
+  let runs = 0;
+  let intentSeenByRunner: number | null = null;
+  let release!: (o: PlanDownloadOutcome) => void;
+  const progressSeen: number[] = [];
+  const jobs = createPlanDownloadJobs({
+    repo,
+    run: (_p, _agreed, onProgress) => {
+      runs++;
+      intentSeenByRunner = JSON.parse(store.get('f')!).plans[0].downloadRequestedAt;
+      onProgress(0.4);
+      return new Promise((r) => { release = r; });
+    },
+    now: () => 42,
+    log: (m) => logs.push(m),
+  });
+  let notes = 0;
+  jobs.subscribe(() => { notes++; progressSeen.push(jobs.view(plan.plan_id).fraction); });
+
+  const first = jobs.start(plan.plan_id);
+  const second = jobs.start(plan.plan_id);
+  assert('a second start while running returns the SAME job', first === second && runs === 1);
+  assert('the intent is on disk before the runner starts', intentSeenByRunner === 42);
+  assert('progress is published', jobs.view(plan.plan_id).running && jobs.view(plan.plan_id).fraction === 0.4);
+  release({ kind: 'ready' });
+  eq('ready: the job saves the plan, no screen needed', [(await first).kind, repo.get(plan.plan_id)!.status], ['ready', 'saved']);
+  assert('ready leaves no outcome to take', jobs.view(plan.plan_id).outcome === null && !jobs.view(plan.plan_id).running);
+  eq('a saved plan needs no job', (await jobs.start(plan.plan_id)).kind, 'ready');
+  assert('...and runs none', runs === 1);
+
+  const p2 = parsePlanTourOk({ ...rawPlan(), plan_id: uuid(501) });
+  repo.putDraft({ plan: p2, request: req, originLabel: 'Y', savedAt: 2 });
+  const conflictJob = jobs.start(p2.plan_id);
+  release({ kind: 'conflict', tourId: TA, blocking: [] });
+  await conflictJob;
+  assert('an outcome waits in the job until taken', jobs.view(p2.plan_id).outcome?.kind === 'conflict');
+  eq('take() hands it over once', [jobs.take(p2.plan_id)?.kind, jobs.take(p2.plan_id)], ['conflict', null]);
+
+  const retry = jobs.start(p2.plan_id, [uuid(700)]);
+  assert('after an outcome, start() runs a NEW job', runs === 3);
+  const p3 = parsePlanTourOk({ ...rawPlan(), plan_id: uuid(502) });
+  repo.putDraft({ plan: p3, request: req, originLabel: 'Z', savedAt: 3 });
+  release({ kind: 'ready' });
+  await retry;
+  assert('ready for a draft replaced meanwhile: not saved, logged', repo.get(p2.plan_id) === null && logs.some((l) => /replaced while downloading/.test(l)));
+
+  const boom = createPlanDownloadJobs({ repo, run: async () => { throw new Error('runner bug'); }, now: () => 1, log: (m) => logs.push(m) });
+  const failed = await boom.start(p3.plan_id);
+  assert('a runner that throws ends as a failed outcome, logged - never a hung job', failed.kind === 'failed' && !boom.view(p3.plan_id).running && logs.some((l) => /runner bug/.test(l)));
+  throwsLike('start() for an unknown plan fails loudly', () => jobs.start(uuid(999)), /no plan/);
+  assert('listeners heard every change', notes > 0 && progressSeen.includes(0.4));
 }
 
 console.log(`\n${checks - failures}/${checks} checks passed`);

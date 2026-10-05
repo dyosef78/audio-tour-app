@@ -24,6 +24,7 @@ import { IS_PLANNING_ENABLED } from '../config/features';
 import { TourBundleRepository } from '../services/bundle/TourBundleRepository';
 import { formatDuration } from '../services/planner/planForm';
 import { useSavedPlans } from '../services/planner/planRepositoryFile';
+import { usePlanReconciler } from '../services/planner/planRuntime';
 import { networkMonitor } from '../services/network/NetworkMonitor';
 import { isSupabaseConfigured } from '../services/supabase/client';
 import { fetchTours } from '../services/supabase/tours';
@@ -86,6 +87,8 @@ export default function DiscoveryScreen({ navigation }: DiscoveryScreenProps) {
   const timeBudget = usePreferences((s) => s.timeBudget);
   const cityId = usePreferences((s) => s.cityId);
   // Saved plans only: a draft is a plan the visitor has not kept.
+  // Squared with the bundles on disk before the list is drawn (planReconciler).
+  usePlanReconciler();
   const allPlans = useSavedPlans();
   const plans = useMemo(() => allPlans.filter((p) => p.status === 'saved'), [allPlans]);
   const cities = useCityCatalogue((s) => s.cities);

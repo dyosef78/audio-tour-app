@@ -4,10 +4,11 @@ import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Text, View
 import type { PlanPreviewScreenProps } from '../navigation/types';
 import { TourBundleRepository } from '../services/bundle/TourBundleRepository';
 import { planClient } from '../services/planner';
-import { downloadPlanBundles, type PlanDownloadDeps } from '../services/planner/planDownload';
+import type { PlanDownloadOutcome } from '../services/planner/planDownload';
 import { estimateSummary, formatDistance, formatDuration, localIsoWithOffset, planErrorCopy, segmentRows, upsellCopy, type SegmentRow } from '../services/planner/planForm';
 import { pinConflictCopy } from '../services/planner/planRepository';
 import { savedPlans, useSavedPlans } from '../services/planner/planRepositoryFile';
+import { planDownloads, usePlanDownload, usePlanReconciler } from '../services/planner/planRuntime';
 import { fetchTours } from '../services/supabase/tours';
 import { useTourSession } from '../session/tourSessionStore';
 import { colors, MIN_TOUCH } from '../ui/theme';
@@ -19,45 +20,40 @@ import { colors, MIN_TOUCH } from '../ui/theme';
  * plan deleted elsewhere (strict invalidation by another plan or a tour
  * update) shows as gone instead of lingering as a stale copy.
  *
- * "Download & save" brings every pinned bundle onto the device at exactly the
- * pinned version (downloadPlanBundles), then marks the plan saved, which is
- * when it starts pinning. On the way:
+ * ON MOUNT, usePlanReconciler squares the plan file with the bundles on disk
+ * (planReconciler.ts): a draft whose download completed but whose save was
+ * lost is promoted; a saved plan whose bundles are gone is removed, and this
+ * screen says why.
+ *
+ * "Download & save" starts the plan's download JOB (planRuntime): owned by the
+ * app, one per plan, finishing and saving whether or not this screen is still
+ * mounted. The screen only shows the job and answers its outcomes:
  *   conflict  a SAVED plan pins another version of a tour this plan needs ->
  *             the PM's dialog (pinConflictCopy 'new_plan'); on Overwrite the
- *             download retries with those plans agreed, and they are deleted
- *             only once the new bundle has committed
+ *             job restarts with those plans agreed
  *   stale     a tour changed since planning -> re-plan ONCE with the same
  *             request (route param `replanned` stops a loop)
- *
- * The download outlives this screen on purpose (bytes already fetched are
- * kept); it stops between tours once the screen is gone, and the plan stays a
- * draft - pinning nothing - until a complete run marks it saved.
+ * An outcome that lands while the visitor is elsewhere waits in the job and is
+ * answered on the next visit.
  */
 
-type Download =
-  | { phase: 'idle' }
-  | { phase: 'downloading'; fraction: number }
-  | { phase: 'replanning' }
-  | { phase: 'error'; title: string; message: string };
+type Local = { phase: 'idle' } | { phase: 'replanning' } | { phase: 'error'; title: string; message: string };
 
-const deps: PlanDownloadDeps = {
-  localHash: (tourId) => TourBundleRepository.readManifest(tourId)?.bundle_version_hash ?? null,
-  download: (tourId, o) =>
-    TourBundleRepository.download(tourId, {
-      invalidatePlans: o.invalidatePlans,
-      onProgress: (p) => o.onProgress?.(p.fraction),
-    }),
-  blockingPlans: (tourId, toHash) => savedPlans.blockingPlans(tourId, toHash),
-  manifest: (tourId) => TourBundleRepository.readManifest(tourId),
+const REMOVED_COPY: Record<'bundle_missing' | 'bundle_changed' | 'plan_invalid', string> = {
+  bundle_missing: 'One of its tours is no longer on this device.',
+  bundle_changed: 'One of its tours was replaced by another version on this device.',
+  plan_invalid: 'It no longer matches the tours on this device.',
 };
 
 export default function PlanPreviewScreen({ route, navigation }: PlanPreviewScreenProps) {
   const { planId, replanned = false } = route.params;
+  const report = usePlanReconciler();
   const saved = useSavedPlans().find((p) => p.plan.plan_id === planId) ?? null;
-  const [dl, setDl] = useState<Download>({ phase: 'idle' });
-  // Bumped after a download so chapter titles are re-read from the new manifests.
-  const [diskVersion, setDiskVersion] = useState(0);
+  const job = usePlanDownload(planId);
+  const [local, setLocal] = useState<Local>({ phase: 'idle' });
   const [tourTitles, setTourTitles] = useState<ReadonlyMap<string, string>>(new Map());
+  // Plans the visitor agreed to overwrite, across this visit's retries.
+  const agreed = useRef<string[]>([]);
 
   const mounted = useRef(true);
   useEffect(() => {
@@ -83,60 +79,50 @@ export default function PlanPreviewScreen({ route, navigation }: PlanPreviewScre
     };
   }, [cityId]);
 
+  // job.running is a dependency on purpose: a finished job means new manifests, so new chapter titles.
   const rows = useMemo(() => {
     if (saved === null) return [];
-    void diskVersion;
     return segmentRows(saved.plan, {
       chapterTitle: (tourId, chapterId) => TourBundleRepository.readManifest(tourId)?.chapters?.find((c) => c.chapter_id === chapterId)?.title ?? null,
       tourTitle: (tourId) => tourTitles.get(tourId) ?? TourBundleRepository.readManifest(tourId)?.tour_metadata.title ?? null,
     });
-  }, [saved, tourTitles, diskVersion]);
+  }, [saved, tourTitles, job.running]);
 
   const replan = useCallback(async () => {
     if (saved === null) return;
-    setDl({ phase: 'replanning' });
+    setLocal({ phase: 'replanning' });
     const request = { ...saved.request, context: { local_time: localIsoWithOffset(new Date()) } };
     const result = await planClient.plan(request);
     if (!mounted.current) return;
     if (result.kind === 'error') {
-      setDl({ phase: 'error', ...planErrorCopy(result) });
+      setLocal({ phase: 'error', ...planErrorCopy(result) });
       return;
     }
     savedPlans.putDraft({ plan: result.plan, request, originLabel: saved.originLabel, savedAt: Date.now() });
     navigation.replace('PlanPreview', { planId: result.plan.plan_id, replanned: true });
   }, [saved, navigation]);
 
-  const runDownload = useCallback(
-    async (agreed: readonly string[]) => {
-      if (saved === null) return;
-      setDl({ phase: 'downloading', fraction: 0 });
-      const outcome = await downloadPlanBundles(saved.plan, deps, {
-        invalidatePlans: agreed,
-        onProgress: (fraction) => mounted.current && setDl({ phase: 'downloading', fraction }),
-        cancelled: () => !mounted.current,
-      });
-      if (mounted.current) setDiskVersion((v) => v + 1);
+  const startDownload = useCallback(() => {
+    setLocal({ phase: 'idle' });
+    // The job outlives this screen; its outcome comes back through the effect below.
+    void planDownloads.start(planId, agreed.current);
+  }, [planId]);
 
-      if (outcome.kind === 'ready') {
-        // Saved even if the visitor has left: the bundles are verified. Not if
-        // the draft itself was replaced meanwhile (Back, then a new plan).
-        if (savedPlans.get(planId) === null) {
-          console.warn(`[PlanPreview] plan ${planId} was replaced while downloading; not saving it`);
-          return;
-        }
-        savedPlans.markSaved(planId);
-        if (mounted.current) setDl({ phase: 'idle' });
-        return;
-      }
-      if (!mounted.current) return;
-
+  const answer = useCallback(
+    (outcome: Exclude<PlanDownloadOutcome, { kind: 'ready' }>) => {
       switch (outcome.kind) {
         case 'conflict': {
           const copy = pinConflictCopy(outcome.blocking, 'new_plan');
-          setDl({ phase: 'idle' });
           Alert.alert(copy.title, copy.message, [
             { text: 'Keep old plan', style: 'cancel' },
-            { text: copy.confirm, style: 'destructive', onPress: () => void runDownload([...agreed, ...outcome.blocking.map((b) => b.planId)]) },
+            {
+              text: copy.confirm,
+              style: 'destructive',
+              onPress: () => {
+                agreed.current = [...agreed.current, ...outcome.blocking.map((b) => b.planId)];
+                startDownload();
+              },
+            },
           ]);
           return;
         }
@@ -148,15 +134,22 @@ export default function PlanPreviewScreen({ route, navigation }: PlanPreviewScre
             void replan();
             return;
           }
-          setDl({ phase: 'error', title: 'Tours are being updated', message: 'This city\'s tours changed while we were planning. Please try again in a few minutes.' });
+          setLocal({ phase: 'error', title: 'Tours are being updated', message: "This city's tours changed while we were planning. Please try again in a few minutes." });
           return;
         case 'failed':
-          setDl({ phase: 'error', title: 'Download failed', message: `${outcome.message} Finished parts are kept, so trying again continues where it stopped.` });
+          setLocal({ phase: 'error', title: 'Download failed', message: `${outcome.message} Finished parts are kept, so trying again continues where it stopped.` });
           return;
       }
     },
-    [saved, planId, replanned, replan],
+    [replanned, replan, startDownload],
   );
+
+  // Take the job's outcome - now, or on the next visit if it landed while away.
+  useEffect(() => {
+    if (job.outcome === null) return;
+    const outcome = planDownloads.take(planId);
+    if (outcome !== null) answer(outcome);
+  }, [job.outcome, planId, answer]);
 
   const deletePlan = useCallback(() => {
     Alert.alert('Delete this plan?', 'The downloaded tours stay on your device.', [
@@ -173,10 +166,15 @@ export default function PlanPreviewScreen({ route, navigation }: PlanPreviewScre
   }, [planId, navigation]);
 
   if (saved === null) {
+    const removed = report?.actions.find((a) => a.kind === 'remove' && a.planId === planId);
     return (
       <View style={styles.centered}>
         <Text style={styles.h2}>This plan is gone</Text>
-        <Text style={styles.muted}>It was deleted, or replaced when one of its tours was updated.</Text>
+        <Text style={styles.muted}>
+          {removed?.kind === 'remove'
+            ? `${REMOVED_COPY[removed.reason]} Plan again to get a fresh route.`
+            : 'It was deleted, or replaced when one of its tours was updated.'}
+        </Text>
         <Pressable style={styles.primary} onPress={() => navigation.goBack()} accessibilityRole="button">
           <Text style={styles.primaryText}>Back</Text>
         </Pressable>
@@ -188,8 +186,12 @@ export default function PlanPreviewScreen({ route, navigation }: PlanPreviewScre
   const est = estimateSummary(plan);
   const upsell = upsellCopy(plan);
   const blockedByRunningTour =
-    runningTourId !== null && plan.sources.some((s) => s.tour_id === runningTourId && deps.localHash(s.tour_id) !== s.bundle_version_hash);
-  const busy = dl.phase === 'downloading' || dl.phase === 'replanning';
+    runningTourId !== null &&
+    plan.sources.some((s) => s.tour_id === runningTourId && TourBundleRepository.readManifest(s.tour_id)?.bundle_version_hash !== s.bundle_version_hash);
+  const busy = job.running || local.phase === 'replanning';
+  // Asked for before, not running now: a kill or a failure interrupted it.
+  const resumable = saved.downloadRequestedAt !== null && !job.running;
+  const dl = job.running ? { phase: 'downloading' as const, fraction: job.fraction } : local;
 
   return (
     <ScrollView contentContainerStyle={styles.container}>
@@ -242,11 +244,11 @@ export default function PlanPreviewScreen({ route, navigation }: PlanPreviewScre
           <Pressable
             style={[styles.primary, (busy || blockedByRunningTour) && styles.disabled]}
             disabled={busy || blockedByRunningTour}
-            onPress={() => void runDownload([])}
+            onPress={startDownload}
             accessibilityRole="button"
             accessibilityState={{ disabled: busy || blockedByRunningTour, busy }}
           >
-            {busy ? <ActivityIndicator color={colors.canvas} /> : <Text style={styles.primaryText}>{dl.phase === 'error' ? 'Try again' : 'Download & save plan'}</Text>}
+            {busy ? <ActivityIndicator color={colors.canvas} /> : <Text style={styles.primaryText}>{dl.phase === 'error' ? 'Try again' : resumable ? 'Resume download' : 'Download & save plan'}</Text>}
           </Pressable>
         </>
       )}

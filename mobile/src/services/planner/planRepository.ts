@@ -15,6 +15,11 @@ import { parsePlanTourOk, type PlanTourOk, type PlanTourRequest } from '../../..
  *           the visitor never kept must not freeze tours. At most one draft.
  *   saved   downloaded and verified. Pins its sources.
  *
+ * downloadRequestedAt is a WRITE-AHEAD INTENT: set (and on disk) before the
+ * first byte of a plan's download, so after a crash planReconciler can tell a
+ * draft the visitor asked to keep - which it may promote to saved once every
+ * pin is verified on disk - from one they only previewed, which it must not.
+ *
  * SYNCHRONOUS by design, like TourProgressRepository: the guard runs inside a
  * download, and an async store that had not finished loading at cold start
  * would read "no plans" and let a pinned tour be overwritten. Pure: the file
@@ -30,6 +35,8 @@ export interface SavedPlan {
   originLabel: string;
   status: 'draft' | 'saved';
   savedAt: number;
+  /** Epoch ms of "Download & save" (drafts only); null until then. */
+  downloadRequestedAt: number | null;
 }
 
 export interface PinHolder {
@@ -51,7 +58,9 @@ export interface PlanRepository {
   list(): readonly SavedPlan[];
   get(planId: string): SavedPlan | null;
   /** Store a freshly planned plan as THE draft (any previous draft is dropped). */
-  putDraft(entry: Omit<SavedPlan, 'status'>): void;
+  putDraft(entry: Omit<SavedPlan, 'status' | 'downloadRequestedAt'>): void;
+  /** Record, durably, that the visitor asked to download and keep the draft. */
+  requestDownload(planId: string, at: number): void;
   /** Draft -> saved, once every pin has been verified on the device. */
   markSaved(planId: string): void;
   remove(planIds: readonly string[]): void;
@@ -82,7 +91,9 @@ export function createPlanRepository(io: PlanStoreIO, log: (msg: string) => void
           // contract is dropped loudly, never run.
           const plan = parsePlanTourOk(raw.plan);
           if (raw.status !== 'draft' && raw.status !== 'saved') throw new Error('bad status');
-          out.push({ plan, request: raw.request as PlanTourRequest, originLabel: String(raw.originLabel), status: raw.status, savedAt: Number(raw.savedAt) });
+          // Absent in files written before the intent existed: no intent was recorded.
+          const intent = typeof raw.downloadRequestedAt === 'number' ? raw.downloadRequestedAt : null;
+          out.push({ plan, request: raw.request as PlanTourRequest, originLabel: String(raw.originLabel), status: raw.status, savedAt: Number(raw.savedAt), downloadRequestedAt: intent });
         } catch (cause) {
           log(`[Plans] dropped an unreadable saved plan: ${cause instanceof Error ? cause.message : String(cause)}`);
         }
@@ -104,13 +115,20 @@ export function createPlanRepository(io: PlanStoreIO, log: (msg: string) => void
     list: () => plans,
     get: (id) => plans.find((p) => p.plan.plan_id === id) ?? null,
     putDraft(entry) {
-      commit([...plans.filter((p) => p.status !== 'draft' && p.plan.plan_id !== entry.plan.plan_id), { ...entry, status: 'draft' }]);
+      commit([...plans.filter((p) => p.status !== 'draft' && p.plan.plan_id !== entry.plan.plan_id), { ...entry, status: 'draft', downloadRequestedAt: null }]);
+    },
+    requestDownload(id, at) {
+      const p = plans.find((x) => x.plan.plan_id === id);
+      if (!p) throw new RangeError(`no plan ${id}`);
+      if (p.status !== 'draft') throw new RangeError(`plan ${id} is ${p.status}, not a draft`);
+      if (p.downloadRequestedAt !== null) return;
+      commit(plans.map((x) => (x === p ? { ...x, downloadRequestedAt: at } : x)));
     },
     markSaved(id) {
       const p = plans.find((x) => x.plan.plan_id === id);
       if (!p) throw new RangeError(`no plan ${id}`);
       if (p.status === 'saved') return;
-      commit(plans.map((x) => (x === p ? { ...x, status: 'saved' } : x)));
+      commit(plans.map((x) => (x === p ? { ...x, status: 'saved', downloadRequestedAt: null } : x)));
     },
     remove(ids) {
       const drop = new Set(ids);
