@@ -85,6 +85,11 @@ jobs:
       - name: Engine drive simulation
         run: npm run sim:drive
 
+      # Epic 16: a planned day across two tours - transfers, a kill-and-resume
+      # from the v3 checkpoint, and a duplicate plaza silenced (Option E).
+      - name: Plan simulation
+        run: npm run sim:plan
+
       - name: Auth storage tests
         run: npm run test:auth
 
