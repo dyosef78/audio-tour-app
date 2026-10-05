@@ -3,7 +3,7 @@
  * The plan-tour Edge Function is its only production caller.
  */
 
-export { PLANNER_VERSION, PLAN_TTL_DAYS, MAX_FILL_CELLS, MAX_SEARCH_NODES } from './constants.ts';
+export { DEDUP_RADIUS_M, PLANNER_VERSION, PLAN_TTL_DAYS, MAX_FILL_CELLS, MAX_SEARCH_NODES } from './constants.ts';
 export { CandidatesShapeError, parseCandidates } from './candidates.ts';
 export type { Candidate, CandidateStop, Pair, PlannerCandidates } from './candidates.ts';
 export { CostBook, estimateCost, missingCellKey, UNROUTABLE } from './costBook.ts';

@@ -24,9 +24,22 @@
  *
  * PLAN ORDER (best first): more value; less total time; fewer estimated
  * legs; then chapter ids, lexicographically.
+ *
+ * SPATIAL DEDUP (v3, PM 6 Oct 2026), when `dedup` is given. Two tours may visit
+ * the same plaza; the visitor must not hear it twice. An EXTENSION of a
+ * chapter in the sequence is unavailable when it lies within dedup.radiusM of
+ *   - a CORE stop of any other chapter in the sequence (cores always play), or
+ *   - an extension of an EARLIER chapter (the first visit keeps the place).
+ * Exact, not a post-pass: each chapter's curve is recomputed for the sequence
+ * it is in (memoised; most pairs of chapters are far apart and change nothing),
+ * and when a new chapter takes extensions away from earlier ones the node's
+ * table is folded again from scratch. Value only falls, so every bound stays
+ * optimistic. Core stops are never removed (core means core): two chapters
+ * whose CORE stops share a place both play it - see the Epic 16 handover.
  */
 
-import type { Pair } from './candidates.ts';
+import { distanceMeters } from '../distance.ts';
+import type { CandidateStop, Pair } from './candidates.ts';
 import { compareOrders, compareSameValue, optionTime, paretoByValue, type ChapterModel, type ChapterOption } from './chapterOptions.ts';
 import { UNROUTABLE, type Cost, type CostBook } from './costBook.ts';
 import { MAX_PLAN_CHAPTERS, MAX_SEARCH_NODES } from './constants.ts';
@@ -41,6 +54,14 @@ export interface SearchInput {
   transferPace: number;
   transferIsWalking: boolean;
   maxNodes?: number;
+  /** Spatial dedup of extensions. Absent: off (the brute-force oracle tests without it). */
+  dedup?: DedupInput;
+}
+
+export interface DedupInput {
+  radiusM: number;
+  /** The chapter's curve with these extensions unavailable: chapterOptions(..., excluded). */
+  curveFor(model: ChapterModel, excluded: ReadonlySet<string>): ChapterOption[];
 }
 
 export interface Hop {
@@ -54,6 +75,8 @@ export interface PlannedChapter {
   /** The transfer INTO this chapter (from the origin for the first). */
   hop: Hop;
   option: ChapterOption;
+  /** The curve this chapter was planned with: model.options minus deduplicated extensions. */
+  options: ChapterOption[];
 }
 
 export interface SearchResult {
@@ -130,9 +153,76 @@ function improves(c: Best, best: Best | null): boolean {
   return c.ids.length < best.ids.length;
 }
 
+/** Extensions offered by a chapter (the only stops dedup can take away). */
+const offeredExtensions = (m: ChapterModel): CandidateStop[] =>
+  m.candidate.stops.filter((s) => s.stopRole === 'extension' && s.eligible && s.matchedWeight > 0);
+
+const toPoint = (s: CandidateStop) => ({ lng: s.coordinates[0], lat: s.coordinates[1] });
+
+/**
+ * For every ordered pair of chapters (x, y): x's offered extensions within
+ * radius of y's CORE stops, and of y's offered extensions. Empty pairs are
+ * not stored; a bounding-box test skips chapters that cannot be that close.
+ */
+function proximity(models: readonly ChapterModel[], radiusM: number) {
+  const nearCore = new Map<string, Map<string, string[]>>();
+  const nearExt = new Map<string, Map<string, string[]>>();
+  const box = new Map<string, [number, number, number, number]>();
+  for (const m of models) {
+    const pts = m.candidate.stops.map((s) => s.coordinates);
+    const lats = pts.map((p) => p[1]);
+    const lons = pts.map((p) => p[0]);
+    const padLat = radiusM / 111_320;
+    const midLat = (Math.min(...lats) + Math.max(...lats)) / 2;
+    const padLon = radiusM / (111_320 * Math.max(0.01, Math.cos((midLat * Math.PI) / 180)));
+    box.set(m.candidate.chapterId, [Math.min(...lons) - padLon, Math.min(...lats) - padLat, Math.max(...lons) + padLon, Math.max(...lats) + padLat]);
+  }
+  const overlap = (a: [number, number, number, number], b: [number, number, number, number]) => a[0] <= b[2] && b[0] <= a[2] && a[1] <= b[3] && b[1] <= a[3];
+  const within = (s: CandidateStop, others: readonly CandidateStop[]) => others.some((o) => distanceMeters(toPoint(s), toPoint(o)) <= radiusM);
+  for (const x of models) {
+    const xs = offeredExtensions(x);
+    if (xs.length === 0) continue;
+    for (const y of models) {
+      if (x === y || !overlap(box.get(x.candidate.chapterId)!, box.get(y.candidate.chapterId)!)) continue;
+      const cores = y.candidate.stops.filter((s) => s.stopRole === 'core');
+      const exts = offeredExtensions(y);
+      const c = xs.filter((s) => within(s, cores)).map((s) => s.waypointId);
+      const e = xs.filter((s) => within(s, exts)).map((s) => s.waypointId);
+      if (c.length > 0) (nearCore.get(x.candidate.chapterId) ?? nearCore.set(x.candidate.chapterId, new Map()).get(x.candidate.chapterId)!).set(y.candidate.chapterId, c);
+      if (e.length > 0) (nearExt.get(x.candidate.chapterId) ?? nearExt.set(x.candidate.chapterId, new Map()).get(x.candidate.chapterId)!).set(y.candidate.chapterId, e);
+    }
+  }
+  return { nearCore, nearExt };
+}
+
 export function searchSequence(input: SearchInput): SearchResult {
   const maxNodes = input.maxNodes ?? MAX_SEARCH_NODES;
   const models = [...input.models].sort((a, b) => (a.candidate.chapterId < b.candidate.chapterId ? -1 : 1));
+
+  // Dedup: which extensions each chapter loses, given the sequence it is in.
+  const dedup = input.dedup;
+  const near = dedup ? proximity(models, dedup.radiusM) : null;
+  const excludedAt = (ids: readonly string[], i: number): Set<string> => {
+    const out = new Set<string>();
+    const x = ids[i]!;
+    ids.forEach((y, j) => {
+      if (j === i) return;
+      for (const id of near!.nearCore.get(x)?.get(y) ?? []) out.add(id);
+      if (j < i) for (const id of near!.nearExt.get(x)?.get(y) ?? []) out.add(id);
+    });
+    return out;
+  };
+  const curves = new Map<string, ChapterOption[]>();
+  const curveOf = (m: ChapterModel, excluded: ReadonlySet<string>): ChapterOption[] => {
+    if (excluded.size === 0) return m.options;
+    const key = `${m.candidate.chapterId}|${[...excluded].sort().join(',')}`;
+    let c = curves.get(key);
+    if (!c) {
+      c = dedup!.curveFor(m, excluded);
+      curves.set(key, c);
+    }
+    return c;
+  };
   const minTime = new Map(models.map((m) => [m.candidate.chapterId, optionTime(m.options[0]!)]));
   const maxValue = new Map(models.map((m) => [m.candidate.chapterId, m.options[m.options.length - 1]!.value]));
   const ratio = (m: ChapterModel): number =>
@@ -189,7 +279,30 @@ export function searchSequence(input: SearchInput): SearchResult {
       const id = child.model.candidate.chapterId;
       const nextTransferS = transferS + child.hop.seconds;
       const nextBase = baseValue + child.model.baseValue;
-      const nextTable = fold(seq.length === 0 ? [{ value: 0, timeS: 0, estimatedLegs: 0, picks: [] }] : table, child.model.options, input.capacityS - nextTransferS);
+      const capacity = input.capacityS - nextTransferS;
+      const seed: Combo[] = [{ value: 0, timeS: 0, estimatedLegs: 0, picks: [] }];
+
+      // The child's curve, and - when it takes a place an earlier chapter's
+      // extension relied on - the earlier chapters' too (then fold again).
+      let nextSeq: PlannedChapter[];
+      let nextTable: Combo[];
+      if (near) {
+        const ids = [...seq.map((p) => p.model.candidate.chapterId), id];
+        let refold = false;
+        const prior = seq.map((p, i) => {
+          if ((near.nearCore.get(p.model.candidate.chapterId)?.get(id)?.length ?? 0) === 0) return p;
+          refold = true;
+          return { ...p, options: curveOf(p.model, excludedAt(ids, i)) };
+        });
+        const own = curveOf(child.model, excludedAt(ids, seq.length));
+        nextSeq = [...prior, { model: child.model, hop: child.hop, option: own[0]!, options: own }];
+        nextTable = refold
+          ? nextSeq.reduce((t, p) => fold(t, p.options, capacity), seed)
+          : fold(seq.length === 0 ? seed : table, own, capacity);
+      } else {
+        nextSeq = [...seq, { model: child.model, hop: child.hop, option: child.model.options[0]!, options: child.model.options }];
+        nextTable = fold(seq.length === 0 ? seed : table, child.model.options, capacity);
+      }
       if (nextTable.length === 0) continue;
 
       // Bound: this node's best value, plus what the time left could buy at
@@ -206,7 +319,7 @@ export function searchSequence(input: SearchInput): SearchResult {
       nodes++;
       used.add(id);
       visit(
-        [...seq, { model: child.model, hop: child.hop, option: child.model.options[0]! }],
+        nextSeq,
         used,
         nextTransferS,
         nextBase,

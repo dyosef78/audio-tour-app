@@ -136,7 +136,7 @@ Deno.test('POST: a plan in the contract shape, saved once, origin never stored',
   assertEquals(res.status, 200);
   const plan = await res.json() as PlanTourOk;
   assertEquals(plan.status, 'ok');
-  assertEquals(plan.planner_version, 'v2');
+  assertEquals(plan.planner_version, 'v3');
   assertEquals(typeof plan.quality.dropped_high_value_extensions, 'number');
   assert(/^[0-9a-f]{32}$/.test(plan.content_hash));
   assertEquals(plan.sources, [{ tour_id: TOUR, bundle_version_hash: 'bundlehash1' }]);

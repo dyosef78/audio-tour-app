@@ -63,6 +63,8 @@ export interface ChapterModel {
 
 export const optionTime = (o: ChapterOption): number => o.travelS + o.dwellS;
 
+const NONE: ReadonlySet<string> = new Set();
+
 /** -1 when a is better, 1 when b is better. Never 0 for distinct choices. */
 export function compareSameValue(a: ChapterOption, b: ChapterOption): number {
   const ta = optionTime(a);
@@ -180,7 +182,7 @@ function slotOptions(chapter: Candidate, book: CostBook, params: ChapterParams, 
  * The chapter's choice curve, or null when no path crosses it at all - a
  * chapter whose core route is unroutable cannot be planned.
  */
-export function chapterOptions(chapter: Candidate, book: CostBook, params: ChapterParams): ChapterOption[] | null {
+export function chapterOptions(chapter: Candidate, book: CostBook, params: ChapterParams, excluded: ReadonlySet<string> = NONE): ChapterOption[] | null {
   const mandatory: SlotNode[] = [{ id: 'entry', stop: null }];
   const slots: CandidateStop[][] = [[]];
   let coreDwell = 0;
@@ -192,7 +194,8 @@ export function chapterOptions(chapter: Candidate, book: CostBook, params: Chapt
       slots.push([]);
       coreDwell += s.dwellS + (params.includeDeepDives ? s.deepDiveDwellS : 0);
       coreDeepDiveExtra += params.includeDeepDives ? 0 : s.deepDiveDwellS;
-    } else if (s.eligible && s.matchedWeight > 0) {
+    } else if (s.eligible && s.matchedWeight > 0 && !excluded.has(s.waypointId)) {
+      // `excluded`: extensions the plan already covers elsewhere (dedup, sequence.ts).
       slots[slots.length - 1]!.push(s);
     }
   }

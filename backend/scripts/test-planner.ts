@@ -17,7 +17,9 @@ import {
   chooseFillChain,
   contentHash,
   CostBook,
+  DEDUP_RADIUS_M,
   MAX_FILL_CELLS,
+  PLANNER_VERSION,
   optionTime,
   parseCandidates,
   planTour,
@@ -35,6 +37,7 @@ import {
   type PlannerCandidates,
 } from '../../shared/src/planner/index.ts';
 import { coordsKey } from '../../shared/src/routing/coordsKey.ts';
+import { distanceMeters } from '../../shared/src/distance.ts';
 import type { PlanTourRequest } from '../../shared/src/contracts/planTour.ts';
 
 let checks = 0;
@@ -597,6 +600,144 @@ heading('Request, hashing, origin');
   assert('content_hash is 32 hex (the tour_plans CHECK)', /^[0-9a-f]{32}$/.test(c1));
   assert('a moved entry point changes content_hash', c1 !== (await contentHash([{ ...ch[0]!, entry: at(1, 0) }], { [uuid(9000)]: 'abc' })));
   assert('a changed bundle hash changes content_hash', c1 !== (await contentHash(ch, { [uuid(9000)]: 'abd' })));
+}
+
+// -----------------------------------------------------------------------------
+heading('spatial dedup (v3) - an extension the plan already covers is not narrated twice');
+{
+  // Two chapters 400 m apart; each: core - extension (weight 3) - core.
+  const chapter = (k: number, x: number, extPos: Pair): ChapterSpec => ({
+    id: uuid(7000 + k), tour: uuid(7100 + k), entry: at(x, 0), exit: at(x + 300, 0), coreWeight: 1, stops: [
+      { id: uuid(7200 + k * 10 + 1), sort: 1, role: 'core', pos: at(x + 20, 0), dwell: 120 },
+      { id: uuid(7200 + k * 10 + 2), sort: 2, role: 'extension', pos: extPos, dwell: 60, weight: 3 },
+      { id: uuid(7200 + k * 10 + 3), sort: 3, role: 'core', pos: at(x + 280, 0), dwell: 120 },
+    ],
+  });
+  const run = (a: ChapterSpec, b: ChapterSpec) => {
+    const out = planTour(request({ available_minutes: 240 }), parseCandidates(rpc([a, b], { legs: [a, b].flatMap((c) => allLegs(c, () => 90)) })), ORIGIN_LL);
+    if (!out.ok) throw new Error('expected a plan');
+    return out.draft.segments.filter((s): s is Extract<typeof s, { kind: 'chapter' }> => s.kind === 'chapter');
+  };
+  const extA = uuid(7200 + 0 * 10 + 2);
+  const extB = uuid(7200 + 1 * 10 + 2);
+  const coreA1 = at(0 + 20, 0);
+
+  // B's extension 10 m from A's first CORE stop: A's core always plays, so B's extension goes.
+  const near = run(chapter(0, 0, at(150, 40)), chapter(1, 400, [coreA1[0], Number((coreA1[1] + 10 / 111_320).toFixed(6))]));
+  eq('both chapters are planned (dedup never costs a chapter)', near.length, 2);
+  const segB = near.find((s) => s.chapter_id === uuid(7001))!;
+  assert('an extension within 20 m of another chapter\'s CORE stop is not kept', !segB.kept_extension_ids.includes(extB) && segB.dropped_extension_ids.includes(extB));
+  assert('...and every core stop is still planned (core means core)', near.every((s) => s.waypoint_ids.length >= 2));
+
+  // The same at 30 m: a different place - kept.
+  const far = run(chapter(0, 0, at(150, 40)), chapter(1, 400, [coreA1[0], Number((coreA1[1] + 30 / 111_320).toFixed(6))]));
+  assert('30 m away it is another place: kept', far.find((s) => s.chapter_id === uuid(7001))!.kept_extension_ids.includes(extB));
+
+  // Extension next to extension: the EARLIER chapter keeps the place.
+  const shared = at(200, 120);
+  const twin = run(chapter(0, 0, shared), chapter(1, 400, [shared[0], Number((shared[1] + 8 / 111_320).toFixed(6))]));
+  const order = twin.map((s) => s.chapter_id);
+  const keptBy = twin.filter((s) => s.kept_extension_ids.some((id) => id === extA || id === extB)).map((s) => s.chapter_id);
+  eq('two extensions 8 m apart: only the earlier chapter keeps one', keptBy, [order[0]]);
+
+  // The upsell counts extensions dropped for TIME, never ones dropped as duplicates.
+  const dropped = planTour(request({ available_minutes: 240 }), parseCandidates(rpc([chapter(0, 0, at(150, 40)), chapter(1, 400, [coreA1[0], Number((coreA1[1] + 10 / 111_320).toFixed(6))])], { legs: [chapter(0, 0, at(150, 40)), chapter(1, 400, at(0, 0))].flatMap((c) => allLegs(c, () => 90)) })), ORIGIN_LL);
+  assert('a deduplicated extension never counts toward dropped_high_value_extensions', dropped.ok && dropped.draft.droppedHighValueExtensions === 0, dropped.ok ? String(dropped.draft.droppedHighValueExtensions) : 'no plan');
+  eq('planner_version is v3 (cached v2 plans are not reused)', PLANNER_VERSION, 'v3');
+  eq('the radius is the PM\'s ~20 m', DEDUP_RADIUS_M, 20);
+}
+
+// -----------------------------------------------------------------------------
+heading('searchSequence WITH dedup == brute force over every ordered subset (150 overlapping cities)');
+{
+  const rand = rng(6100);
+  let mismatches = 0;
+  let detail = '';
+  let overlapsSeen = 0;
+  for (let trial = 0; trial < 150; trial++) {
+    const n = 3 + Math.floor(rand() * 3);
+    const specs: ChapterSpec[] = [];
+    for (let k = 0; k < n; k++) {
+      const x = Math.round(rand() * 800);
+      const y = Math.round(rand() * 800);
+      specs.push({ id: uuid(8000 + k), entry: at(x, y), exit: at(x + 250, y), coreWeight: Math.floor(rand() * 3), stops: [
+        { id: uuid(8100 + k * 10 + 1), sort: 1, role: 'core', pos: at(x + 50, y), dwell: 200 },
+        { id: uuid(8100 + k * 10 + 2), sort: 2, role: 'extension', pos: at(x + 100, y + 40), dwell: 100, weight: 1 + Math.floor(rand() * 4) },
+        { id: uuid(8100 + k * 10 + 3), sort: 3, role: 'extension', pos: at(x + 150, y + 40), dwell: 100, weight: 1 + Math.floor(rand() * 4) },
+        { id: uuid(8100 + k * 10 + 4), sort: 4, role: 'core', pos: at(x + 200, y), dwell: 200 },
+      ] });
+    }
+    // Make places collide on purpose: move some extensions onto another chapter's stop (+ up to 10 m).
+    for (const s of specs) for (const st of s.stops) {
+      if (st.role !== 'extension' || rand() < 0.5) continue;
+      const other = specs[Math.floor(rand() * specs.length)]!;
+      if (other === s) continue;
+      const target = other.stops[Math.floor(rand() * other.stops.length)]!.pos;
+      st.pos = [target[0], Number((target[1] + (rand() * 10) / 111_320).toFixed(6))];
+      overlapsSeen++;
+    }
+    const legs = specs.flatMap((c) => allLegs(c, () => 60 + Math.floor(rand() * 240)));
+    const transfers = specs.flatMap((a) => specs.filter((b) => b !== a).map((b) => ({ from: a.id, to: b.id, s: 300 + Math.floor(rand() * 1200), fromPt: a.exit, toPt: b.entry })));
+    const answer = parseCandidates(rpc(specs, { legs, transfers }));
+    const book = new CostBook(answer, 'walking');
+    const models: ChapterModel[] = answer.candidates.map((c) => ({ candidate: c, baseValue: 1 + c.coreMatchedWeight, options: chapterOptions(c, book, PARAMS)! }));
+    const capacityS = 2400 + Math.floor(rand() * 6000);
+    const curveFor = (m: ChapterModel, ex: ReadonlySet<string>) => chapterOptions(m.candidate, book, PARAMS, ex)!;
+    const got = searchSequence({ models, book, origin: ORIGIN_LL, capacityS, transferPace: 1, transferIsWalking: true, dedup: { radiusM: 20, curveFor } });
+
+    // Oracle: the rule written out again, independently, and every combination tried.
+    const dist = (p: Pair, q: Pair) => distanceMeters({ lng: p[0], lat: p[1] }, { lng: q[0], lat: q[1] });
+    const offered = (m: ChapterModel) => m.candidate.stops.filter((s) => s.stopRole === 'extension' && s.eligible && s.matchedWeight > 0);
+    const excludedFor = (ms: ChapterModel[], i: number) => new Set(offered(ms[i]!).filter((e) => ms.some((o, j) => j !== i && (
+      o.candidate.stops.some((s) => s.stopRole === 'core' && dist(e.coordinates, s.coordinates) <= 20) ||
+      (j < i && offered(o).some((s) => dist(e.coordinates, s.coordinates) <= 20))))).map((e) => e.waypointId));
+    let best: { value: number; total: number; ids: string[] } | null = null;
+    const ids = models.map((m) => m.candidate.chapterId);
+    const walk = (seq: string[]) => {
+      if (seq.length > 0) {
+        let hopS = 0;
+        let ok = true;
+        seq.forEach((id, i) => {
+          const h = i === 0 ? book.fromOrigin(ORIGIN_LL, id) : book.transfer(seq[i - 1]!, id);
+          if (h === 'unroutable') ok = false;
+          else hopS += h.durationS;
+        });
+        if (ok) {
+          const ms = seq.map((id) => models.find((m) => m.candidate.chapterId === id)!);
+          const cs = ms.map((m, i) => chapterOptions(m.candidate, book, PARAMS, excludedFor(ms, i))!);
+          const rec = (i: number, v: number, t: number) => {
+            if (i === ms.length) {
+              if (hopS + t > capacityS) return;
+              const cand = { value: v + ms.reduce((a, m) => a + m.baseValue, 0), total: hopS + t, ids: seq };
+              const b = best as typeof cand | null;
+              if (!b || cand.value > b.value || (cand.value === b.value && (cand.total < b.total || (cand.total === b.total && cand.ids.join() < b.ids.join())))) best = cand;
+              return;
+            }
+            for (const o of cs[i]!) rec(i + 1, v + o.value, t + optionTime(o));
+          };
+          rec(0, 0, 0);
+        }
+      }
+      if (seq.length < ids.length) for (const id of ids) if (!seq.includes(id)) walk([...seq, id]);
+    };
+    walk([]);
+    const mine = got.chapters.length === 0 ? null : { value: got.value, total: got.totalS, ids: got.chapters.map((p) => p.model.candidate.chapterId) };
+    if (got.truncated || JSON.stringify(mine) !== JSON.stringify(best)) {
+      mismatches++;
+      if (!detail) detail = `trial ${trial}: got ${JSON.stringify(mine)} expected ${JSON.stringify(best)}`;
+    }
+    // Whatever was chosen, no kept extension sits on a place the plan already narrates.
+    const chosen = got.chapters;
+    chosen.forEach((p, i) => {
+      for (const id of p.option.keptIds) {
+        const e = p.model.candidate.stops.find((s) => s.waypointId === id)!;
+        const clash = chosen.some((o, j) => j !== i && o.model.candidate.stops.some((s) =>
+          dist(e.coordinates, s.coordinates) <= 20 && (s.stopRole === 'core' || (j < i && o.option.keptIds.includes(s.waypointId)))));
+        if (clash && !detail) { mismatches++; detail = `trial ${trial}: kept ${id} on a place already narrated`; }
+      }
+    });
+  }
+  assert(`dedup B&B finds the brute-force optimum (150 trials, ${overlapsSeen} forced overlaps)`, mismatches === 0, detail);
 }
 
 console.log(`\n${checks - failures}/${checks} checks passed`);

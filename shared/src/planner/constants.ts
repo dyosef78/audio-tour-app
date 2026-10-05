@@ -11,8 +11,19 @@
 import type { GroupType } from '../vocabulary.ts';
 import type { TransitMode } from '../contracts/planTour.ts';
 
-/** v2 (Part 4): quality.dropped_high_value_extensions. Same plans, richer metadata. */
-export const PLANNER_VERSION = 'v2';
+/**
+ * v2 (Part 4): quality.dropped_high_value_extensions. Same plans, richer metadata.
+ * v3 (Epic 16, PM 6 Oct 2026): spatial dedup of EXTENSIONS - the same request
+ * can now keep fewer extensions, so cached v2 plans are not reused.
+ */
+export const PLANNER_VERSION = 'v3';
+
+/**
+ * Two stops of DIFFERENT chapters this close are the same place (PM: "~20 m").
+ * An extension that close to a stop the plan already narrates is not offered
+ * (sequence.ts, dedup). Core stops are never removed (core means core).
+ */
+export const DEDUP_RADIUS_M = 20;
 
 /** Plans fill at most (1 - margin) of the budget: slack absorbs pace error. */
 export const PLANNING_MARGIN = 0.1;
