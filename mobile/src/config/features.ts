@@ -26,7 +26,8 @@ export const TELEMETRY_PLAN_FIELDS_LIVE = true;
 
 /**
  * Migration 20261010120100 ('navigation_handoff') is applied to production.
- * Until then TelemetryService refuses the event before queueing it (a type
- * the server's CHECK lacks fails its whole batch). Flip only AFTER the push.
+ * Until it was, TelemetryService refused the event before queueing it (a type
+ * the server's CHECK lacks fails its whole batch). LIVE since 6 Oct 2026:
+ * applied (supabase migration list) and the types match production.
  */
-export const TELEMETRY_HANDOFF_EVENT_LIVE = false;
+export const TELEMETRY_HANDOFF_EVENT_LIVE = true;
