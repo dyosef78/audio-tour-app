@@ -650,5 +650,22 @@ heading('createPlanClient');
   eq('a tour id is not a plan key', planIdOfSessionKey(uuid(1)), null);
 }
 
+{
+  heading('silent_stop_ids (Option E) - parsed, checked against the bundle, carried to the engine');
+  eq('absent on the wire (plans before v4) parses as []', (plan.segments[1] as Extract<PlanTourOk['segments'][number], { kind: 'chapter' }>).silent_stop_ids, []);
+  const withSilent = parsePlanTourOk(mutate((p) => { p.segments[1].silent_stop_ids = [A3]; }));
+  eq('a planned core stop may be silent', (withSilent.segments[1] as Extract<PlanTourOk['segments'][number], { kind: 'chapter' }>).silent_stop_ids, [A3]);
+  throwsLike('a silent id that is not planned is refused', () => parsePlanTourOk(mutate((p) => { p.segments[1].silent_stop_ids = [A4]; })), /silent_stop_ids/);
+  throwsLike('a kept extension cannot be silent (it would have been dropped instead)', () => parsePlanTourOk(mutate((p) => { p.segments[1].silent_stop_ids = [A2]; })), /silent_stop_ids/);
+  throwsLike('a silent id listed twice is refused', () => parsePlanTourOk(mutate((p) => { p.segments[1].silent_stop_ids = [A1, A1]; })), /silent_stop_ids/);
+  eq('a silent CORE stop passes planProblem (core means core)', planProblem(withSilent, manifests), null);
+  // A bundle where A1 is (now) an extension: the plan silences something that is not a core stop.
+  const roleSwap = new Map([[TA, { ...mA, waypoints: mA.waypoints.map((w) => (w.waypoint_id === A3 ? { ...w, stop_role: 'extension' as const } : w)) } as WireBundle], [TB, mB]]);
+  assert('a silent stop that is not a core stop in the bundle is a problem (stale plan)', planProblem(withSilent, roleSwap) !== null);
+  const t = engineTourFromPlan(withSilent, manifests);
+  eq('the engine marks exactly that stop silent', t.stops.filter((st) => st.silent).map((st) => st.id), [A3]);
+  assert('...and keeps its zone and position (it still fires and moves the window)', t.stops.find((st) => st.id === A3)!.index === (withSilent.segments[1] as Extract<PlanTourOk['segments'][number], { kind: 'chapter' }>).waypoint_ids.indexOf(A3) && t.stops.find((st) => st.id === A3)!.zone !== undefined);
+}
+
 console.log(`\n${checks - failures}/${checks} checks passed`);
 if (failures > 0) process.exit(1);

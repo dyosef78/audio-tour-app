@@ -36,6 +36,7 @@ import { EngineRunner, type EngineRunnerPorts } from './EngineRunner';
 import { optimisticHandoff } from './optimisticHandoff';
 import { decideSnapshotResume, type SessionSource, type TourProgressSnapshot } from './progressRepository';
 import { planSessionKey } from './sessionKey';
+import { engineEventTourId } from './telemetryAttribution';
 import { tourProgress } from './sessionCheckpointFile';
 import { useTourSession, type ChapterView } from './tourSessionStore';
 import type { GpsFix } from '../engine/types';
@@ -599,8 +600,7 @@ class TourSessionController {
     const type = fx.kind === 'trigger_fired' ? 'geofence_entered' : fx.kind;
     // tour_id is the tour that OWNS the stop (Epic 16: a plan spans tours).
     // Without a stop: the catalogue tour, or none - a plan key is not a tours.id.
-    const stopTour = fx.stopId ? meta.waypointsById.get(fx.stopId)?.tourId : undefined;
-    const tourId = stopTour ?? (meta.source.kind === 'tour' ? meta.tourId : undefined);
+    const tourId = engineEventTourId(meta.source, meta.tourId, fx.stopId ? meta.waypointsById.get(fx.stopId)?.tourId : undefined);
     void telemetry.record(type, { tourId, waypointId: fx.stopId ?? undefined, meta: { ...fx.detail } });
   }
 

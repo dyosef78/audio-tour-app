@@ -56,6 +56,13 @@ export interface EngineStop {
   index: number;
   zone: EngineZone;
   approach: EngineApproach | null;
+  /**
+   * Epic 16, Option E: a planned stop at a place an earlier chapter already
+   * narrated (plan silent_stop_ids). Its zone fires as usual - the window,
+   * cursor and transitions see an ordinary stop - but nothing plays: no PLAY,
+   * so no audio session (Maps and music keep theirs) and no audio telemetry.
+   */
+  silent?: boolean;
 }
 
 export type SequencePolicy = 'strict' | 'windowed';

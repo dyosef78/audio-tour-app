@@ -421,6 +421,17 @@ function fire(
   mode: ModeConfig,
   effects: Effect[],
 ): EngineState {
+  if (stop.silent) {
+    // Option E: an earlier chapter already narrated this place. The zone did
+    // its job - fired, so the cursor, window and transitions move as for any
+    // stop - and it counts as heard. Nothing is queued or played, and what is
+    // on air keeps playing: a walking stop would otherwise preempt it.
+    effects.push(telemetry('trigger_fired', stop.id, { index: stop.index, reason, silent: 1 }));
+    return {
+      ...s,
+      progress: { ...s.progress, fired: { ...s.progress.fired, [stop.id]: now }, played: { ...s.progress.played, [stop.id]: now } },
+    };
+  }
   effects.push(telemetry('trigger_fired', stop.id, { index: stop.index, reason }));
   const item: QueueItem = {
     stopId: stop.id,

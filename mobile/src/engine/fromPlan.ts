@@ -47,6 +47,7 @@ const chapterOfStop = (manifest: WireBundle, w: WireWaypoint): string => w.chapt
  *   * EVERY core stop of the chapter is planned (core means core)
  *   * kept + dropped are exactly the chapter's extensions, and the planned
  *     extensions are exactly the kept ones
+ *   * every silent stop (v4) is a CORE stop of the chapter
  */
 export function planProblem(plan: PlanTourOk, manifests: ReadonlyMap<string, WireBundle>): string | null {
   for (const s of plan.sources) {
@@ -80,6 +81,9 @@ export function planProblem(plan: PlanTourOk, manifests: ReadonlyMap<string, Wir
     if (JSON.stringify(plannedExtensions) !== JSON.stringify([...c.kept_extension_ids].sort())) {
       return `chapter ${c.chapter_id}: the planned extensions are not the kept ones`;
     }
+    // Only a duplicate PLACE is silenced, and only a core one (extensions are dropped instead).
+    const notCore = c.silent_stop_ids.find((id) => role(byId.get(id)!) !== 'core');
+    if (notCore) return `chapter ${c.chapter_id}: silent stop ${notCore} is not a core stop`;
   }
   return null;
 }
@@ -99,9 +103,11 @@ export function engineTourFromPlan(plan: PlanTourOk, manifests: ReadonlyMap<stri
     // The authored chapter, in PLAN order.
     engineChapters.push({ ...toChapter(wireChapterOf(m, segment.chapter_id)!), sortOrder });
     const byId = new Map(m.waypoints.map((w) => [w.waypoint_id, w]));
+    const silent = new Set(segment.silent_stop_ids);
     segment.waypoint_ids.forEach((id, index) => {
       const w = byId.get(id)!;
-      stops.push({ id, chapterId: segment.chapter_id, index, zone: toZone(w), approach: toApproach(w) });
+      const stop: EngineStop = { id, chapterId: segment.chapter_id, index, zone: toZone(w), approach: toApproach(w) };
+      stops.push(silent.has(id) ? { ...stop, silent: true } : stop);
     });
   });
   return { chapters: engineChapters, stops };
