@@ -44,7 +44,13 @@ export type TelemetryEventType =
    * TELEMETRY_PLAN_FIELDS_LIVE (config/features.ts) - TelemetryService
    * refuses to queue it otherwise.
    */
-  | 'handoff_tracking_late';
+  | 'handoff_tracking_late'
+  /**
+   * Added by migration 20261010120100 (Epic 16): every handoff to Google Maps
+   * or Waze - the denominator handoff_tracking_late lacks. Sent only while
+   * TELEMETRY_HANDOFF_EVENT_LIVE (config/features.ts).
+   */
+  | 'navigation_handoff';
 
 /**
  * One row of public.telemetry_events, as the client posts it.

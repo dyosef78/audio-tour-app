@@ -628,6 +628,20 @@ async function testPlanFields(): Promise<void> {
   const rows = lit.sent.flat();
   assert('live: every event in a planned session carries plan_id', rows.filter((r) => r.plan_id === PLAN).map((r) => r.event_type).join() === 'audio_started,handoff_tracking_late', JSON.stringify(rows));
   assert('live: after setPlan(null) no plan_id key at all', rows.length === 3 && !('plan_id' in rows[2]!));
+
+  resetStorage();
+  const hDark = new ScriptedTransport();
+  const handoffDark = new TelemetryService(hDark, { planFieldsLive: true, handoffEventLive: false });
+  await handoffDark.record('navigation_handoff', { meta: { wait: 'settled' } });
+  await handoffDark.record('audio_started', { tourId: 't1' });
+  await handoffDark.flush();
+  assert('navigation_handoff is never queued before migration 20261010120100 is live', hDark.sent.flat().every((r) => r.event_type !== 'navigation_handoff') && hDark.sent.flat().length === 1);
+  resetStorage();
+  const hLit = new ScriptedTransport();
+  const handoffLive = new TelemetryService(hLit, { planFieldsLive: true, handoffEventLive: true });
+  await handoffLive.record('navigation_handoff', { meta: { wait: 'timed_out', waited_ms: 1500 } });
+  await handoffLive.flush();
+  assert('...and sent once it is', hLit.sent.flat().some((r) => r.event_type === 'navigation_handoff' && (r.meta as Record<string, unknown>).wait === 'timed_out'));
 }
 
 // -----------------------------------------------------------------------------

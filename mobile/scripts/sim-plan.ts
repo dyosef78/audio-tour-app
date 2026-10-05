@@ -283,7 +283,7 @@ function open(initial: EngineState): EngineRunner {
     persist: (progress: Progress) => {
       writes++;
       const snap: TourProgressSnapshot = {
-        v: 3, tourId: SESSION_KEY, source: SOURCE, tourTitle: 'Your plan', activeIds, skippedIds: [],
+        v: 3, tourId: SESSION_KEY, source: SOURCE, tourTitle: 'Your plan', activeIds,
         backgroundPermission: true, notificationPermission: true, startedAt: T0, savedAt: now, progress,
       };
       repo.save(snap);

@@ -252,7 +252,7 @@ const runner = new EngineRunner(createEngineState(tour, freshProgress(tour, 'dri
   persist: (progress) => {
     writes++;
     repo.save({
-      v: 3, tourId: TOUR, source: { kind: 'tour' }, tourTitle: 'Masada day', activeIds: allIds, skippedIds: [],
+      v: 3, tourId: TOUR, source: { kind: 'tour' }, tourTitle: 'Masada day', activeIds: allIds,
       backgroundPermission: true, notificationPermission: true, startedAt: T0, savedAt: now, progress,
     });
   },

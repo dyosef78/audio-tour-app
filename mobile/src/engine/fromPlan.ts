@@ -27,7 +27,6 @@ import type { EngineChapter, EngineStop, EngineTour } from './types.ts';
 
 export const TRANSFER_CHAPTER_PREFIX = 'transfer:';
 
-export const isTransferChapter = (chapterId: string): boolean => chapterId.startsWith(TRANSFER_CHAPTER_PREFIX);
 
 const chapters = (plan: PlanTourOk) => plan.segments.filter((s): s is ChapterSegment => s.kind === 'chapter');
 

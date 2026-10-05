@@ -160,7 +160,6 @@ const snapshot: TourProgressSnapshot = {
   source: { kind: 'tour' },
   tourTitle: 'T',
   activeIds: ['w1', 'w2'],
-  skippedIds: [],
   backgroundPermission: true,
   notificationPermission: true,
   startedAt: 1000,
@@ -195,9 +194,11 @@ const snapshot: TourProgressSnapshot = {
   // Epic 16: checkpoint v3.
   const { v: _v, source: _s, ...v2body } = snapshot;
   const v2 = memoryIO();
-  v2.files.main = JSON.stringify({ v: 2, ...v2body });
+  // As Epic 15 wrote it: with TASK-604's skippedIds.
+  v2.files.main = JSON.stringify({ v: 2, ...v2body, skippedIds: [] });
   const v2Load = createProgressRepository(v2.io).load();
   assert('a v2 checkpoint (a walk in progress at update) loads as a v3 catalogue tour', v2Load.kind === 'found' && v2Load.snapshot.v === 3 && v2Load.snapshot.source.kind === 'tour');
+  assert('...without the retired skippedIds', v2Load.kind === 'found' && !('skippedIds' in v2Load.snapshot));
   const PLAN = '00000000-0000-4000-8000-000000000500';
   const planSnap: TourProgressSnapshot = { ...snapshot, tourId: `plan:${PLAN}`, source: { kind: 'plan', planId: PLAN, contentHash: 'a'.repeat(32) } };
   repo.save(planSnap);

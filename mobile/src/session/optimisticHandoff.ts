@@ -59,10 +59,14 @@ export function settleWithin(work: Promise<unknown>, ms: number, timers: Timers)
 
 export type LateOutcome = 'late' | 'lost';
 
+/** What the wait ended as, and how long it took (before the app opened). */
+export type HandoffResult = SettleResult & { waitedMs: number };
+
 /**
  * The handoff, ordered: wait (bounded) for `trackingWork`, then `open()` -
  * whatever the wait ended as. After a timeout, `onLate` hears how the work
- * ended, once, when it ends. Returns what the wait ended as.
+ * ended, once, when it ends. Returns what the wait ended as and how long it
+ * took - the navigation_handoff event's payload.
  */
 export async function optimisticHandoff(args: {
   trackingWork: Promise<unknown>;
@@ -72,13 +76,14 @@ export async function optimisticHandoff(args: {
   timers: Timers;
   now: () => number;
   timeoutMs?: number;
-}): Promise<SettleResult> {
+}): Promise<HandoffResult> {
   const startedAt = args.now();
   const result = await settleWithin(args.trackingWork, args.timeoutMs ?? HANDOFF_TRACKING_TIMEOUT_MS, args.timers);
+  const waitedMs = args.now() - startedAt;
   if (result.kind === 'timed_out') {
     const report = () => args.onLate(args.trackingLost() ? 'lost' : 'late', args.now() - startedAt);
     args.trackingWork.then(report, report);
   }
   await args.open();
-  return result;
+  return { ...result, waitedMs };
 }

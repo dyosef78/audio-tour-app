@@ -1,7 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { AppState, type AppStateStatus, Platform } from 'react-native';
 
-import { TELEMETRY_PLAN_FIELDS_LIVE } from '../../config/features';
+import { TELEMETRY_HANDOFF_EVENT_LIVE, TELEMETRY_PLAN_FIELDS_LIVE } from '../../config/features';
 import { TelemetryQueue } from './TelemetryQueue';
 import { SupabaseTelemetryTransport } from './SupabaseTelemetryTransport';
 import type {
@@ -92,10 +92,16 @@ export class TelemetryService implements AudioTelemetrySink {
   private planId: string | null = null;
   /** Migration 20261009120000 is live: plan_id and 'handoff_tracking_late' may be sent. */
   private readonly planFieldsLive: boolean;
+  /** Migration 20261010120100 is live: 'navigation_handoff' may be sent. */
+  private readonly handoffEventLive: boolean;
 
-  constructor(transport: TelemetryTransport = new SupabaseTelemetryTransport(), options: { planFieldsLive?: boolean } = {}) {
+  constructor(
+    transport: TelemetryTransport = new SupabaseTelemetryTransport(),
+    options: { planFieldsLive?: boolean; handoffEventLive?: boolean } = {},
+  ) {
     this.queue = new TelemetryQueue(transport);
     this.planFieldsLive = options.planFieldsLive ?? TELEMETRY_PLAN_FIELDS_LIVE;
+    this.handoffEventLive = options.handoffEventLive ?? TELEMETRY_HANDOFF_EVENT_LIVE;
   }
 
   /**
@@ -241,6 +247,10 @@ export class TelemetryService implements AudioTelemetrySink {
     // fail every event batched with it, on every retry.
     if (!this.planFieldsLive && type === 'handoff_tracking_late') {
       console.warn(`[Telemetry] ${type} NOT sent - migration 20261009120000 is not live (TELEMETRY_PLAN_FIELDS_LIVE):`, context.meta);
+      return;
+    }
+    if (!this.handoffEventLive && type === 'navigation_handoff') {
+      console.warn(`[Telemetry] ${type} NOT sent - migration 20261010120100 is not live (TELEMETRY_HANDOFF_EVENT_LIVE):`, context.meta);
       return;
     }
     try {

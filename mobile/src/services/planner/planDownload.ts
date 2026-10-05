@@ -40,8 +40,6 @@ export interface PlanDownloadOptions {
   invalidatePlans?: readonly string[];
   /** Overall progress 0..1 across every tour still to fetch. */
   onProgress?: (fraction: number, tourId: string) => void;
-  /** Checked between tours: a screen that unmounted stops the sequence. */
-  cancelled?: () => boolean;
 }
 
 export async function downloadPlanBundles(plan: PlanTourOk, deps: PlanDownloadDeps, options: PlanDownloadOptions = {}): Promise<PlanDownloadOutcome> {
@@ -49,7 +47,6 @@ export async function downloadPlanBundles(plan: PlanTourOk, deps: PlanDownloadDe
   const todo = plan.sources.filter((s) => deps.localHash(s.tour_id) !== s.bundle_version_hash);
 
   for (const [i, source] of todo.entries()) {
-    if (options.cancelled?.()) return { kind: 'failed', tourId: source.tour_id, message: 'cancelled' };
     // This plan itself is still a draft and pins nothing, so it never blocks itself.
     const blocking = deps.blockingPlans(source.tour_id, source.bundle_version_hash).filter((b) => b.planId !== plan.plan_id);
     const unagreed = blocking.filter((b) => !agreed.has(b.planId));

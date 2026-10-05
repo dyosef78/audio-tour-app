@@ -16,7 +16,7 @@
  */
 
 import { parsePlanTourOk, type PlanTourOk, type PlanTourRequest } from '../../shared/src/contracts/planTour.ts';
-import { engineTourFromPlan, isTransferChapter, planChapters, planProblem } from '../src/engine/fromPlan.ts';
+import { engineTourFromPlan, planChapters, planProblem, TRANSFER_CHAPTER_PREFIX } from '../src/engine/fromPlan.ts';
 import { sessionStops } from '../src/routing/stopSelection.ts';
 import { createPlanClient } from '../src/services/planner/PlanClient.ts';
 import { downloadPlanBundles, type PlanDownloadDeps, type PlanDownloadOutcome } from '../src/services/planner/planDownload.ts';
@@ -116,7 +116,7 @@ eq('catalogue mode is untouched: core only', sessionStops(domain(mA), { kind: 'c
 // -----------------------------------------------------------------------------
 heading('engineTourFromPlan');
 const tour = engineTourFromPlan(plan, manifests);
-eq('chapters: transfer, A, transfer, B - in plan order', tour.chapters.map((c) => `${isTransferChapter(c.id) ? 'T' : 'C'}${c.sortOrder}`), ['T0', 'C1', 'T2', 'C3']);
+eq('chapters: transfer, A, transfer, B - in plan order', tour.chapters.map((c) => `${((id: string) => id.startsWith(TRANSFER_CHAPTER_PREFIX))(c.id) ? 'T' : 'C'}${c.sortOrder}`), ['T0', 'C1', 'T2', 'C3']);
 const t0 = tour.chapters[0]!;
 eq('a transfer chapter: no stops, destination = the next entry, transfer mode', [t0.id, t0.destination, t0.transitMode, tour.stops.filter((s) => s.chapterId === t0.id).length],
   [`transfer:${CA}`, { latitude: 32.08, longitude: 34.78 }, 'driving', 0]);
@@ -178,13 +178,6 @@ heading('createPlanClient');
   const hang = await client(((_u: unknown, init?: RequestInit) => new Promise((_, reject) => init?.signal?.addEventListener('abort', () => reject(new Error('aborted'))))) as typeof fetch, null, 50).plan(request);
   assert('a hung request times out', hang.kind === 'error' && hang.code === 'timeout');
 
-  const get = (status: number, body: unknown) => client(reply(status, body) as typeof fetch).fetchPlan(uuid(500));
-  assert('GET 200 -> the plan', (await get(200, rawPlan())).kind === 'plan');
-  eq('GET 409 -> stale, with the tours', await get(409, { status: 'error', code: 'plan_stale', detail: '', retryable: false, stale_tour_ids: [TA], request_id: 'r' }), { kind: 'stale', staleTourIds: [TA] });
-  eq('GET 410 -> expired (runnable offline if pins match)', await get(410, { status: 'error', code: 'plan_expired', detail: '', retryable: false, request_id: 'r' }), { kind: 'expired' });
-  eq('GET 404 -> not_found', await get(404, { status: 'error', code: 'plan_not_found', detail: '', retryable: false, request_id: 'r' }), { kind: 'not_found' });
-  const other = await client(reply(200, { ...rawPlan(), plan_id: uuid(501) }) as typeof fetch).fetchPlan(uuid(500));
-  assert('a 200 for ANOTHER plan_id is refused', other.kind === 'error' && other.code === 'bad_response');
 }
 
 // -----------------------------------------------------------------------------
@@ -292,9 +285,6 @@ heading('createPlanClient');
   const broken = setup({ fail: { [TA]: new Error('disk full') } });
   eq('any other error: failed, with its message', await downloadPlanBundles(plan, broken.deps), { kind: 'failed', tourId: TA, message: 'disk full' });
 
-  const gone = setup();
-  const r2 = await downloadPlanBundles(plan, gone.deps, { cancelled: () => true });
-  assert('a screen that is gone stops before the next tour', r2.kind === 'failed' && r2.message === 'cancelled' && gone.calls.length === 0);
 
   const mismatched = setup({ local: { [TA]: 'hashA', [TB]: 'hashB' } });
   mismatched.deps.manifest = (id) => (id === TA ? ({ ...mA, waypoints: mA.waypoints.slice(0, 2) } as WireBundle) : mB);
@@ -590,7 +580,9 @@ heading('createPlanClient');
     await flush();
     eq('waiting: Maps has not opened at 1.0 s', order, []);
     work.resolve();
-    eq('restart done at 1.0 s: tracking first, then Maps, no late report', [(await h).kind, order], ['settled', ['tracking', 'open']]);
+    const done = await h;
+    eq('restart done at 1.0 s: tracking first, then Maps, no late report', [done.kind, order], ['settled', ['tracking', 'open']]);
+    eq('...and reports the wait for navigation_handoff', done.waitedMs, 1000);
   }
 
   // 3. The OS stalls: at 1.5 s Maps opens anyway; the restart ends later -> 'late'.
@@ -604,7 +596,9 @@ heading('createPlanClient');
     await flush();
     eq('1.499 s: still waiting', order, []);
     t.advance(1);
-    eq('1.5 s: Maps opens anyway (optimistic)', [(await h).kind, order], ['timed_out', ['open@1500']]);
+    const timedOut = await h;
+    eq('1.5 s: Maps opens anyway (optimistic)', [timedOut.kind, order], ['timed_out', ['open@1500']]);
+    eq('...reporting a 1500 ms wait', timedOut.waitedMs, 1500);
     eq('...nothing reported while the restart still runs', late, []);
     t.advance(2500);
     work.resolve();

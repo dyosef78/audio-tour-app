@@ -48,7 +48,7 @@ export type ReconcileAction =
   | { kind: 'remove'; planId: string; reason: 'bundle_missing' | 'bundle_changed' | 'plan_invalid'; detail: string };
 
 /** Where one plan stands against the disk. Missing outranks changed outranks invalid. */
-export function planDiskState(plan: PlanTourOk, manifest: (tourId: string) => WireBundle | null): PlanDiskState {
+function planDiskState(plan: PlanTourOk, manifest: (tourId: string) => WireBundle | null): PlanDiskState {
   const missing: string[] = [];
   const changed: string[] = [];
   const manifests = new Map<string, WireBundle>();

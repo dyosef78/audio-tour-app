@@ -21,3 +21,10 @@ export const IS_PLANNING_ENABLED = false;
  * migration list) and its generated types match the production schema.
  */
 export const TELEMETRY_PLAN_FIELDS_LIVE = true;
+
+/**
+ * Migration 20261010120100 ('navigation_handoff') is applied to production.
+ * Until then TelemetryService refuses the event before queueing it (a type
+ * the server's CHECK lacks fails its whole batch). Flip only AFTER the push.
+ */
+export const TELEMETRY_HANDOFF_EVENT_LIVE = false;

@@ -34,7 +34,6 @@ import {
   type ChapterOption,
   type MissingCell,
   type Pair,
-  type PlannerCandidates,
 } from '../../shared/src/planner/index.ts';
 import { coordsKey } from '../../shared/src/routing/coordsKey.ts';
 import { distanceMeters } from '../../shared/src/distance.ts';

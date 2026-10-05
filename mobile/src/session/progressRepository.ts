@@ -39,12 +39,6 @@ export interface TourProgressSnapshot {
   tourTitle: string;
   /** The stops this session runs (every core stop, Epic 16). Never re-derived. */
   activeIds: string[];
-  /**
-   * TASK-604's preference skips. Retired in Epic 16: written as [] and never
-   * read, kept so v2 checkpoints keep one shape - bumping the version would
-   * discard every walk in progress when the app updates.
-   */
-  skippedIds: string[];
   backgroundPermission: boolean;
   notificationPermission: boolean;
   /** Epoch ms the tour was first started; kept across resumes. */
@@ -113,7 +107,6 @@ export function snapshotProblem(value: unknown): string | null {
   }
   if (typeof c.tourTitle !== 'string') return 'no tourTitle';
   if (!isStringArray(c.activeIds) || c.activeIds.length === 0) return 'activeIds is not a non-empty list of ids';
-  if (!isStringArray(c.skippedIds)) return 'skippedIds is not a list of ids';
   for (const key of ['backgroundPermission', 'notificationPermission'] as const) {
     if (typeof c[key] !== 'boolean') return `${key} is not a boolean`;
   }
@@ -148,8 +141,10 @@ export function createProgressRepository(io: CheckpointIO): TourProgressReposito
       return { kind: 'invalid', reason: 'not JSON' };
     }
     // A v2 checkpoint is a catalogue tour by definition (plans did not exist).
+    // Its skippedIds (TASK-604, retired in Epic 16, always []) is dropped.
     if (typeof value === 'object' && value !== null && (value as Record<string, unknown>).v === 2) {
-      value = { ...(value as Record<string, unknown>), v: SNAPSHOT_VERSION, source: { kind: 'tour' } };
+      const { skippedIds: _retired, ...rest } = value as Record<string, unknown>;
+      value = { ...rest, v: SNAPSHOT_VERSION, source: { kind: 'tour' } };
     }
     const problem = snapshotProblem(value);
     return problem === null ? { kind: 'found', snapshot: value as TourProgressSnapshot } : { kind: 'invalid', reason: problem };

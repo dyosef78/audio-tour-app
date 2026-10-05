@@ -3,7 +3,7 @@ import { AppState, Platform, type AppStateStatus } from 'react-native';
 
 import type { PlanTourOk } from '../../../shared/src/contracts/planTour';
 import { chaptersOf, engineTourFromManifest } from '../engine/fromManifest';
-import { engineTourFromPlan, planChapters } from '../engine/fromPlan';
+import { engineTourFromPlan, planChapters, TRANSFER_CHAPTER_PREFIX } from '../engine/fromPlan';
 import { allStopsResolved, createEngineState, freshProgress, nextChapterOf, progressProblem } from '../engine/reduce';
 import { planHandoff, type HandoffPlan, type HandoffProvider, type HandoffSpec } from '../handoff/handoffLinks';
 import type { Effect, EngineState, EngineTour, Progress, TrackKind } from '../engine/types';
@@ -786,7 +786,13 @@ class TourSessionController {
       { googleMaps: await isGoogleMapsInstalled() },
       Platform.OS === 'ios' ? 'ios' : 'android',
     );
-    if (plan.kind === 'open') await this.handOff(plan.url);
+    if (plan.kind === 'open') {
+      await this.handOff(plan.url, meta, {
+        provider,
+        mode: chapter.transit_mode,
+        segment: chapter.chapter_id.startsWith(TRANSFER_CHAPTER_PREFIX) ? 'transfer' : 'chapter',
+      });
+    }
     return plan;
   }
 
@@ -803,7 +809,7 @@ class TourSessionController {
    * applyTransitMode ('lost') and repaired on the next return to the app
    * (handleAppStateChange -> recoverTracking, 'recovered').
    */
-  private async handOff(url: string): Promise<void> {
+  private async handOff(url: string, meta: SessionMeta, what: { provider: HandoffProvider; mode: string; segment: 'transfer' | 'chapter' }): Promise<void> {
     const service = this.location;
     const result = await optimisticHandoff({
       trackingWork: this.trackingOps,
@@ -818,6 +824,12 @@ class TourSessionController {
       now: Date.now,
     });
     if (result.kind === 'timed_out') console.warn('[TourSession] optimistic handoff: the tracking restart had not finished; navigation opened anyway');
+    // The denominator for handoff_tracking_late: one row per handoff that
+    // actually opened the navigation app (an open that threw never got here).
+    void telemetry.record('navigation_handoff', {
+      tourId: engineEventTourId(meta.source, meta.tourId, undefined),
+      meta: { wait: result.kind, waited_ms: result.waitedMs, provider: what.provider, mode: what.mode, segment: what.segment },
+    });
   }
 
   /** Open a URL the screen chose after a 'needs_app' plan (store page, or no scenic route). */
@@ -850,10 +862,6 @@ class TourSessionController {
       source: meta.source,
       tourTitle: meta.tourTitle,
       activeIds: meta.activeIds,
-      // TASK-604's preference skips, retired in Epic 16. Still written so a v2
-      // checkpoint keeps one shape (a version bump would discard walks in
-      // progress on update); never read.
-      skippedIds: [],
       backgroundPermission: meta.backgroundPermission,
       notificationPermission: meta.notificationPermission,
       startedAt: meta.startedAt,
