@@ -1,10 +1,10 @@
 -- =============================================================================
 -- Epic 16 security: is_cms_admin() requires an EMAIL-CODE (OTP) sign-in
 --
--- STATUS: DRAFT - approved by the PM 5 Oct 2026, NOT APPLIED. Push only after
--- `npm run auth:inspect-amr` prints "SAFE to push 20261008120000" against the
--- production project (PM constraint: verify the real JWT first - a false
--- negative here locks every admin out of the CMS).
+-- STATUS: approved by the PM 5 Oct 2026. VERIFIED before applying: the PM ran
+-- `npm run auth:inspect-amr` against production and it printed SAFE - the
+-- live token's amr is [{"method":"otp","timestamp":...}], before and after a
+-- refresh (PM constraint: a false negative here would lock every admin out).
 --
 -- WHY. Admin CLIs sign in by email code only (PM, 4 Oct 2026: no static
 -- passwords for production admin access). But the Email provider that sends
