@@ -6,12 +6,14 @@
  */
 
 /**
- * Epic 16 planner (Plan my day, saved plans). OFF until the session
- * controller can run a plan (PM, 5 Oct 2026): a visitor must never save a plan
- * they cannot start. Gates the Discovery entry, the "Your plans" list and the
- * Plan / PlanPreview routes.
+ * Epic 16 planner (Plan my day, saved plans). ON since the PM's device QA
+ * sign-off: the session controller runs plans (startPlannedSession), the
+ * planner v4 is live, and Android tracking recovery and the iOS audio session
+ * were verified on hardware. Gates the Discovery entry, the "Your plans" list
+ * and the Plan / PlanPreview routes - set false to take the planner dark again
+ * (saved plans stay on the device and pin nothing new).
  */
-export const IS_PLANNING_ENABLED = false;
+export const IS_PLANNING_ENABLED = true;
 
 /**
  * Migration 20261009120000 (telemetry_events.plan_id + 'handoff_tracking_late')
