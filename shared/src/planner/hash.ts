@@ -62,15 +62,33 @@ export async function requestHash(
 export interface HashedChapter {
   chapterId: string;
   waypointIds: readonly string[];
+  /** v4: silenced core stops. Hashed only when non-empty, so earlier plans hash as they always did. */
+  silentStopIds?: readonly string[];
   entry: Pair;
   exit: Pair;
 }
 
-/** Recomputed on every GET: a moved entry/exit or a changed bundle is plan_stale. */
-export async function contentHash(chapters: readonly HashedChapter[], sourceTourHashes: Readonly<Record<string, string>>): Promise<string> {
+/**
+ * Recomputed on every GET: a moved entry/exit or a changed bundle is plan_stale.
+ *
+ * `plannerVersion` is the STORED plan's on a GET. Hashing a stored plan with
+ * the deployed version instead (as before v4) made every stored plan stale
+ * at each planner deploy - the content had not changed, the constant had.
+ */
+export async function contentHash(
+  chapters: readonly HashedChapter[],
+  sourceTourHashes: Readonly<Record<string, string>>,
+  plannerVersion: string = PLANNER_VERSION,
+): Promise<string> {
   const full = await sha256Hex(canonicalJson({
-    planner_version: PLANNER_VERSION,
-    chapters: chapters.map((c) => ({ chapter_id: c.chapterId, waypoint_ids: c.waypointIds, entry: [c.entry[0], c.entry[1]], exit: [c.exit[0], c.exit[1]] })),
+    planner_version: plannerVersion,
+    chapters: chapters.map((c) => ({
+      chapter_id: c.chapterId,
+      waypoint_ids: c.waypointIds,
+      ...(c.silentStopIds && c.silentStopIds.length > 0 ? { silent_stop_ids: c.silentStopIds } : {}),
+      entry: [c.entry[0], c.entry[1]],
+      exit: [c.exit[0], c.exit[1]],
+    })),
     sources: sourceTourHashes,
   }));
   return full.slice(0, 32);

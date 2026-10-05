@@ -144,6 +144,15 @@ export interface ChapterSegment {
   /** Subset of waypoint_ids: the extensions the planner kept. */
   kept_extension_ids: readonly string[];
   /**
+   * Planner v4 (Option E, PM 6 Oct 2026): CORE stops of this chapter within
+   * DEDUP_RADIUS_M of a stop an EARLIER chapter of the plan already narrates
+   * (two tours that share a plaza). Still in waypoint_ids - core means core,
+   * and the zone still fires, so sequencing and transitions are untouched -
+   * but the device plays nothing there: no audio session, no audio telemetry.
+   * Additive: absent on the wire (plans before v4) parses as [].
+   */
+  silent_stop_ids: readonly string[];
+  /**
    * Extensions present in the bundle that must NOT be armed (they lie along
    * the path; arming them would narrate stops the plan dropped). Explicit so
    * the device can assert waypoint_ids + dropped = the chapter's stops in its
@@ -284,6 +293,16 @@ function oneOf<T extends string>(v: unknown, allowed: readonly string[], w: stri
   return typeof v === 'string' && allowed.includes(v) ? (v as T) : bad(w);
 }
 
+/** silent_stop_ids: optional (plans before v4), unique, planned, and never a kept extension. */
+function silentIds(s: Obj, waypointIds: readonly string[], w: string): string[] {
+  if (s.silent_stop_ids === undefined) return [];
+  const ids = strings(s, 'silent_stop_ids', w);
+  const planned = new Set(waypointIds);
+  const kept = new Set(Array.isArray(s.kept_extension_ids) ? (s.kept_extension_ids as string[]) : []);
+  if (new Set(ids).size !== ids.length || ids.some((id) => !planned.has(id) || kept.has(id))) bad(`${w}.silent_stop_ids (must be planned core stops, once each)`);
+  return ids;
+}
+
 /**
  * A 200 body, checked in full: field types, the transfer/chapter alternation,
  * each transfer pointing at the chapter that follows it, exits chained to the
@@ -361,6 +380,7 @@ export function parsePlanTourOk(value: unknown): PlanTourOk {
         waypoint_ids: waypointIds,
         kept_extension_ids: strings(s, 'kept_extension_ids', w),
         dropped_extension_ids: strings(s, 'dropped_extension_ids', w),
+        silent_stop_ids: silentIds(s, waypointIds, w),
         travel_s: num(s, 'travel_s', w),
         dwell_s: num(s, 'dwell_s', w),
         cost_source: oneOf<CostSource>(s.cost_source, SOURCES, `${w}.cost_source`),

@@ -643,8 +643,47 @@ heading('spatial dedup (v3) - an extension the plan already covers is not narrat
   // The upsell counts extensions dropped for TIME, never ones dropped as duplicates.
   const dropped = planTour(request({ available_minutes: 240 }), parseCandidates(rpc([chapter(0, 0, at(150, 40)), chapter(1, 400, [coreA1[0], Number((coreA1[1] + 10 / 111_320).toFixed(6))])], { legs: [chapter(0, 0, at(150, 40)), chapter(1, 400, at(0, 0))].flatMap((c) => allLegs(c, () => 90)) })), ORIGIN_LL);
   assert('a deduplicated extension never counts toward dropped_high_value_extensions', dropped.ok && dropped.draft.droppedHighValueExtensions === 0, dropped.ok ? String(dropped.draft.droppedHighValueExtensions) : 'no plan');
-  eq('planner_version is v3 (cached v2 plans are not reused)', PLANNER_VERSION, 'v3');
+  eq('planner_version is v4 (cached v2/v3 plans are not reused)', PLANNER_VERSION, 'v4');
   eq('the radius is the PM\'s ~20 m', DEDUP_RADIUS_M, 20);
+}
+
+// -----------------------------------------------------------------------------
+heading('Option E (v4) - a CORE stop on a place an earlier chapter narrated is kept but silenced');
+{
+  const chapter = (k: number, x: number, firstCore: Pair, w = 0): ChapterSpec => ({
+    id: uuid(7500 + k), tour: uuid(7600 + k), entry: at(x, 0), exit: at(x + 300, 0), coreWeight: w, stops: [
+      { id: uuid(7700 + k * 10 + 1), sort: 1, role: 'core', pos: firstCore, dwell: 120, weight: w },
+      { id: uuid(7700 + k * 10 + 3), sort: 3, role: 'core', pos: at(x + 280, 0), dwell: 120 },
+    ],
+  });
+  const plaza = at(20, 0);
+  const a = chapter(0, 0, plaza);
+  const b = chapter(1, 400, [plaza[0], Number((plaza[1] + 9 / 111_320).toFixed(6))]);
+  const out = planTour(request({ available_minutes: 240 }), parseCandidates(rpc([a, b], { legs: [a, b].flatMap((c) => allLegs(c, () => 90)) })), ORIGIN_LL);
+  assert('a plan is produced', out.ok);
+  if (out.ok) {
+    const chs = out.draft.segments.filter((x): x is Extract<typeof x, { kind: 'chapter' }> => x.kind === 'chapter');
+    eq('both chapters planned (no content value lost)', chs.length, 2);
+    const [first, second] = chs as [typeof chs[0], typeof chs[0]];
+    const secondPlaza = second.chapter_id === a.id ? a.stops[0]!.id : b.stops[0]!.id;
+    eq('the LATER chapter\'s plaza core is silenced, the first plays it', [first.silent_stop_ids, second.silent_stop_ids], [[], [secondPlaza]]);
+    assert('...and stays in waypoint_ids (core means core: planProblem passes)', second.waypoint_ids.includes(secondPlaza));
+    eq('draft.chapters carries the silent ids for content_hash', out.draft.chapters.map((c) => c.silentStopIds), [[], [secondPlaza]]);
+  }
+  // 30 m: another place, nothing silenced.
+  const far = planTour(request({ available_minutes: 240 }), parseCandidates(rpc([a, chapter(1, 400, [plaza[0], Number((plaza[1] + 30 / 111_320).toFixed(6))])], { legs: [a, b].flatMap((c) => allLegs(c, () => 90)) })), ORIGIN_LL);
+  assert('30 m apart: nothing silenced', far.ok && far.draft.segments.every((x) => x.kind !== 'chapter' || x.silent_stop_ids.length === 0));
+}
+
+{
+  heading('contentHash - stored planner version, silent ids only when present');
+  const ch = { chapterId: uuid(1), waypointIds: [uuid(2)], entry: at(0, 0), exit: at(10, 0) };
+  const src = { [uuid(3)]: 'h' };
+  const v2 = await contentHash([ch], src, 'v2');
+  eq('a plan stored by v2 hashes the same under a v4 deploy (no spurious plan_stale)', await contentHash([ch], src, 'v2'), v2);
+  assert('the version is part of the hash', (await contentHash([ch], src, 'v4')) !== v2);
+  eq('no silent ids hashes exactly as before v4', await contentHash([{ ...ch, silentStopIds: [] }], src, 'v2'), v2);
+  assert('silent ids change the hash (a GET detects them changing)', (await contentHash([{ ...ch, silentStopIds: [uuid(2)] }], src, 'v4')) !== (await contentHash([ch], src, 'v4')));
 }
 
 // -----------------------------------------------------------------------------
@@ -660,16 +699,17 @@ heading('searchSequence WITH dedup == brute force over every ordered subset (150
     for (let k = 0; k < n; k++) {
       const x = Math.round(rand() * 800);
       const y = Math.round(rand() * 800);
-      specs.push({ id: uuid(8000 + k), entry: at(x, y), exit: at(x + 250, y), coreWeight: Math.floor(rand() * 3), stops: [
-        { id: uuid(8100 + k * 10 + 1), sort: 1, role: 'core', pos: at(x + 50, y), dwell: 200 },
+      specs.push({ id: uuid(8000 + k), entry: at(x, y), exit: at(x + 250, y), coreWeight: 0, stops: [
+        { id: uuid(8100 + k * 10 + 1), sort: 1, role: 'core', pos: at(x + 50, y), dwell: 200, weight: Math.floor(rand() * 3) },
         { id: uuid(8100 + k * 10 + 2), sort: 2, role: 'extension', pos: at(x + 100, y + 40), dwell: 100, weight: 1 + Math.floor(rand() * 4) },
         { id: uuid(8100 + k * 10 + 3), sort: 3, role: 'extension', pos: at(x + 150, y + 40), dwell: 100, weight: 1 + Math.floor(rand() * 4) },
         { id: uuid(8100 + k * 10 + 4), sort: 4, role: 'core', pos: at(x + 200, y), dwell: 200 },
       ] });
     }
-    // Make places collide on purpose: move some extensions onto another chapter's stop (+ up to 10 m).
+    // Make places collide on purpose: move some stops - extensions AND first
+    // cores - onto another chapter's stop (+ up to 10 m).
     for (const s of specs) for (const st of s.stops) {
-      if (st.role !== 'extension' || rand() < 0.5) continue;
+      if (st.sort === 4 || rand() < 0.5) continue;
       const other = specs[Math.floor(rand() * specs.length)]!;
       if (other === s) continue;
       const target = other.stops[Math.floor(rand() * other.stops.length)]!.pos;
@@ -680,7 +720,8 @@ heading('searchSequence WITH dedup == brute force over every ordered subset (150
     const transfers = specs.flatMap((a) => specs.filter((b) => b !== a).map((b) => ({ from: a.id, to: b.id, s: 300 + Math.floor(rand() * 1200), fromPt: a.exit, toPt: b.entry })));
     const answer = parseCandidates(rpc(specs, { legs, transfers }));
     const book = new CostBook(answer, 'walking');
-    const models: ChapterModel[] = answer.candidates.map((c) => ({ candidate: c, baseValue: 1 + c.coreMatchedWeight, options: chapterOptions(c, book, PARAMS)! }));
+    // baseValue from the cores' own weights, as the SQL's core_matched_weight sums them.
+    const models: ChapterModel[] = answer.candidates.map((c) => ({ candidate: c, baseValue: 1 + c.stops.filter((st) => st.stopRole === 'core').reduce((a, st) => a + st.matchedWeight, 0), options: chapterOptions(c, book, PARAMS)! }));
     const capacityS = 2400 + Math.floor(rand() * 6000);
     const curveFor = (m: ChapterModel, ex: ReadonlySet<string>) => chapterOptions(m.candidate, book, PARAMS, ex)!;
     const got = searchSequence({ models, book, origin: ORIGIN_LL, capacityS, transferPace: 1, transferIsWalking: true, dedup: { radiusM: 20, curveFor } });
@@ -705,10 +746,13 @@ heading('searchSequence WITH dedup == brute force over every ordered subset (150
         if (ok) {
           const ms = seq.map((id) => models.find((m) => m.candidate.chapterId === id)!);
           const cs = ms.map((m, i) => chapterOptions(m.candidate, book, PARAMS, excludedFor(ms, i))!);
+          // Silent cores (v4): a core on an EARLIER chapter's core earns nothing a second time.
+          const cores = (m: ChapterModel) => m.candidate.stops.filter((st) => st.stopRole === 'core');
+          const silentWeight = ms.reduce((acc, m, i) => acc + cores(m).filter((c) => ms.slice(0, i).some((o) => cores(o).some((d) => dist(c.coordinates, d.coordinates) <= 20))).reduce((a, c) => a + c.matchedWeight, 0), 0);
           const rec = (i: number, v: number, t: number) => {
             if (i === ms.length) {
               if (hopS + t > capacityS) return;
-              const cand = { value: v + ms.reduce((a, m) => a + m.baseValue, 0), total: hopS + t, ids: seq };
+              const cand = { value: v + ms.reduce((a, m) => a + m.baseValue, 0) - silentWeight, total: hopS + t, ids: seq };
               const b = best as typeof cand | null;
               if (!b || cand.value > b.value || (cand.value === b.value && (cand.total < b.total || (cand.total === b.total && cand.ids.join() < b.ids.join())))) best = cand;
               return;
@@ -737,7 +781,7 @@ heading('searchSequence WITH dedup == brute force over every ordered subset (150
       }
     });
   }
-  assert(`dedup B&B finds the brute-force optimum (150 trials, ${overlapsSeen} forced overlaps)`, mismatches === 0, detail);
+  assert(`dedup + silent-core B&B finds the brute-force optimum (150 trials, ${overlapsSeen} forced overlaps)`, mismatches === 0, detail);
 }
 
 console.log(`\n${checks - failures}/${checks} checks passed`);

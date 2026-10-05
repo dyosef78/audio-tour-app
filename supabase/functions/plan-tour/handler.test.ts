@@ -136,7 +136,7 @@ Deno.test('POST: a plan in the contract shape, saved once, origin never stored',
   assertEquals(res.status, 200);
   const plan = await res.json() as PlanTourOk;
   assertEquals(plan.status, 'ok');
-  assertEquals(plan.planner_version, 'v3');
+  assertEquals(plan.planner_version, 'v4');
   assertEquals(typeof plan.quality.dropped_high_value_extensions, 'number');
   assert(/^[0-9a-f]{32}$/.test(plan.content_hash));
   assertEquals(plan.sources, [{ tour_id: TOUR, bundle_version_hash: 'bundlehash1' }]);
@@ -273,4 +273,21 @@ Deno.test('GET: not found, other user, expired, stale, fresh', async () => {
   const later = { ...h.deps, now: () => NOW + 31 * 86_400_000 };
   const expired = await handlePlanTour(getReq(anon.plan_id), later);
   assertEquals([expired.status, ((await expired.json()) as PlanFetchError).code], [410, 'plan_expired']);
+});
+
+Deno.test('GET: a plan stored by an EARLIER planner version is not stale after a deploy (v4 fix)', async () => {
+  const { contentHash } = await import('@shared/planner/index.ts');
+  const h = harness();
+  const made = await (await handlePlanTour(post(body()), h.deps)).json() as PlanTourOk;
+  const row = h.rows.get(made.plan_id)!;
+  // As planner v2 stored it: its own version, no silent_stop_ids on the wire, hashed accordingly.
+  const segments = row.plan.segments.map((s) => {
+    if (s.kind !== 'chapter') return s;
+    const { silent_stop_ids: _drop, ...rest } = s;
+    return rest as typeof s;
+  });
+  const chapters = segments.filter((s) => s.kind === 'chapter').map((s) => ({ chapterId: s.chapter_id, waypointIds: s.waypoint_ids, entry: h.state[s.chapter_id]!.entry!, exit: h.state[s.chapter_id]!.exit! }));
+  h.rows.set(made.plan_id, { ...row, plan: { ...row.plan, planner_version: 'v2', segments }, contentHash: await contentHash(chapters, row.sourceTourHashes, 'v2') });
+  const res = await handlePlanTour(getReq(made.plan_id), h.deps);
+  assertEquals(res.status, 200, 'hashed with the stored version, an unchanged v2 plan is still fresh');
 });

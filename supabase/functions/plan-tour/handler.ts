@@ -339,16 +339,18 @@ async function get(request: Request, deps: PlanTourDeps, requestId: string): Pro
 
   const stale = new Set<string>();
   for (const id of tourIds) if (hashes[id] !== stored.sourceTourHashes[id]) stale.add(id);
-  const current: { chapterId: string; waypointIds: readonly string[]; entry: Pair; exit: Pair }[] = [];
+  const current: { chapterId: string; waypointIds: readonly string[]; silentStopIds: readonly string[]; entry: Pair; exit: Pair }[] = [];
   for (const c of chapters) {
     const s = state[c.chapter_id];
     if (!s || !s.tourPublished || !s.plannable || !s.entry || !s.exit) {
       stale.add(c.tour_id);
       continue;
     }
-    current.push({ chapterId: c.chapter_id, waypointIds: c.waypoint_ids, entry: s.entry, exit: s.exit });
+    // Stored before v4: no silent_stop_ids on the wire - hashed as none, as it was.
+    current.push({ chapterId: c.chapter_id, waypointIds: c.waypoint_ids, silentStopIds: c.silent_stop_ids ?? [], entry: s.entry, exit: s.exit });
   }
-  if (stale.size === 0 && (await contentHash(current, stored.sourceTourHashes)) !== stored.contentHash) {
+  // The STORED plan's planner version: a deploy is not a content change.
+  if (stale.size === 0 && (await contentHash(current, stored.sourceTourHashes, stored.plan.planner_version)) !== stored.contentHash) {
     // Same bundles, but an entry/exit point moved: we cannot tell which chapter
     // from the hash alone, so every source tour is named.
     for (const id of tourIds) stale.add(id);

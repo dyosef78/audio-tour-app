@@ -34,8 +34,14 @@
  * it is in (memoised; most pairs of chapters are far apart and change nothing),
  * and when a new chapter takes extensions away from earlier ones the node's
  * table is folded again from scratch. Value only falls, so every bound stays
- * optimistic. Core stops are never removed (core means core): two chapters
- * whose CORE stops share a place both play it - see the Epic 16 handover.
+ * optimistic. Core stops are never removed (core means core).
+ *
+ * SILENT CORES (v4, Option E). A CORE stop within dedup.radiusM of a core of
+ * an EARLIER chapter stays in the plan (its zone still fires) but is silenced
+ * (silent_stop_ids), so its interest weight is not counted a second time:
+ * the node's base value drops by it. Silence depends only on earlier
+ * chapters, so appending a chapter never changes an earlier one's. No later
+ * core can sit on an earlier KEPT extension - that extension was excluded.
  */
 
 import { distanceMeters } from '../distance.ts';
@@ -77,6 +83,8 @@ export interface PlannedChapter {
   option: ChapterOption;
   /** The curve this chapter was planned with: model.options minus deduplicated extensions. */
   options: ChapterOption[];
+  /** v4: core stops silenced because an earlier chapter's core is the same place. */
+  silentIds: string[];
 }
 
 export interface SearchResult {
@@ -167,6 +175,8 @@ const toPoint = (s: CandidateStop) => ({ lng: s.coordinates[0], lat: s.coordinat
 function proximity(models: readonly ChapterModel[], radiusM: number) {
   const nearCore = new Map<string, Map<string, string[]>>();
   const nearExt = new Map<string, Map<string, string[]>>();
+  /** x's CORE stops within radius of y's core stops - silenced when y comes first. */
+  const coreOnCore = new Map<string, Map<string, CandidateStop[]>>();
   const box = new Map<string, [number, number, number, number]>();
   for (const m of models) {
     const pts = m.candidate.stops.map((s) => s.coordinates);
@@ -181,10 +191,13 @@ function proximity(models: readonly ChapterModel[], radiusM: number) {
   const within = (s: CandidateStop, others: readonly CandidateStop[]) => others.some((o) => distanceMeters(toPoint(s), toPoint(o)) <= radiusM);
   for (const x of models) {
     const xs = offeredExtensions(x);
-    if (xs.length === 0) continue;
+    const xCores = x.candidate.stops.filter((s) => s.stopRole === 'core');
     for (const y of models) {
       if (x === y || !overlap(box.get(x.candidate.chapterId)!, box.get(y.candidate.chapterId)!)) continue;
       const cores = y.candidate.stops.filter((s) => s.stopRole === 'core');
+      const silenced = xCores.filter((s) => within(s, cores));
+      if (silenced.length > 0) (coreOnCore.get(x.candidate.chapterId) ?? coreOnCore.set(x.candidate.chapterId, new Map()).get(x.candidate.chapterId)!).set(y.candidate.chapterId, silenced);
+      if (xs.length === 0) continue;
       const exts = offeredExtensions(y);
       const c = xs.filter((s) => within(s, cores)).map((s) => s.waypointId);
       const e = xs.filter((s) => within(s, exts)).map((s) => s.waypointId);
@@ -192,7 +205,7 @@ function proximity(models: readonly ChapterModel[], radiusM: number) {
       if (e.length > 0) (nearExt.get(x.candidate.chapterId) ?? nearExt.set(x.candidate.chapterId, new Map()).get(x.candidate.chapterId)!).set(y.candidate.chapterId, e);
     }
   }
-  return { nearCore, nearExt };
+  return { nearCore, nearExt, coreOnCore };
 }
 
 export function searchSequence(input: SearchInput): SearchResult {
@@ -211,6 +224,12 @@ export function searchSequence(input: SearchInput): SearchResult {
       if (j < i) for (const id of near!.nearExt.get(x)?.get(y) ?? []) out.add(id);
     });
     return out;
+  };
+  /** The cores of chapter `ids[i]` that an earlier chapter's core already narrates. */
+  const silentAt = (ids: readonly string[], i: number): CandidateStop[] => {
+    const out = new Map<string, CandidateStop>();
+    for (let j = 0; j < i; j++) for (const s of near!.coreOnCore.get(ids[i]!)?.get(ids[j]!) ?? []) out.set(s.waypointId, s);
+    return [...out.values()].sort((a, b) => a.sortOrder - b.sortOrder);
   };
   const curves = new Map<string, ChapterOption[]>();
   const curveOf = (m: ChapterModel, excluded: ReadonlySet<string>): ChapterOption[] => {
@@ -278,7 +297,10 @@ export function searchSequence(input: SearchInput): SearchResult {
       }
       const id = child.model.candidate.chapterId;
       const nextTransferS = transferS + child.hop.seconds;
-      const nextBase = baseValue + child.model.baseValue;
+      const ids = [...seq.map((p) => p.model.candidate.chapterId), id];
+      const silent = near ? silentAt(ids, seq.length) : [];
+      // A silenced core's weight was already earned where the place first played.
+      const nextBase = baseValue + child.model.baseValue - silent.reduce((a, s) => a + s.matchedWeight, 0);
       const capacity = input.capacityS - nextTransferS;
       const seed: Combo[] = [{ value: 0, timeS: 0, estimatedLegs: 0, picks: [] }];
 
@@ -287,7 +309,6 @@ export function searchSequence(input: SearchInput): SearchResult {
       let nextSeq: PlannedChapter[];
       let nextTable: Combo[];
       if (near) {
-        const ids = [...seq.map((p) => p.model.candidate.chapterId), id];
         let refold = false;
         const prior = seq.map((p, i) => {
           if ((near.nearCore.get(p.model.candidate.chapterId)?.get(id)?.length ?? 0) === 0) return p;
@@ -295,12 +316,12 @@ export function searchSequence(input: SearchInput): SearchResult {
           return { ...p, options: curveOf(p.model, excludedAt(ids, i)) };
         });
         const own = curveOf(child.model, excludedAt(ids, seq.length));
-        nextSeq = [...prior, { model: child.model, hop: child.hop, option: own[0]!, options: own }];
+        nextSeq = [...prior, { model: child.model, hop: child.hop, option: own[0]!, options: own, silentIds: silent.map((s) => s.waypointId) }];
         nextTable = refold
           ? nextSeq.reduce((t, p) => fold(t, p.options, capacity), seed)
           : fold(seq.length === 0 ? seed : table, own, capacity);
       } else {
-        nextSeq = [...seq, { model: child.model, hop: child.hop, option: child.model.options[0]!, options: child.model.options }];
+        nextSeq = [...seq, { model: child.model, hop: child.hop, option: child.model.options[0]!, options: child.model.options, silentIds: [] }];
         nextTable = fold(seq.length === 0 ? seed : table, child.model.options, capacity);
       }
       if (nextTable.length === 0) continue;

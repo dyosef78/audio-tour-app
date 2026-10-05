@@ -15,13 +15,17 @@ import type { TransitMode } from '../contracts/planTour.ts';
  * v2 (Part 4): quality.dropped_high_value_extensions. Same plans, richer metadata.
  * v3 (Epic 16, PM 6 Oct 2026): spatial dedup of EXTENSIONS - the same request
  * can now keep fewer extensions, so cached v2 plans are not reused.
+ * v4 (Option E, PM 6 Oct 2026): duplicate CORE stops are kept but silenced
+ * (ChapterSegment.silent_stop_ids), and their interest weight no longer counts
+ * twice, so the same request can choose differently.
  */
-export const PLANNER_VERSION = 'v3';
+export const PLANNER_VERSION = 'v4';
 
 /**
  * Two stops of DIFFERENT chapters this close are the same place (PM: "~20 m").
  * An extension that close to a stop the plan already narrates is not offered
- * (sequence.ts, dedup). Core stops are never removed (core means core).
+ * (sequence.ts, dedup); a CORE stop that close to an earlier chapter's core is
+ * kept but silenced (silent_stop_ids). Core stops are never removed.
  */
 export const DEDUP_RADIUS_M = 20;
 

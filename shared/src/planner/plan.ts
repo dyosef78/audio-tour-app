@@ -28,7 +28,7 @@ export interface PlanDraft {
   /** See PlanQuality.dropped_high_value_extensions. */
   droppedHighValueExtensions: number;
   /** Chosen chapters, for content_hash and the stale check. */
-  chapters: { chapterId: string; tourId: string; waypointIds: string[]; entry: Pair; exit: Pair }[];
+  chapters: { chapterId: string; tourId: string; waypointIds: string[]; silentStopIds: string[]; entry: Pair; exit: Pair }[];
 }
 
 export type PlanOutcome =
@@ -139,6 +139,9 @@ export function planTour(request: PlanTourRequest, answer: PlannerCandidates, or
       waypoint_ids: waypointIds,
       kept_extension_ids: [...p.option.keptIds],
       dropped_extension_ids: extensionIds(c).filter((id) => !kept.has(id)),
+      // v4: duplicate places an earlier chapter already narrates. Still planned
+      // (and their dwell still counted: a conservative estimate, never over budget).
+      silent_stop_ids: [...p.silentIds],
       travel_s: p.option.travelS,
       dwell_s: p.option.dwellS,
       cost_source: p.option.estimatedLegs > 0 ? 'estimated' : 'valhalla',
@@ -163,7 +166,7 @@ export function planTour(request: PlanTourRequest, answer: PlannerCandidates, or
     deepDiveExtraS += p.option.deepDiveExtraS;
     legsTotal += 1 + p.option.legs;
     legsEstimated += (p.hop.cost.source === 'estimated' ? 1 : 0) + p.option.estimatedLegs;
-    chapters.push({ chapterId: c.chapterId, tourId: c.tourId, waypointIds, entry: c.entry, exit: c.exit });
+    chapters.push({ chapterId: c.chapterId, tourId: c.tourId, waypointIds, silentStopIds: [...p.silentIds], entry: c.entry, exit: c.exit });
     previous = c;
   });
 
