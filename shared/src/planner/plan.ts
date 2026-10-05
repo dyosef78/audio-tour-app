@@ -57,10 +57,10 @@ export function planTour(request: PlanTourRequest, answer: PlannerCandidates, or
     transferIsWalking: request.transit_mode === 'walking',
     dedup: {
       radiusM: DEDUP_RADIUS_M,
-      curveFor: (m, excluded) => {
-        // Excluding extensions never touches the core path, so a chapter that
-        // had a curve still has one; null here is a planner bug.
-        const curve = chapterOptions(m.candidate, book, params, excluded);
+      curveFor: (m, excluded, silenced) => {
+        // Excluding extensions or silencing cores never touches the core path,
+        // so a chapter that had a curve still has one; null is a planner bug.
+        const curve = chapterOptions(m.candidate, book, params, excluded, silenced);
         if (curve === null) throw new Error(`dedup: chapter ${m.candidate.chapterId} lost its core path`);
         return curve;
       },
@@ -140,7 +140,7 @@ export function planTour(request: PlanTourRequest, answer: PlannerCandidates, or
       kept_extension_ids: [...p.option.keptIds],
       dropped_extension_ids: extensionIds(c).filter((id) => !kept.has(id)),
       // v4: duplicate places an earlier chapter already narrates. Still planned
-      // (and their dwell still counted: a conservative estimate, never over budget).
+      // (walked through), with ZERO dwell: dwell_s below already excludes them.
       silent_stop_ids: [...p.silentIds],
       travel_s: p.option.travelS,
       dwell_s: p.option.dwellS,

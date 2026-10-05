@@ -131,7 +131,7 @@ function travel(seconds: number, mode: TransitMode, pace: number): number {
  * Every way to cross one slot L -> [extensions] -> R. Empty when no path
  * exists (every route through it is unroutable).
  */
-function slotOptions(chapter: Candidate, book: CostBook, params: ChapterParams, L: SlotNode, exts: CandidateStop[], R: SlotNode): ChapterOption[] {
+function slotOptions(chapter: Candidate, book: CostBook, params: ChapterParams, L: SlotNode, exts: CandidateStop[], R: SlotNode, silenced: ReadonlySet<string>): ChapterOption[] {
   const nodes: SlotNode[] = [L, ...exts.map((s) => ({ id: s.waypointId, stop: s })), R];
   const last = nodes.length - 1;
   // best[j]: value -> best option for paths L .. ending at node j
@@ -153,7 +153,9 @@ function slotOptions(chapter: Candidate, book: CostBook, params: ChapterParams, 
       // Applied only to hops an EXTENSION choice creates - core-to-core hops
       // are authored, and the planner cannot drop a core.
       const touchesExtension = i > 0 || isExtension;
-      if (chapter.transitMode === 'driving' && touchesExtension && from.stop && t < (from.stop.narrationS ?? 0)) continue;
+      // A silenced core narrates nothing, so there is nothing to outrun.
+      const narrationS = from.stop && !silenced.has(from.stop.waypointId) ? (from.stop.narrationS ?? 0) : 0;
+      if (chapter.transitMode === 'driving' && touchesExtension && from.stop && t < narrationS) continue;
 
       const step: ChapterOption = isExtension
         ? {
@@ -182,7 +184,19 @@ function slotOptions(chapter: Candidate, book: CostBook, params: ChapterParams, 
  * The chapter's choice curve, or null when no path crosses it at all - a
  * chapter whose core route is unroutable cannot be planned.
  */
-export function chapterOptions(chapter: Candidate, book: CostBook, params: ChapterParams, excluded: ReadonlySet<string> = NONE): ChapterOption[] | null {
+/**
+ * `excluded`: extensions the plan already covers elsewhere (dedup, sequence.ts).
+ * `silenced`: CORE stops an earlier chapter already narrated (v4, Option E).
+ * The visitor walks through them - their legs stay, so travel is unchanged -
+ * but does not stop to listen: no dwell, no Deep Dive, nothing to outrun.
+ */
+export function chapterOptions(
+  chapter: Candidate,
+  book: CostBook,
+  params: ChapterParams,
+  excluded: ReadonlySet<string> = NONE,
+  silenced: ReadonlySet<string> = NONE,
+): ChapterOption[] | null {
   const mandatory: SlotNode[] = [{ id: 'entry', stop: null }];
   const slots: CandidateStop[][] = [[]];
   let coreDwell = 0;
@@ -192,8 +206,10 @@ export function chapterOptions(chapter: Candidate, book: CostBook, params: Chapt
     if (s.stopRole === 'core') {
       mandatory.push({ id: s.waypointId, stop: s });
       slots.push([]);
-      coreDwell += s.dwellS + (params.includeDeepDives ? s.deepDiveDwellS : 0);
-      coreDeepDiveExtra += params.includeDeepDives ? 0 : s.deepDiveDwellS;
+      if (!silenced.has(s.waypointId)) {
+        coreDwell += s.dwellS + (params.includeDeepDives ? s.deepDiveDwellS : 0);
+        coreDeepDiveExtra += params.includeDeepDives ? 0 : s.deepDiveDwellS;
+      }
     } else if (s.eligible && s.matchedWeight > 0 && !excluded.has(s.waypointId)) {
       // `excluded`: extensions the plan already covers elsewhere (dedup, sequence.ts).
       slots[slots.length - 1]!.push(s);
@@ -203,7 +219,7 @@ export function chapterOptions(chapter: Candidate, book: CostBook, params: Chapt
 
   let curve: ChapterOption[] = [{ ...EMPTY, dwellS: coreDwell, deepDiveExtraS: coreDeepDiveExtra }];
   for (let k = 0; k < mandatory.length - 1; k++) {
-    const options = slotOptions(chapter, book, params, mandatory[k]!, slots[k]!, mandatory[k + 1]!);
+    const options = slotOptions(chapter, book, params, mandatory[k]!, slots[k]!, mandatory[k + 1]!, silenced);
     if (options.length === 0) return null;
     const merged: ChapterOption[] = [];
     for (const a of curve) for (const b of options) merged.push(combine(a, b));

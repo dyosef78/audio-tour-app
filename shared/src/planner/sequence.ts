@@ -39,9 +39,17 @@
  * SILENT CORES (v4, Option E). A CORE stop within dedup.radiusM of a core of
  * an EARLIER chapter stays in the plan (its zone still fires) but is silenced
  * (silent_stop_ids), so its interest weight is not counted a second time:
- * the node's base value drops by it. Silence depends only on earlier
- * chapters, so appending a chapter never changes an earlier one's. No later
- * core can sit on an earlier KEPT extension - that extension was excluded.
+ * the node's base value drops by it - and its DWELL is zero (the
+ * visitor walks through without stopping to listen; the legs through it are
+ * unchanged). Silence depends only on earlier chapters, so appending a chapter
+ * never changes an earlier one's. No later core can sit on an earlier KEPT
+ * extension - that extension was excluded.
+ *
+ * Because silence makes a chapter SHORTER, the two time bounds account for
+ * it: a child's fit is judged on its curve with its actual silence, and the
+ * value-per-second rate behind the pruning bound uses each chapter's fastest
+ * possible time (every core that could ever be silenced, silenced) - so the
+ * bound stays optimistic.
  */
 
 import { distanceMeters } from '../distance.ts';
@@ -66,8 +74,8 @@ export interface SearchInput {
 
 export interface DedupInput {
   radiusM: number;
-  /** The chapter's curve with these extensions unavailable: chapterOptions(..., excluded). */
-  curveFor(model: ChapterModel, excluded: ReadonlySet<string>): ChapterOption[];
+  /** The chapter's curve with these extensions unavailable and these cores silenced: chapterOptions(..., excluded, silenced). */
+  curveFor(model: ChapterModel, excluded: ReadonlySet<string>, silenced: ReadonlySet<string>): ChapterOption[];
 }
 
 export interface Hop {
@@ -232,20 +240,36 @@ export function searchSequence(input: SearchInput): SearchResult {
     return [...out.values()].sort((a, b) => a.sortOrder - b.sortOrder);
   };
   const curves = new Map<string, ChapterOption[]>();
-  const curveOf = (m: ChapterModel, excluded: ReadonlySet<string>): ChapterOption[] => {
-    if (excluded.size === 0) return m.options;
-    const key = `${m.candidate.chapterId}|${[...excluded].sort().join(',')}`;
+  const NO_IDS: ReadonlySet<string> = new Set();
+  const curveOf = (m: ChapterModel, excluded: ReadonlySet<string>, silenced: ReadonlySet<string> = NO_IDS): ChapterOption[] => {
+    if (excluded.size === 0 && silenced.size === 0) return m.options;
+    const key = `${m.candidate.chapterId}|${[...excluded].sort().join(',')}|${[...silenced].sort().join(',')}`;
     let c = curves.get(key);
     if (!c) {
-      c = dedup!.curveFor(m, excluded);
+      c = dedup!.curveFor(m, excluded, silenced);
       curves.set(key, c);
     }
     return c;
   };
+  // Fastest a chapter can ever be: core only, with every core that some
+  // other chapter could silence silenced. For the optimistic bound only.
+  const fastestEver = new Map(
+    models.map((m) => {
+      const id = m.candidate.chapterId;
+      const silenceable = new Set([...(near?.coreOnCore.get(id)?.values() ?? [])].flat().map((s) => s.waypointId));
+      return [id, silenceable.size === 0 ? optionTime(m.options[0]!) : optionTime(curveOf(m, NO_IDS, silenceable)[0]!)];
+    }),
+  );
+  /** The child's core-only time with the silence it would actually get after `seq`. */
+  const minTimeAfter = (seqIds: readonly string[], m: ChapterModel): number => {
+    if (!near) return optionTime(m.options[0]!);
+    const silent = silentAt([...seqIds, m.candidate.chapterId], seqIds.length);
+    return optionTime(curveOf(m, NO_IDS, new Set(silent.map((s) => s.waypointId)))[0]!);
+  };
   const minTime = new Map(models.map((m) => [m.candidate.chapterId, optionTime(m.options[0]!)]));
   const maxValue = new Map(models.map((m) => [m.candidate.chapterId, m.options[m.options.length - 1]!.value]));
   const ratio = (m: ChapterModel): number =>
-    (m.baseValue + maxValue.get(m.candidate.chapterId)!) / Math.max(1, minTime.get(m.candidate.chapterId)!);
+    (m.baseValue + maxValue.get(m.candidate.chapterId)!) / Math.max(1, fastestEver.get(m.candidate.chapterId)!);
 
   const hopTo = (fromId: string | null, toId: string): Hop | null => {
     const cost = fromId === null ? input.book.fromOrigin(input.origin, toId) : input.book.transfer(fromId, toId);
@@ -285,7 +309,8 @@ export function searchSequence(input: SearchInput): SearchResult {
       const hop = hopTo(lastId, id);
       if (!hop) continue;
       const fastestCombo = table.length > 0 ? table[table.length - 1]!.timeS : 0;
-      if (transferS + hop.seconds + fastestCombo + minTime.get(id)! > input.capacityS) continue;
+      const seqIds = seq.map((p) => p.model.candidate.chapterId);
+      if (transferS + hop.seconds + fastestCombo + minTimeAfter(seqIds, m) > input.capacityS) continue;
       children.push({ model: m, hop, score: (m.baseValue + maxValue.get(id)!) / Math.max(1, hop.seconds + minTime.get(id)!) });
     }
     children.sort((a, b) => b.score - a.score || (a.model.candidate.chapterId < b.model.candidate.chapterId ? -1 : 1));
@@ -313,9 +338,9 @@ export function searchSequence(input: SearchInput): SearchResult {
         const prior = seq.map((p, i) => {
           if ((near.nearCore.get(p.model.candidate.chapterId)?.get(id)?.length ?? 0) === 0) return p;
           refold = true;
-          return { ...p, options: curveOf(p.model, excludedAt(ids, i)) };
+          return { ...p, options: curveOf(p.model, excludedAt(ids, i), new Set(p.silentIds)) };
         });
-        const own = curveOf(child.model, excludedAt(ids, seq.length));
+        const own = curveOf(child.model, excludedAt(ids, seq.length), new Set(silent.map((s) => s.waypointId)));
         nextSeq = [...prior, { model: child.model, hop: child.hop, option: own[0]!, options: own, silentIds: silent.map((s) => s.waypointId) }];
         nextTable = refold
           ? nextSeq.reduce((t, p) => fold(t, p.options, capacity), seed)

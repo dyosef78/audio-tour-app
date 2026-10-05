@@ -673,6 +673,53 @@ heading('Option E (v4) - a CORE stop on a place an earlier chapter narrated is k
   // 30 m: another place, nothing silenced.
   const far = planTour(request({ available_minutes: 240 }), parseCandidates(rpc([a, chapter(1, 400, [plaza[0], Number((plaza[1] + 30 / 111_320).toFixed(6))])], { legs: [a, b].flatMap((c) => allLegs(c, () => 90)) })), ORIGIN_LL);
   assert('30 m apart: nothing silenced', far.ok && far.draft.segments.every((x) => x.kind !== 'chapter' || x.silent_stop_ids.length === 0));
+
+  // ZERO DWELL (PM, 6 Oct 2026): the visitor walks through a silent stop.
+  // A 20-minute plaza stop in both tours: the second visit must cost nothing.
+  const big = (k: number, x: number, firstCore: Pair): ChapterSpec => ({
+    id: uuid(7800 + k), tour: uuid(7900 + k), entry: at(x, 0), exit: at(x + 300, 0), coreWeight: 0, stops: [
+      { id: uuid(7950 + k * 10 + 1), sort: 1, role: 'core', pos: firstCore, dwell: 1200 },
+      { id: uuid(7950 + k * 10 + 3), sort: 3, role: 'core', pos: at(x + 280, 0), dwell: 120 },
+    ],
+  });
+  const bigA = big(0, 0, plaza);
+  const bigB = big(1, 400, [plaza[0], Number((plaza[1] + 9 / 111_320).toFixed(6))]);
+  const both = rpc([bigA, bigB], { legs: [bigA, bigB].flatMap((c) => allLegs(c, () => 90)) });
+  const roomy = planTour(request({ available_minutes: 240 }), parseCandidates(both), ORIGIN_LL);
+  assert('roomy budget: both chapters planned', roomy.ok && roomy.draft.chapters.length === 2);
+  if (roomy.ok) {
+    const segs = roomy.draft.segments.filter((x): x is Extract<typeof x, { kind: 'chapter' }> => x.kind === 'chapter');
+    eq('dwell: the first visit stops 1200 + 120 s, the silent second visit only 120 s', segs.map((x) => x.dwell_s), [1320, 120]);
+    eq('the estimate adds only what the visitor actually stands for', roomy.draft.estimate.dwell_s, 1440);
+    // Tight budget: room for the plaza ONCE. Counting the silent dwell would
+    // have dropped the second chapter for time that is never spent.
+    const need = roomy.draft.estimate.total_s;
+    const minutes = Math.ceil((need + 60) / 0.9 / 60);
+    const tight = planTour(request({ available_minutes: minutes }), parseCandidates(both), ORIGIN_LL);
+    // Driving: a stop's narration plays on the move, so the next stop must not
+    // come sooner - but a SILENT stop narrates nothing, so it blocks nothing.
+    const drive = (k: number, x: number, firstCore: Pair): ChapterSpec => ({
+      id: uuid(8800 + k), tour: uuid(8900 + k), mode: 'driving', entry: at(x, 0), exit: at(x + 3000, 0), coreWeight: 0, stops: [
+        { id: uuid(8950 + k * 10 + 1), sort: 1, role: 'core', pos: firstCore, dwell: 0, narration: 300 },
+        { id: uuid(8950 + k * 10 + 2), sort: 2, role: 'extension', pos: at(x + 1500, 300), dwell: 0, narration: 60, weight: 3 },
+        { id: uuid(8950 + k * 10 + 3), sort: 3, role: 'core', pos: at(x + 2800, 0), dwell: 0, narration: 60 },
+      ],
+    });
+    const dA = drive(0, 0, plaza);
+    const dB = drive(1, 5000, [plaza[0], Number((plaza[1] + 9 / 111_320).toFixed(6))]);
+    // Every leg 90 s: shorter than the plaza's 300 s narration.
+    const drv = planTour(request({ available_minutes: 240, transit_mode: 'driving' }), parseCandidates(rpc([dA, dB], { legs: [dA, dB].flatMap((c) => allLegs(c, () => 90)), transferProfile: 'auto' })), ORIGIN_LL);
+    assert('a plan is produced (driving)', drv.ok);
+    if (drv.ok) {
+      const segs = drv.draft.segments.filter((x): x is Extract<typeof x, { kind: 'chapter' }> => x.kind === 'chapter');
+      const second = segs[1]!;
+      assert('driving: the second chapter silences its plaza core', second.silent_stop_ids.length === 1);
+      assert('...and may keep the extension 90 s after it (nothing is narrating there)', second.kept_extension_ids.length === 1, JSON.stringify(second));
+      assert('...while the FIRST chapter cannot (its plaza narrates 300 s)', segs[0]!.kept_extension_ids.length === 0, JSON.stringify(segs[0]));
+    }
+    assert(`tight budget (${minutes} min, ${need} s needed, +1200 s if the silent dwell counted): BOTH chapters still fit`,
+      tight.ok && tight.draft.chapters.length === 2 && Math.floor(minutes * 60 * 0.9) < need + 1200, tight.ok ? JSON.stringify(tight.draft.chapters.map((c) => c.chapterId)) : 'no plan');
+  }
 }
 
 {
@@ -687,9 +734,45 @@ heading('Option E (v4) - a CORE stop on a place an earlier chapter narrated is k
 }
 
 // -----------------------------------------------------------------------------
-heading('searchSequence WITH dedup == brute force over every ordered subset (150 overlapping cities)');
+heading('the pruning bound knows silence makes a chapter SHORTER');
 {
-  const rand = rng(6100);
+  // Z: a medium chapter, alone. Y: a cheap visit to the plaza. X: valuable,
+  // but with a 50-minute plaza stop - which, AFTER Y, is silent and costs 0.
+  // Optimum: Y then X. A bound that rated X at its unsilenced time would
+  // prune Y's subtree once Z is found, and return Z.
+  const spec = (k: number, stops: StopSpec[], entry: Pair, exit: Pair): ChapterSpec => ({ id: uuid(9100 + k), tour: uuid(9200 + k), entry, exit, coreWeight: 0, stops });
+  const Y = spec(1, [
+    { id: uuid(9301), sort: 1, role: 'core', pos: at(20, 0), dwell: 60 },
+    { id: uuid(9302), sort: 2, role: 'core', pos: at(60, 0), dwell: 60 },
+  ], at(0, 0), at(80, 0));
+  const X = spec(2, [
+    { id: uuid(9311), sort: 1, role: 'core', pos: at(20, 5), dwell: 3000 },
+    { id: uuid(9312), sort: 2, role: 'core', pos: at(40, 40), dwell: 60, weight: 10 },
+  ], at(0, 10), at(50, 50));
+  const Z = spec(3, [{ id: uuid(9321), sort: 1, role: 'core', pos: at(0, -60), dwell: 500, weight: 4 }], at(0, -50), at(0, -70));
+  const specs = [Y, X, Z];
+  const transfers = specs.flatMap((a) => specs.filter((b) => b !== a).map((b) => ({ from: a.id, to: b.id, s: a === Z || b === Z ? 600 : 30, fromPt: a.exit, toPt: b.entry })));
+  const answer = parseCandidates(rpc(specs, { legs: specs.flatMap((c) => allLegs(c, () => 30)), transfers }));
+  const book = new CostBook(answer, 'walking');
+  const models: ChapterModel[] = answer.candidates.map((c) => ({ candidate: c, baseValue: 1 + c.stops.filter((st) => st.stopRole === 'core').reduce((a, st) => a + st.matchedWeight, 0), options: chapterOptions(c, book, PARAMS)! }));
+  const model = (spec: ChapterSpec) => models.find((m) => m.candidate.chapterId === spec.id)!;
+  const hop = (spec: ChapterSpec) => book.fromOrigin(ORIGIN_LL, spec.id).durationS;
+  const zTotal = hop(Z) + optionTime(model(Z).options[0]!);
+  const yTotal = hop(Y) + optionTime(model(Y).options[0]!);
+  const capacityS = zTotal + 5;
+  // The hazard, stated: the rate a silence-blind bound would use, and what it would conclude.
+  const rate = (m: ChapterModel) => m.baseValue / Math.max(1, optionTime(m.options[0]!));
+  const blindBound = model(Y).baseValue + Math.max(rate(model(X)), rate(model(Z))) * (capacityS - yTotal);
+  assert('fixture: a silence-blind bound would prune Y (and so miss Y -> X)', blindBound < model(Z).baseValue, `bound ${blindBound} vs Z ${model(Z).baseValue}`);
+  const got = searchSequence({ models, book, origin: ORIGIN_LL, capacityS, transferPace: 1, transferIsWalking: true,
+    dedup: { radiusM: 20, curveFor: (m, ex, si) => chapterOptions(m.candidate, book, PARAMS, ex, si)! } });
+  eq('the search finds Y then X (silence makes X fit), not Z', got.chapters.map((c) => c.model.candidate.chapterId), [Y.id, X.id]);
+}
+
+// -----------------------------------------------------------------------------
+heading('searchSequence WITH dedup == brute force over every ordered subset (150 overlapping cities + 200 dwell-heavy)');
+for (const [seed, trials, coreDwellMax, capMin, capSpan] of [[6100, 150, 0, 2400, 6000], [6200, 200, 1800, 1200, 3600]] as const) {
+  const rand = rng(seed);
   let mismatches = 0;
   let detail = '';
   let overlapsSeen = 0;
@@ -700,7 +783,7 @@ heading('searchSequence WITH dedup == brute force over every ordered subset (150
       const x = Math.round(rand() * 800);
       const y = Math.round(rand() * 800);
       specs.push({ id: uuid(8000 + k), entry: at(x, y), exit: at(x + 250, y), coreWeight: 0, stops: [
-        { id: uuid(8100 + k * 10 + 1), sort: 1, role: 'core', pos: at(x + 50, y), dwell: 200, weight: Math.floor(rand() * 3) },
+        { id: uuid(8100 + k * 10 + 1), sort: 1, role: 'core', pos: at(x + 50, y), dwell: 200 + Math.floor(rand() * coreDwellMax), weight: Math.floor(rand() * 3) },
         { id: uuid(8100 + k * 10 + 2), sort: 2, role: 'extension', pos: at(x + 100, y + 40), dwell: 100, weight: 1 + Math.floor(rand() * 4) },
         { id: uuid(8100 + k * 10 + 3), sort: 3, role: 'extension', pos: at(x + 150, y + 40), dwell: 100, weight: 1 + Math.floor(rand() * 4) },
         { id: uuid(8100 + k * 10 + 4), sort: 4, role: 'core', pos: at(x + 200, y), dwell: 200 },
@@ -722,8 +805,8 @@ heading('searchSequence WITH dedup == brute force over every ordered subset (150
     const book = new CostBook(answer, 'walking');
     // baseValue from the cores' own weights, as the SQL's core_matched_weight sums them.
     const models: ChapterModel[] = answer.candidates.map((c) => ({ candidate: c, baseValue: 1 + c.stops.filter((st) => st.stopRole === 'core').reduce((a, st) => a + st.matchedWeight, 0), options: chapterOptions(c, book, PARAMS)! }));
-    const capacityS = 2400 + Math.floor(rand() * 6000);
-    const curveFor = (m: ChapterModel, ex: ReadonlySet<string>) => chapterOptions(m.candidate, book, PARAMS, ex)!;
+    const capacityS = capMin + Math.floor(rand() * capSpan);
+    const curveFor = (m: ChapterModel, ex: ReadonlySet<string>, si: ReadonlySet<string>) => chapterOptions(m.candidate, book, PARAMS, ex, si)!;
     const got = searchSequence({ models, book, origin: ORIGIN_LL, capacityS, transferPace: 1, transferIsWalking: true, dedup: { radiusM: 20, curveFor } });
 
     // Oracle: the rule written out again, independently, and every combination tried.
@@ -745,9 +828,11 @@ heading('searchSequence WITH dedup == brute force over every ordered subset (150
         });
         if (ok) {
           const ms = seq.map((id) => models.find((m) => m.candidate.chapterId === id)!);
-          const cs = ms.map((m, i) => chapterOptions(m.candidate, book, PARAMS, excludedFor(ms, i))!);
-          // Silent cores (v4): a core on an EARLIER chapter's core earns nothing a second time.
+          // Silent cores (v4): a core on an EARLIER chapter's core earns nothing a
+          // second time, and the visitor does not stop there (zero dwell).
           const cores = (m: ChapterModel) => m.candidate.stops.filter((st) => st.stopRole === 'core');
+          const silentFor = (i: number) => new Set(cores(ms[i]!).filter((c) => ms.slice(0, i).some((o) => cores(o).some((d) => dist(c.coordinates, d.coordinates) <= 20))).map((c) => c.waypointId));
+          const cs = ms.map((m, i) => chapterOptions(m.candidate, book, PARAMS, excludedFor(ms, i), silentFor(i))!);
           const silentWeight = ms.reduce((acc, m, i) => acc + cores(m).filter((c) => ms.slice(0, i).some((o) => cores(o).some((d) => dist(c.coordinates, d.coordinates) <= 20))).reduce((a, c) => a + c.matchedWeight, 0), 0);
           const rec = (i: number, v: number, t: number) => {
             if (i === ms.length) {
@@ -781,7 +866,7 @@ heading('searchSequence WITH dedup == brute force over every ordered subset (150
       }
     });
   }
-  assert(`dedup + silent-core B&B finds the brute-force optimum (150 trials, ${overlapsSeen} forced overlaps)`, mismatches === 0, detail);
+  assert(`dedup + silent-core B&B finds the brute-force optimum (seed ${seed}, ${trials} trials, ${overlapsSeen} forced overlaps)`, mismatches === 0, detail);
 }
 
 console.log(`\n${checks - failures}/${checks} checks passed`);
