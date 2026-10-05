@@ -12,6 +12,7 @@
  *   planForm                the request, error copy, preview rows
  *   planReconciler          plan file vs bundles on disk: promote, remove, leave
  *   createPlanDownloadJobs  one job per plan, write-ahead intent, outcomes kept
+ *   optimisticHandoff       1.5 s bound on the tracking wait before Maps opens
  */
 
 import { parsePlanTourOk, type PlanTourOk, type PlanTourRequest } from '../../shared/src/contracts/planTour.ts';
@@ -21,6 +22,8 @@ import { createPlanClient } from '../src/services/planner/PlanClient.ts';
 import { downloadPlanBundles, type PlanDownloadDeps, type PlanDownloadOutcome } from '../src/services/planner/planDownload.ts';
 import { createPlanDownloadJobs } from '../src/services/planner/planDownloadJobs.ts';
 import { reconcileActions, reconcilePlans } from '../src/services/planner/planReconciler.ts';
+import { HANDOFF_TRACKING_TIMEOUT_MS, optimisticHandoff } from '../src/session/optimisticHandoff.ts';
+import { planIdOfSessionKey, planSessionKey } from '../src/session/sessionKey.ts';
 import { buildPlanRequest, estimateSummary, formatDistance, formatDuration, localIsoWithOffset, planErrorCopy, segmentRows, upsellCopy } from '../src/services/planner/planForm.ts';
 import { createPlanRepository, PinnedBundleError, pinConflictCopy } from '../src/services/planner/planRepository.ts';
 import { MAX_REQUESTS_PER_SESSION, MIN_QUERY, PlacesSession, SESSION_IDLE_MS, type PlacesCallResult, type PlacesClient } from '../src/services/planner/places.ts';
@@ -541,6 +544,110 @@ heading('createPlanClient');
   assert('a runner that throws ends as a failed outcome, logged - never a hung job', failed.kind === 'failed' && !boom.view(p3.plan_id).running && logs.some((l) => /runner bug/.test(l)));
   throwsLike('start() for an unknown plan fails loudly', () => jobs.start(uuid(999)), /no plan/);
   assert('listeners heard every change', notes > 0 && progressSeen.includes(0.4));
+}
+
+{
+  heading('optimisticHandoff - bounded wait, then Maps opens whatever tracking is doing');
+  const fake = () => {
+    let clock = 0;
+    const timers = new Map<number, { at: number; fn: () => void }>();
+    let next = 1;
+    return {
+      timers: {
+        setTimeout: (fn: () => void, ms: number) => { const id = next++; timers.set(id, { at: clock + ms, fn }); return id; },
+        clearTimeout: (h: unknown) => void timers.delete(h as number),
+      },
+      now: () => clock,
+      pending: () => timers.size,
+      advance(ms: number) {
+        clock += ms;
+        for (const [id, t] of [...timers]) if (t.at <= clock) { timers.delete(id); t.fn(); }
+      },
+    };
+  };
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+  const deferred = () => { let resolve!: () => void, reject!: (e: unknown) => void; const promise = new Promise<void>((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; };
+
+  eq('the PM bound is 1.5 s', HANDOFF_TRACKING_TIMEOUT_MS, 1500);
+
+  // 1. Tracking already settled: opens at once, no timer left behind.
+  {
+    const t = fake();
+    const opened: number[] = [];
+    const late: string[] = [];
+    const r = await optimisticHandoff({ trackingWork: Promise.resolve(), trackingLost: () => false, open: async () => { opened.push(t.now()); }, onLate: (o) => late.push(o), timers: t.timers, now: t.now });
+    eq('settled tracking: opens immediately, reports nothing', [r.kind, opened, late], ['settled', [0], []]);
+    eq('...and leaves no timer scheduled', t.pending(), 0);
+  }
+
+  // 2. Restart finishes within the bound: Maps opens only AFTER it.
+  {
+    const t = fake();
+    const work = deferred();
+    const order: string[] = [];
+    const h = optimisticHandoff({ trackingWork: work.promise.then(() => { order.push('tracking'); }), trackingLost: () => false, open: async () => { order.push('open'); }, onLate: () => order.push('late'), timers: t.timers, now: t.now });
+    t.advance(1000);
+    await flush();
+    eq('waiting: Maps has not opened at 1.0 s', order, []);
+    work.resolve();
+    eq('restart done at 1.0 s: tracking first, then Maps, no late report', [(await h).kind, order], ['settled', ['tracking', 'open']]);
+  }
+
+  // 3. The OS stalls: at 1.5 s Maps opens anyway; the restart ends later -> 'late'.
+  {
+    const t = fake();
+    const work = deferred();
+    const order: string[] = [];
+    const late: [string, number][] = [];
+    const h = optimisticHandoff({ trackingWork: work.promise, trackingLost: () => false, open: async () => { order.push(`open@${t.now()}`); }, onLate: (o, ms) => late.push([o, ms]), timers: t.timers, now: t.now });
+    t.advance(1499);
+    await flush();
+    eq('1.499 s: still waiting', order, []);
+    t.advance(1);
+    eq('1.5 s: Maps opens anyway (optimistic)', [(await h).kind, order], ['timed_out', ['open@1500']]);
+    eq('...nothing reported while the restart still runs', late, []);
+    t.advance(2500);
+    work.resolve();
+    await flush();
+    eq('the restart ends at 4 s: reported once as late, with the wait', late, [['late', 4000]]);
+  }
+
+  // 4. Timed out, and the restart then LOSES tracking (refused in the background).
+  {
+    const t = fake();
+    const work = deferred();
+    let lost = false;
+    const late: string[] = [];
+    const h = optimisticHandoff({ trackingWork: work.promise, trackingLost: () => lost, open: async () => {}, onLate: (o) => late.push(o), timers: t.timers, now: t.now });
+    t.advance(1500);
+    await h;
+    lost = true;
+    work.resolve();
+    await flush();
+    eq('a restart that ends with tracking off is reported as lost', late, ['lost']);
+  }
+
+  // 5. A restart that REJECTS within the bound still lets Maps open, and never rejects the handoff.
+  {
+    const t = fake();
+    let opened = false;
+    const r = await optimisticHandoff({ trackingWork: Promise.reject(new Error('boom')), trackingLost: () => false, open: async () => { opened = true; }, onLate: () => {}, timers: t.timers, now: t.now });
+    assert('a failed restart within the bound: settled, Maps opens, no throw', r.kind === 'settled' && opened && t.pending() === 0);
+  }
+
+  // 6. open() failing surfaces to the caller (the panel shows the error) - not swallowed.
+  {
+    const t = fake();
+    let threw = false;
+    try {
+      await optimisticHandoff({ trackingWork: Promise.resolve(), trackingLost: () => false, open: async () => { throw new Error('no maps'); }, onLate: () => {}, timers: t.timers, now: t.now });
+    } catch (e) { threw = /no maps/.test(String(e)); }
+    assert('a navigation app that cannot open is the caller\'s error, loudly', threw);
+  }
+
+  heading('sessionKey - a plan session is keyed plan:<planId>, never confused with a tour id');
+  eq('plan key round-trips', planIdOfSessionKey(planSessionKey(uuid(500))), uuid(500));
+  eq('a tour id is not a plan key', planIdOfSessionKey(uuid(1)), null);
 }
 
 console.log(`\n${checks - failures}/${checks} checks passed`);

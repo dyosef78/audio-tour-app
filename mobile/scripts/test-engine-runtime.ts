@@ -155,8 +155,9 @@ const progress: Progress = {
   queue: [{ stopId: 'w2', firedAt: 2000, firedWhere: { latitude: 32, longitude: 34 }, expiresAt: 62_000 }],
 };
 const snapshot: TourProgressSnapshot = {
-  v: 2,
+  v: 3,
   tourId: TOUR,
+  source: { kind: 'tour' },
   tourTitle: 'T',
   activeIds: ['w1', 'w2'],
   skippedIds: [],
@@ -190,6 +191,21 @@ const snapshot: TourProgressSnapshot = {
   v1.files.main = JSON.stringify({ v: 1, tourId: TOUR });
   const v1Load = createProgressRepository(v1.io).load();
   assert('an Epic 13 (v1) checkpoint is invalid, not misread', v1Load.kind === 'invalid' && /version 1/.test(v1Load.reason));
+
+  // Epic 16: checkpoint v3.
+  const { v: _v, source: _s, ...v2body } = snapshot;
+  const v2 = memoryIO();
+  v2.files.main = JSON.stringify({ v: 2, ...v2body });
+  const v2Load = createProgressRepository(v2.io).load();
+  assert('a v2 checkpoint (a walk in progress at update) loads as a v3 catalogue tour', v2Load.kind === 'found' && v2Load.snapshot.v === 3 && v2Load.snapshot.source.kind === 'tour');
+  const PLAN = '00000000-0000-4000-8000-000000000500';
+  const planSnap: TourProgressSnapshot = { ...snapshot, tourId: `plan:${PLAN}`, source: { kind: 'plan', planId: PLAN, contentHash: 'a'.repeat(32) } };
+  repo.save(planSnap);
+  const planBack = repo.load();
+  assert('a plan session round-trips its source (id + content hash, never the plan)', planBack.kind === 'found' && planBack.snapshot.source.kind === 'plan' && !('segments' in planBack.snapshot));
+  throws('a plan session keyed by anything but plan:<planId> is refused', () => repo.save({ ...planSnap, tourId: TOUR }), /keyed/);
+  throws('a plan source without its content hash is refused', () => repo.save({ ...planSnap, source: { kind: 'plan', planId: PLAN, contentHash: '' } }), /contentHash/);
+  throws('a source of an unknown kind is refused', () => repo.save({ ...planSnap, source: { kind: 'route' } as unknown as TourProgressSnapshot['source'] }), /unknown source/);
 
   throws('saving progress about an inactive stop throws (bug here, not at resume)', () =>
     repo.save({ ...snapshot, progress: { ...progress, fired: { ghost: 1 } } }), /ghost/);

@@ -46,6 +46,16 @@ export interface LocationServiceCallbacks {
   onSamplingChange?: (tier: 'fine', sampling: GpsSampling) => void;
 }
 
+/**
+ * A restart stopped the running task and then could not start the new one
+ * (Android: the app left the foreground in between). Tracking is OFF until
+ * recover() runs in the foreground - the controller does that on the next
+ * return to the app (Epic 16 optimistic handoff).
+ */
+export class TrackingLostError extends Error {
+  override readonly name = 'TrackingLostError';
+}
+
 export class LocationService {
   private sampling: GpsSampling;
   private callbacks: LocationServiceCallbacks = {};
@@ -60,6 +70,9 @@ export class LocationService {
 
   /** Serialises transport restarts so overlapping ones cannot interleave. */
   private applying: Promise<void> = Promise.resolve();
+
+  /** A restart stopped the task and could not start it again (TrackingLostError). */
+  private lost = false;
 
   /**
    * Android: the background task is the only transport, opened once by
@@ -221,6 +234,8 @@ export class LocationService {
   }
 
   async stopBackground(): Promise<void> {
+    // Stopped on purpose (idle pause, session end): nothing is "lost" any more.
+    this.lost = false;
     // Same ordering as stop(): a late restart would leave a task running with
     // no session behind it - the battery drain stopOrphanedLocationUpdates()
     // exists to clean up on the next cold start.
@@ -244,11 +259,25 @@ export class LocationService {
       if (this.trackingMode === 'foreground') {
         await this.openWatcher();
       } else if (this.trackingMode === 'background') {
+        // Asked AGAIN where the work runs (Epic 16): this restart may have
+        // queued behind another while the app went to the background - an
+        // optimistic handoff opens Google Maps after 1.5 s whatever tracking
+        // is doing. Refused here, the running task is still untouched.
+        this.assertCanRestartTask('retune()');
         // startLocationUpdatesAsync does not reconfigure a running task, so
         // the stop is mandatory rather than defensive.
         const running = await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME);
         if (running) await Location.stopLocationUpdatesAsync(LOCATION_TASK_NAME);
-        await this.openBackgroundUpdates();
+        try {
+          await this.openBackgroundUpdates();
+        } catch (err) {
+          // The one unrecoverable-in-place outcome: stopped, and the OS
+          // refused the start (backgrounded between the two awaits). Say so
+          // precisely, and remember it for recover().
+          this.trackingMode = 'idle';
+          this.lost = true;
+          throw new TrackingLostError(`tracking stopped for a ${mode} restart and the OS refused to start it again: ${err instanceof Error ? err.message : String(err)}`);
+        }
       }
     });
     // The CALLER gets the failure; the chain does not keep it. A rejected
@@ -256,6 +285,27 @@ export class LocationService {
     this.applying = run.catch(() => undefined);
     await run;
     this.callbacks.onSamplingChange?.('fine', this.sampling);
+  }
+
+  /** Tracking is off after a failed restart (TrackingLostError) until recover(). */
+  get trackingLost(): boolean {
+    return this.lost;
+  }
+
+  /**
+   * Start tracking again after a TrackingLostError, with the sampling the
+   * failed restart asked for. Foreground only, like every start; serialised
+   * with restarts. Throws if the OS refuses again (the caller reports it and
+   * tries on the next return to the app).
+   */
+  async recover(): Promise<void> {
+    const run = this.applying.then(async () => {
+      if (!this.lost) return;
+      await this.start();
+      this.lost = false;
+    });
+    this.applying = run.catch(() => undefined);
+    await run;
   }
 
   // ---------------------------------------------------------------------------

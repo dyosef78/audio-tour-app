@@ -37,7 +37,14 @@ export type TelemetryEventType =
   | 'audio_watchdog'
   | 'tour_suspended'
   | 'tour_resumed'
-  | 'chapter_arrived';
+  | 'chapter_arrived'
+  /**
+   * Added by migration 20261009120000 (Epic 16): the optimistic navigation
+   * handoff opened Maps before tracking finished restarting. Sent only while
+   * TELEMETRY_PLAN_FIELDS_LIVE (config/features.ts) - TelemetryService
+   * refuses to queue it otherwise.
+   */
+  | 'handoff_tracking_late';
 
 /**
  * One row of public.telemetry_events, as the client posts it.
@@ -81,6 +88,13 @@ export interface TelemetryEvent {
   app_version: string | null;
   platform: 'ios' | 'android' | null;
   meta: Record<string, unknown> | null;
+  /**
+   * Epic 16 (migration 20261009120000): the planned session this event came
+   * from. ABSENT - not null - unless set: a key the server's table lacks
+   * fails the whole batch, so a build must never send it to a database
+   * without the column (TELEMETRY_PLAN_FIELDS_LIVE).
+   */
+  plan_id?: string;
 }
 
 /**

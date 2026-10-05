@@ -23,6 +23,7 @@ export type RootStackParamList = {
   OnboardingTime: OnboardingParams;
   Discovery: undefined;
   TourDetail: { tourId: string; title: string };
+  /** `tourId` is a SESSION KEY (session/sessionKey.ts): a tour id, or plan:<planId>. */
   ActiveTour: { tourId: string };
   Settings: undefined;
   DeleteAccount: undefined;

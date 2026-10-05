@@ -123,9 +123,22 @@ export const startLocationUpdatesAsync = async (
   calls.push({ kind: 'background-start', options });
 };
 
+/**
+ * Epic 16: run once, right after the next background stop - to pocket the
+ * phone BETWEEN a retune's stop and its start, the window an optimistic
+ * navigation handoff makes reachable.
+ */
+let afterNextStop: (() => void) | null = null;
+export function __afterNextBackgroundStop(fn: () => void): void {
+  afterNextStop = fn;
+}
+
 export const stopLocationUpdatesAsync = async (): Promise<void> => {
   backgroundRunning = false;
   calls.push({ kind: 'background-stop' });
+  const fn = afterNextStop;
+  afterNextStop = null;
+  fn?.();
 };
 
 export const hasStartedLocationUpdatesAsync = async (): Promise<boolean> => backgroundRunning;

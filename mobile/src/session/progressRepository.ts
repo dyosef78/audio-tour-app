@@ -1,5 +1,6 @@
 import type { Progress, QueueItem } from '../engine/types.ts';
 import { MAX_RESUME_AGE_MS, type CheckpointIO } from './sessionCheckpoint.ts';
+import { planSessionKey } from './sessionKey.ts';
 
 /**
  * TourProgressRepository (Epic 15) - the running tour, persisted so a killed
@@ -16,13 +17,25 @@ import { MAX_RESUME_AGE_MS, type CheckpointIO } from './sessionCheckpoint.ts';
  * same port, never an async queue (PM decision).
  *
  * Pure: the I/O is injected, so `npm run test:engine` covers every branch.
+ *
+ * VERSION 3 (Epic 16) adds `source`: a catalogue tour, or a saved PLAN named by
+ * id and content_hash - never embedded. The plan already lives in
+ * saved-plans.json; copying it into a file rewritten synchronously at every
+ * progress change would put 20-50 KB of JSON on the JS thread mid-narration.
+ * A v2 file still LOADS (as a catalogue tour) so a walk in progress survives
+ * the app update; every write is v3.
  */
 
-export const SNAPSHOT_VERSION = 2;
+export const SNAPSHOT_VERSION = 3;
+
+/** What the session runs. A plan is re-read from the plan store at resume and must still match. */
+export type SessionSource = { kind: 'tour' } | { kind: 'plan'; planId: string; contentHash: string };
 
 export interface TourProgressSnapshot {
   v: typeof SNAPSHOT_VERSION;
+  /** The session key (sessionKey.ts): the tour id, or plan:<planId>. */
   tourId: string;
+  source: SessionSource;
   tourTitle: string;
   /** The stops this session runs (every core stop, Epic 16). Never re-derived. */
   activeIds: string[];
@@ -88,6 +101,16 @@ export function snapshotProblem(value: unknown): string | null {
   const c = value as Record<string, unknown>;
   if (c.v !== SNAPSHOT_VERSION) return `unknown version ${String(c.v)}`;
   if (typeof c.tourId !== 'string' || c.tourId === '') return 'no tourId';
+  const source = c.source as Record<string, unknown> | null | undefined;
+  if (typeof source !== 'object' || source === null) return 'no source';
+  if (source.kind === 'plan') {
+    if (typeof source.planId !== 'string' || source.planId === '') return 'plan source has no planId';
+    if (typeof source.contentHash !== 'string' || source.contentHash === '') return 'plan source has no contentHash';
+    // One identity, stated twice: they must agree, or resume would key the wrong session.
+    if (c.tourId !== planSessionKey(source.planId)) return `a plan session is keyed ${String(c.tourId)}, not ${planSessionKey(source.planId)}`;
+  } else if (source.kind !== 'tour') {
+    return `unknown source ${String(source.kind)}`;
+  }
   if (typeof c.tourTitle !== 'string') return 'no tourTitle';
   if (!isStringArray(c.activeIds) || c.activeIds.length === 0) return 'activeIds is not a non-empty list of ids';
   if (!isStringArray(c.skippedIds)) return 'skippedIds is not a list of ids';
@@ -123,6 +146,10 @@ export function createProgressRepository(io: CheckpointIO): TourProgressReposito
       value = JSON.parse(text);
     } catch {
       return { kind: 'invalid', reason: 'not JSON' };
+    }
+    // A v2 checkpoint is a catalogue tour by definition (plans did not exist).
+    if (typeof value === 'object' && value !== null && (value as Record<string, unknown>).v === 2) {
+      value = { ...(value as Record<string, unknown>), v: SNAPSHOT_VERSION, source: { kind: 'tour' } };
     }
     const problem = snapshotProblem(value);
     return problem === null ? { kind: 'found', snapshot: value as TourProgressSnapshot } : { kind: 'invalid', reason: problem };

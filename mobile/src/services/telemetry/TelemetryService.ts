@@ -1,6 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { AppState, type AppStateStatus, Platform } from 'react-native';
 
+import { TELEMETRY_PLAN_FIELDS_LIVE } from '../../config/features';
 import { TelemetryQueue } from './TelemetryQueue';
 import { SupabaseTelemetryTransport } from './SupabaseTelemetryTransport';
 import type {
@@ -87,8 +88,23 @@ export class TelemetryService implements AudioTelemetrySink {
 
   private appVersion: string | null = null;
 
-  constructor(transport: TelemetryTransport = new SupabaseTelemetryTransport()) {
+  /** Epic 16: the planned session every event is stamped with, while one runs. */
+  private planId: string | null = null;
+  /** Migration 20261009120000 is live: plan_id and 'handoff_tracking_late' may be sent. */
+  private readonly planFieldsLive: boolean;
+
+  constructor(transport: TelemetryTransport = new SupabaseTelemetryTransport(), options: { planFieldsLive?: boolean } = {}) {
     this.queue = new TelemetryQueue(transport);
+    this.planFieldsLive = options.planFieldsLive ?? TELEMETRY_PLAN_FIELDS_LIVE;
+  }
+
+  /**
+   * Stamp every event with this plan until cleared - set by the session
+   * controller for a planned session, cleared when it ends. Audio events
+   * recorded by AudioService get it too, with no plumbing through the player.
+   */
+  setPlan(planId: string | null): void {
+    this.planId = planId;
   }
 
   // ---------------------------------------------------------------------------
@@ -221,6 +237,12 @@ export class TelemetryService implements AudioTelemetrySink {
     type: TelemetryEventType,
     context: Partial<AudioEventContext> & { meta?: Record<string, unknown> } = {},
   ): Promise<void> {
+    // Refused BEFORE queueing, not after: a type the server's CHECK lacks would
+    // fail every event batched with it, on every retry.
+    if (!this.planFieldsLive && type === 'handoff_tracking_late') {
+      console.warn(`[Telemetry] ${type} NOT sent - migration 20261009120000 is not live (TELEMETRY_PLAN_FIELDS_LIVE):`, context.meta);
+      return;
+    }
     try {
       const deviceId = await this.ensureDeviceId();
 
@@ -237,6 +259,8 @@ export class TelemetryService implements AudioTelemetrySink {
         app_version: this.appVersion,
         platform: platformTag(),
         meta: context.meta ?? null,
+        // Absent, not null, unless live AND set (see TelemetryEvent.plan_id).
+        ...(this.planFieldsLive && this.planId !== null ? { plan_id: this.planId } : {}),
       };
 
       await this.queue.enqueue(event);

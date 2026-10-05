@@ -10,6 +10,7 @@ import { pinConflictCopy } from '../services/planner/planRepository';
 import { savedPlans, useSavedPlans } from '../services/planner/planRepositoryFile';
 import { planDownloads, usePlanDownload, usePlanReconciler } from '../services/planner/planRuntime';
 import { fetchTours } from '../services/supabase/tours';
+import { planSessionKey } from '../session/sessionKey';
 import { useTourSession } from '../session/tourSessionStore';
 import { colors, MIN_TOUCH } from '../ui/theme';
 
@@ -64,7 +65,9 @@ export default function PlanPreviewScreen({ route, navigation }: PlanPreviewScre
   }, []);
 
   // A running tour plays from its bundle directory: replacing it would silence it.
-  const runningTourId = useTourSession((s) => (s.status === 'active' || s.status === 'starting' ? s.tourId : null));
+  // Every tour a running session plays from - a plan's sources included.
+  const runningTourIds = useTourSession((s) => (s.status === 'active' || s.status === 'starting' ? s.sourceTourIds : NO_TOURS));
+  const runningKey = useTourSession((s) => (s.status === 'active' || s.status === 'starting' || s.status === 'paused' ? s.tourId : null));
 
   const cityId = saved?.request.city_id ?? null;
   useEffect(() => {
@@ -185,9 +188,10 @@ export default function PlanPreviewScreen({ route, navigation }: PlanPreviewScre
   const { plan } = saved;
   const est = estimateSummary(plan);
   const upsell = upsellCopy(plan);
-  const blockedByRunningTour =
-    runningTourId !== null &&
-    plan.sources.some((s) => s.tour_id === runningTourId && TourBundleRepository.readManifest(s.tour_id)?.bundle_version_hash !== s.bundle_version_hash);
+  const blockedByRunningTour = plan.sources.some(
+    (s) => runningTourIds.includes(s.tour_id) && TourBundleRepository.readManifest(s.tour_id)?.bundle_version_hash !== s.bundle_version_hash,
+  );
+  const thisPlanRunning = runningKey === planSessionKey(planId);
   const busy = job.running || local.phase === 'replanning';
   // Asked for before, not running now: a kill or a failure interrupted it.
   const resumable = saved.downloadRequestedAt !== null && !job.running;
@@ -224,9 +228,19 @@ export default function PlanPreviewScreen({ route, navigation }: PlanPreviewScre
       </View>
 
       {saved.status === 'saved' ? (
-        <View style={styles.savedCard}>
-          <Text style={styles.savedText}>✓ Saved — every tour is on your device</Text>
-        </View>
+        <>
+          <View style={styles.savedCard}>
+            <Text style={styles.savedText}>✓ Saved — every tour is on your device</Text>
+          </View>
+          {/* The controller re-checks the plan against the bundles (planProblem) and refuses a stale one. */}
+          <Pressable
+            style={styles.primary}
+            onPress={() => navigation.navigate('ActiveTour', { tourId: planSessionKey(planId) })}
+            accessibilityRole="button"
+          >
+            <Text style={styles.primaryText}>{thisPlanRunning ? 'Back to your tour' : runningKey !== null ? 'Start (ends the current tour)' : 'Start'}</Text>
+          </Pressable>
+        </>
       ) : (
         <>
           {dl.phase === 'downloading' && (
@@ -253,7 +267,8 @@ export default function PlanPreviewScreen({ route, navigation }: PlanPreviewScre
         </>
       )}
 
-      {!busy && (
+      {/* Not while it runs: deleting unpins its tours, which could then be replaced mid-walk. */}
+      {!busy && !thisPlanRunning && (
         <Pressable onPress={deletePlan} hitSlop={8} style={styles.deleteRow} accessibilityRole="button">
           <Text style={styles.delete}>{saved.status === 'saved' ? 'Delete plan' : 'Discard plan'}</Text>
         </Pressable>
@@ -261,6 +276,8 @@ export default function PlanPreviewScreen({ route, navigation }: PlanPreviewScre
     </ScrollView>
   );
 }
+
+const NO_TOURS: string[] = [];
 
 const MODE_ICON = { walking: '🚶', biking: '🚲', driving: '🚗' } as const;
 

@@ -49,11 +49,11 @@ import type { AudioTrack, EncodedRoute, Waypoint } from '../src/types/domain.ts'
 import { encodePolyline } from '../../shared/src/polyline.ts';
 import { decodeRoute, parseEncodedRoute } from '../src/routing/routeGeometry.ts';
 import { sessionStops } from '../src/routing/stopSelection.ts';
-import { LocationService } from '../src/services/location/LocationService.ts';
+import { LocationService, TrackingLostError } from '../src/services/location/LocationService.ts';
 import { connectivityOf } from '../src/services/network/connectivity.ts';
 import AsyncStorage, { __dump, __setFailReads } from './stubs/async-storage.ts';
 import { players } from './stubs/expo-audio.ts';
-import { __isAppForegrounded, __setAppForegrounded, calls as locationCalls, resetCalls as resetLocationCalls } from './stubs/expo-location.ts';
+import { __afterNextBackgroundStop, __isAppForegrounded, __setAppForegrounded, calls as locationCalls, resetCalls as resetLocationCalls } from './stubs/expo-location.ts';
 import { samplingFor } from '../src/config/transitProfiles.ts';
 
 // -----------------------------------------------------------------------------
@@ -725,6 +725,65 @@ heading('LocationService: transport for the engine (Epic 13 rules kept)');
   }
   __setAppForegrounded(true);
   assert('a start while pocketed throws (the Android rule is enforced by the stub)', stubRefuses);
+
+  // Epic 16 - the optimistic handoff can open Maps while a retune is still
+  // queued or half-done. Two windows, two outcomes.
+  {
+    resetLocationCalls();
+    const q = new LocationService('walking', 'android', { isForeground: __isAppForegrounded });
+    await q.start();
+    // (a) Pocketed AFTER the call but BEFORE the queued work ran: refused at
+    //     the stop, task untouched - the old sampling keeps tracking.
+    const mark = locationCalls.length;
+    const pending = q.retune('driving');
+    __setAppForegrounded(false);
+    let queuedRefused = false;
+    try {
+      await pending;
+    } catch (e) {
+      queuedRefused = !(e instanceof TrackingLostError);
+    }
+    assert('retune queued, then pocketed: refused before the stop (not "lost")', queuedRefused && !q.trackingLost);
+    eq('...and the running task was never touched', locationCalls.slice(mark), []);
+    __setAppForegrounded(true);
+
+    // (b) Pocketed BETWEEN the stop and the start: tracking is OFF - said
+    //     precisely (TrackingLostError), remembered, and recoverable.
+    const markLost = locationCalls.length;
+    __afterNextBackgroundStop(() => __setAppForegrounded(false));
+    let lostErr: unknown = null;
+    try {
+      await q.retune('driving');
+    } catch (e) {
+      lostErr = e;
+    }
+    assert('pocketed between stop and start: TrackingLostError, trackingLost = true', lostErr instanceof TrackingLostError && q.trackingLost, String(lostErr));
+    eq('...the stop happened, the start was refused', locationCalls.slice(markLost).map((c) => c.kind), ['background-stop']);
+
+    let stillRefused = false;
+    try {
+      await q.recover();
+    } catch {
+      stillRefused = true;
+    }
+    assert('recover() while still pocketed throws and stays lost (retried on the next return)', stillRefused && q.trackingLost);
+
+    __setAppForegrounded(true);
+    const markRecover = locationCalls.length;
+    await q.recover();
+    const restarted = locationCalls.slice(markRecover).filter((c) => c.kind === 'background-start');
+    assert('back in the foreground: recover() restarts with the sampling the failed retune asked for', !q.trackingLost && restarted.length === 1 && restarted[0]?.options?.timeInterval === samplingFor('driving').timeInterval, JSON.stringify(locationCalls.slice(markRecover)));
+    const markNoop = locationCalls.length;
+    await q.recover();
+    eq('recover() with nothing lost is a no-op', locationCalls.slice(markNoop), []);
+
+    // A deliberate stop (idle pause, session end) clears "lost": nothing to recover.
+    __afterNextBackgroundStop(() => __setAppForegrounded(false));
+    await q.retune('walking').catch(() => undefined);
+    __setAppForegrounded(true);
+    await q.stopBackground();
+    assert('stopBackground() clears lost - the pause turned tracking off on purpose', !q.trackingLost);
+  }
 
   // A task left by a previous process keeps ITS options; start() must replace it.
   resetLocationCalls();

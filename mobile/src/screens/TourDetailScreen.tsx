@@ -47,7 +47,8 @@ export default function TourDetailScreen({ route, navigation }: TourDetailScreen
   stateRef.current = state;
 
   const tourRunning = useTourSession(
-    (s) => s.tourId === tourId && (s.status === 'active' || s.status === 'starting'),
+    // sourceTourIds, not tourId: a running PLAN plays from this tour's bundle too (Epic 16).
+    (s) => s.sourceTourIds.includes(tourId) && (s.status === 'active' || s.status === 'starting'),
   );
 
   /** Guards setState after unmount - a download outlives a fast back-press. */

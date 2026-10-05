@@ -1,7 +1,9 @@
 import Constants from 'expo-constants';
 import { AppState, Platform, type AppStateStatus } from 'react-native';
 
+import type { PlanTourOk } from '../../../shared/src/contracts/planTour';
 import { chaptersOf, engineTourFromManifest } from '../engine/fromManifest';
+import { engineTourFromPlan, planChapters } from '../engine/fromPlan';
 import { allStopsResolved, createEngineState, freshProgress, nextChapterOf, progressProblem } from '../engine/reduce';
 import { planHandoff, type HandoffPlan, type HandoffProvider, type HandoffSpec } from '../handoff/handoffLinks';
 import type { Effect, EngineState, EngineTour, Progress, TrackKind } from '../engine/types';
@@ -20,7 +22,9 @@ import {
   LocationService,
   registerBackgroundLocationTask,
   stopOrphanedLocationUpdates,
+  TrackingLostError,
 } from '../services/location/LocationService';
+import { savedPlans } from '../services/planner/planRepositoryFile';
 import { telemetry } from '../services/telemetry/TelemetryService';
 import { networkMonitor } from '../services/network/NetworkMonitor';
 import { signedAudioUrls } from '../services/supabase/client';
@@ -28,11 +32,13 @@ import { decodeRoute } from '../routing/routeGeometry';
 import { sessionStops, type SessionStops } from '../routing/stopSelection';
 import { remoteTranscripts } from '../transcript/TranscriptRepository';
 import { EngineRunner, type EngineRunnerPorts } from './EngineRunner';
-import { decideSnapshotResume, type TourProgressSnapshot } from './progressRepository';
+import { optimisticHandoff } from './optimisticHandoff';
+import { decideSnapshotResume, type SessionSource, type TourProgressSnapshot } from './progressRepository';
+import { planSessionKey } from './sessionKey';
 import { tourProgress } from './sessionCheckpointFile';
 import { useTourSession, type ChapterView } from './tourSessionStore';
 import type { GpsFix } from '../engine/types';
-import type { WireChapter } from '../services/bundle/types';
+import type { WireBundle, WireChapter } from '../services/bundle/types';
 import type { AudioTrack, LatLng, TransitMode, Waypoint } from '../types/domain';
 
 /**
@@ -129,7 +135,10 @@ const APP_VERSION: string = (() => {
 
 /** Everything about the running session that is not engine state. */
 interface SessionMeta {
+  /** The session key (sessionKey.ts) - a tour id, or plan:<planId>. NEVER a telemetry tour_id as such. */
   tourId: string;
+  /** Epic 16: a catalogue tour, or a saved plan (id + content hash). */
+  source: SessionSource;
   tourTitle: string;
   activeIds: string[];
   backgroundPermission: boolean;
@@ -139,6 +148,11 @@ interface SessionMeta {
   /** The manifest's chapters (titles, handoff), sorted - for the panel and the handoff. */
   chapters: WireChapter[];
 }
+
+/** What resume rebuilt from the bundles, or why it cannot. */
+type Rebuilt =
+  | { kind: 'ok'; tour: EngineTour; active: Waypoint[]; chapters: WireChapter[]; staticRouteTourId: string | null; sourceTourIds: string[] }
+  | { kind: 'discard'; reason: string };
 
 class TourSessionController {
   private location: LocationService | null = null;
@@ -271,7 +285,137 @@ class TourSessionController {
     } catch (err) {
       return this.failStart('unexpected', err);
     }
-    const firstChapter = tour.chapters[0];
+
+    await this.launch({
+      key: tourId,
+      title: tourTitle,
+      source: { kind: 'tour' },
+      sourceTourIds: [tourId],
+      active: selection.active,
+      tour,
+      chapters: chaptersOf(manifest),
+      staticRouteTourId: tourId,
+    });
+  }
+
+  /**
+   * Epic 16: start a SAVED plan - chapters from several tours, joined by
+   * synthetic travel chapters (engine/fromPlan.ts). Everything after the
+   * tour is built is the catalogue path (launch()): one engine, one audio
+   * lane, one tracker. Idempotent like startSession().
+   */
+  async startPlannedSession(planId: string, title: string): Promise<void> {
+    return this.enqueue(async () => {
+      try {
+        await this.doStartPlan(planId, title);
+      } catch (err) {
+        if (err instanceof SessionStartError) throw err;
+        await this.failStart('unexpected', err);
+      }
+    });
+  }
+
+  private async doStartPlan(planId: string, title: string): Promise<void> {
+    const key = planSessionKey(planId);
+    const store = useTourSession.getState();
+    if (store.tourId === key && (store.status === 'active' || store.status === 'starting')) return;
+    if (store.tourId && store.tourId !== key) await this.doEnd();
+
+    const entry = savedPlans.get(planId);
+    useTourSession.getState().beginStart(key, title, entry?.plan.sources.map((s) => s.tour_id) ?? []);
+    // A draft pins nothing: its tours may change under it. Only a plan whose
+    // every bundle was verified on this device may run (PlanPreview saves it).
+    if (entry === null) {
+      useTourSession.getState().sessionFailed('This plan is gone. Plan again from Discovery.');
+      return;
+    }
+    if (entry.status !== 'saved') {
+      useTourSession.getState().sessionFailed('Download and save this plan before starting it.');
+      return;
+    }
+
+    const pieces = this.planPieces(entry.plan);
+    if (pieces.kind === 'not_runnable') {
+      // Expected, not a crash: the reconciler normally catches this first.
+      useTourSession.getState().sessionFailed(`This plan no longer matches the tours on this device (${pieces.reason}). Plan again.`);
+      return;
+    }
+
+    await this.launch({
+      key,
+      title,
+      source: { kind: 'plan', planId, contentHash: entry.plan.content_hash },
+      sourceTourIds: entry.plan.sources.map((s) => s.tour_id),
+      active: pieces.active,
+      tour: pieces.tour,
+      chapters: pieces.chapters,
+      staticRouteTourId: null,
+    });
+  }
+
+  /**
+   * A plan, as the engine and the panel need it, from the bundles on disk.
+   *
+   * STOP IDS ARE NOT NAMESPACED. A stop id is waypoints.id - a uuid primary
+   * key - and every row has exactly one tour_id. Two tours that both visit a
+   * plaza have two rows, two ids, two zones; the engine arms only the active
+   * chapter's stops, so their overlap never collides. The same id in two
+   * manifests is therefore impossible without corruption, and is refused
+   * loudly (thrown -> failStart), never merged or renamed.
+   */
+  private planPieces(plan: PlanTourOk):
+    | { kind: 'ok'; tour: EngineTour; active: Waypoint[]; chapters: WireChapter[] }
+    | { kind: 'not_runnable'; reason: string } {
+    const manifests = new Map<string, WireBundle>();
+    const byId = new Map<string, Waypoint>();
+    for (const s of plan.sources) {
+      const manifest = TourBundleRepository.readManifest(s.tour_id);
+      const waypoints = TourBundleRepository.loadWaypoints(s.tour_id);
+      if (!manifest || !waypoints) return { kind: 'not_runnable', reason: `tour ${s.tour_id} is not downloaded` };
+      manifests.set(s.tour_id, manifest);
+      for (const w of waypoints) {
+        const other = byId.get(w.id);
+        if (other) throw new Error(`stop ${w.id} is in two tours (${other.tourId} and ${s.tour_id}): stop ids are primary keys - a corrupt bundle`);
+        byId.set(w.id, w);
+      }
+    }
+    let tour: EngineTour;
+    try {
+      // Runs planProblem(): pins, chapters, every core stop, extension sets.
+      tour = engineTourFromPlan(plan, manifests);
+    } catch (err) {
+      if (err instanceof RangeError) return { kind: 'not_runnable', reason: err.message };
+      throw err;
+    }
+    const active = plan.segments.flatMap((seg) =>
+      seg.kind === 'chapter'
+        ? seg.waypoint_ids.map((id) => {
+            const w = byId.get(id);
+            if (!w) throw new Error(`plan stop ${id} passed planProblem but is not in the bundle`);
+            return w;
+          })
+        : [],
+    );
+    return { kind: 'ok', tour, active, chapters: planChapters(plan, manifests) };
+  }
+
+  /**
+   * Everything after the tour is built, shared by catalogue and planned
+   * sessions: tracking permissions, the audio session, the engine, tracking,
+   * the store, the checkpoint. Each native stage guarded (Epic 13, Directive 2).
+   */
+  private async launch(spec: {
+    key: string;
+    title: string;
+    source: SessionSource;
+    sourceTourIds: string[];
+    active: Waypoint[];
+    tour: EngineTour;
+    chapters: WireChapter[];
+    /** The tour whose bundled route the map draws; null draws straight lines (a plan spans tours). */
+    staticRouteTourId: string | null;
+  }): Promise<void> {
+    const firstChapter = spec.tour.chapters[0];
     if (!firstChapter) return this.failStart('unexpected', new Error('the tour has no chapters'));
 
     const service = new LocationService(firstChapter.transitMode, Platform.OS);
@@ -292,16 +436,20 @@ class TourSessionController {
 
     this.location = service;
     const meta: SessionMeta = {
-      tourId,
-      tourTitle,
-      activeIds: selection.active.map((w) => w.id),
+      tourId: spec.key,
+      source: spec.source,
+      tourTitle: spec.title,
+      activeIds: spec.active.map((w) => w.id),
       backgroundPermission: permissions.background,
       notificationPermission: permissions.notifications,
       startedAt: Date.now(),
-      waypointsById: new Map(selection.active.map((w) => [w.id, w])),
-      chapters: chaptersOf(manifest),
+      waypointsById: new Map(spec.active.map((w) => [w.id, w])),
+      chapters: spec.chapters,
     };
-    void telemetry.record('tour_started', { tourId });
+    // Every event from here to doEnd carries the plan (audio events included).
+    telemetry.setPlan(spec.source.kind === 'plan' ? spec.source.planId : null);
+    // tour_id is a tours.id foreign key: a plan session's key must never go there.
+    void telemetry.record('tour_started', spec.source.kind === 'tour' ? { tourId: spec.key } : { meta: { source_tour_ids: spec.sourceTourIds } });
 
     try {
       await this.audio.configureSession(interruptionModeFor(Platform.OS, firstChapter.transitMode));
@@ -310,7 +458,7 @@ class TourSessionController {
     }
 
     // The engine exists before tracking starts, so no fix can arrive unheard.
-    const runner = this.openEngine(meta, createEngineState(tour, freshProgress(tour, firstChapter.id)));
+    const runner = this.openEngine(meta, createEngineState(spec.tour, freshProgress(spec.tour, firstChapter.id)));
 
     try {
       await service.start();
@@ -323,12 +471,13 @@ class TourSessionController {
     this.attachAppState();
 
     useTourSession.getState().sessionStarted({
-      waypoints: selection.active,
+      waypoints: spec.active,
       transitMode: firstChapter.transitMode,
       backgroundPermission: permissions.background,
       notificationPermission: permissions.notifications,
     });
-    this.publishStaticRoute(tourId, selection.active, firstChapter.transitMode);
+    if (spec.staticRouteTourId !== null) this.publishStaticRoute(spec.staticRouteTourId, spec.active, firstChapter.transitMode);
+    else useTourSession.getState().setRoute({ source: 'straight', points: null });
 
     runner.start();
     // The checkpoint describes a session that has fully started.
@@ -351,7 +500,7 @@ class TourSessionController {
       applyTransitMode: (mode) => {
         void this.serialTracking(() => this.applyTransitMode(mode));
       },
-      telemetry: (fx) => this.recordEngineTelemetry(meta.tourId, fx),
+      telemetry: (fx) => this.recordEngineTelemetry(meta, fx),
       tracking: (fx) => {
         void this.serialTracking(() => (fx.type === 'SUSPEND_TRACKING' ? this.suspendTracking(meta) : this.restartTrackingAfterIdle()));
       },
@@ -437,8 +586,12 @@ class TourSessionController {
    * its own type since migration 20261003120000 - applied to production
    * BEFORE this build could send them (a refused type poisons its batch).
    */
-  private recordEngineTelemetry(tourId: string, fx: Extract<Effect, { type: 'TELEMETRY' }>): void {
+  private recordEngineTelemetry(meta: SessionMeta, fx: Extract<Effect, { type: 'TELEMETRY' }>): void {
     const type = fx.kind === 'trigger_fired' ? 'geofence_entered' : fx.kind;
+    // tour_id is the tour that OWNS the stop (Epic 16: a plan spans tours).
+    // Without a stop: the catalogue tour, or none - a plan key is not a tours.id.
+    const stopTour = fx.stopId ? meta.waypointsById.get(fx.stopId)?.tourId : undefined;
+    const tourId = stopTour ?? (meta.source.kind === 'tour' ? meta.tourId : undefined);
     void telemetry.record(type, { tourId, waypointId: fx.stopId ?? undefined, meta: { ...fx.detail } });
   }
 
@@ -468,6 +621,14 @@ class TourSessionController {
     try {
       await this.location?.retune(mode);
     } catch (err) {
+      if (err instanceof TrackingLostError) {
+        // Epic 16: the restart stopped the task and the OS refused the start -
+        // the app left the foreground in between (an optimistic handoff). OFF,
+        // not merely mistuned: arrival cannot be detected until recovery.
+        console.error(`[TourSession] tracking is OFF for this ${mode} segment - it restarts when the visitor returns to the app:`, err);
+        void telemetry.record('handoff_tracking_late', { meta: { outcome: 'lost', mode } });
+        return;
+      }
       console.error(`[TourSession] tracking not retuned for ${mode} - sampling stays on the previous chapter's:`, err);
     }
   }
@@ -612,8 +773,38 @@ class TourSessionController {
       { googleMaps: await isGoogleMapsInstalled() },
       Platform.OS === 'ios' ? 'ios' : 'android',
     );
-    if (plan.kind === 'open') await openNavigationUrl(plan.url);
+    if (plan.kind === 'open') await this.handOff(plan.url);
     return plan;
+  }
+
+  /**
+   * Open the navigation app AFTER the tracking restart a chapter change
+   * queued - but never more than HANDOFF_TRACKING_TIMEOUT_MS after the tap
+   * (PM, Epic 16: optimistic handoff). On Android the restart may only START
+   * the location service in the foreground, so waiting is what keeps the
+   * travel segment tracked; the bound is what keeps the button answering.
+   * The panel shows its spinner meanwhile - nothing blocks a thread.
+   *
+   * After a timeout the restart goes on: finishing late is reported here
+   * ('late'); failing because Maps had backgrounded the app is reported by
+   * applyTransitMode ('lost') and repaired on the next return to the app
+   * (handleAppStateChange -> recoverTracking, 'recovered').
+   */
+  private async handOff(url: string): Promise<void> {
+    const service = this.location;
+    const result = await optimisticHandoff({
+      trackingWork: this.trackingOps,
+      trackingLost: () => service?.trackingLost ?? false,
+      open: () => openNavigationUrl(url),
+      onLate: (outcome, waitedMs) => {
+        if (outcome === 'lost') return; // applyTransitMode reported it, where it happened
+        console.warn(`[TourSession] the tracking restart finished ${waitedMs} ms after an optimistic handoff`);
+        void telemetry.record('handoff_tracking_late', { meta: { outcome: 'late', waited_ms: waitedMs } });
+      },
+      timers: { setTimeout: (fn, ms) => setTimeout(fn, ms), clearTimeout: (h) => clearTimeout(h as ReturnType<typeof setTimeout>) },
+      now: Date.now,
+    });
+    if (result.kind === 'timed_out') console.warn('[TourSession] optimistic handoff: the tracking restart had not finished; navigation opened anyway');
   }
 
   /** Open a URL the screen chose after a 'needs_app' plan (store page, or no scenic route). */
@@ -641,8 +832,9 @@ class TourSessionController {
 
   private snapshot(meta: SessionMeta, progress: Progress): TourProgressSnapshot {
     return {
-      v: 2,
+      v: 3,
       tourId: meta.tourId,
+      source: meta.source,
       tourTitle: meta.tourTitle,
       activeIds: meta.activeIds,
       // TASK-604's preference skips, retired in Epic 16. Still written so a v2
@@ -705,44 +897,30 @@ class TourSessionController {
     if (decision.kind === 'discard') return discard(decision.reason);
     const snap = decision.snapshot;
 
-    const waypoints = TourBundleRepository.loadWaypoints(snap.tourId);
-    const manifest = TourBundleRepository.readManifest(snap.tourId);
-    if (!waypoints || !manifest) return discard('the tour is no longer downloaded');
-    const byId = new Map(waypoints.map((w) => [w.id, w]));
-    const active = snap.activeIds.map((id) => byId.get(id));
-    if (!active.every((w): w is Waypoint => w !== undefined)) {
-      return discard('the downloaded tour no longer has every stop (updated since?)');
-    }
-    // Epic 16: a catalogue session never runs an extension. A saved session
-    // naming one means the bundle was updated mid-walk and a stop became
-    // optional; replaying it would narrate a detour Discovery must not play.
-    const nowExtension = active.find((w) => w.stopRole !== 'core');
-    if (nowExtension) return discard(`stop ${nowExtension.id} is now an extension (updated since?)`);
+    const rebuilt = snap.source.kind === 'plan' ? this.rebuildPlan(snap, snap.source) : this.rebuildTour(snap);
+    if (rebuilt.kind === 'discard') return discard(rebuilt.reason);
+    const { tour, active, chapters, staticRouteTourId, sourceTourIds } = rebuilt;
 
-    let tour: EngineTour;
-    try {
-      tour = engineTourFromManifest(manifest, snap.activeIds);
-    } catch (err) {
-      return discard(`the downloaded tour cannot run (${err instanceof Error ? err.message : String(err)})`);
-    }
     const problem = progressProblem(tour, snap.progress);
     if (problem !== null) return discard(`saved progress does not fit the tour (${problem})`);
     const chapter = tour.chapters.find((c) => c.id === snap.progress.chapterId);
     if (!chapter) return discard(`unknown chapter ${snap.progress.chapterId}`);
 
-    useTourSession.getState().beginStart(snap.tourId, snap.tourTitle);
+    useTourSession.getState().beginStart(snap.tourId, snap.tourTitle, sourceTourIds);
     const service = new LocationService(chapter.transitMode, Platform.OS);
     this.location = service;
     const meta: SessionMeta = {
       tourId: snap.tourId,
+      source: snap.source,
       tourTitle: snap.tourTitle,
       activeIds: snap.activeIds,
       backgroundPermission: snap.backgroundPermission,
       notificationPermission: snap.notificationPermission,
       startedAt: snap.startedAt,
       waypointsById: new Map(active.map((w) => [w.id, w])),
-      chapters: chaptersOf(manifest),
+      chapters,
     };
+    telemetry.setPlan(snap.source.kind === 'plan' ? snap.source.planId : null);
 
     const fail = async (stage: 'audio' | 'location', err: unknown): Promise<false> => {
       console.error(`[TourSession] resume (${origin}) failed at ${stage}:`, err);
@@ -772,7 +950,9 @@ class TourSessionController {
         return fail('location', err);
       }
     }
-    if (!service.persistentTask) this.attachAppState();
+    // Both platforms since Epic 16: Android listens only to recover tracking a
+    // failed restart lost (handleAppStateChange); iOS also swaps transports.
+    this.attachAppState();
 
     useTourSession.getState().sessionStarted({
       waypoints: active,
@@ -780,16 +960,65 @@ class TourSessionController {
       backgroundPermission: snap.backgroundPermission,
       notificationPermission: snap.notificationPermission,
     });
-    this.publishStaticRoute(snap.tourId, active, chapter.transitMode);
+    if (staticRouteTourId !== null) this.publishStaticRoute(staticRouteTourId, active, chapter.transitMode);
     if (suspended) useTourSession.getState().setPaused(true);
 
     // SESSION_STARTED replays a restored queue - what fired but had not been heard.
     runner.start();
     this.persistNow();
     console.warn(
-      `[TourSession] resumed tour ${snap.tourId} (${origin}): ${Object.keys(snap.progress.played).length}/${snap.activeIds.length} stops heard, ${snap.progress.queue.length} waiting`,
+      `[TourSession] resumed ${snap.tourId} (${origin}): ${Object.keys(snap.progress.played).length}/${snap.activeIds.length} stops heard, ${snap.progress.queue.length} waiting`,
     );
     return true;
+  }
+
+  /** A catalogue checkpoint against its downloaded tour (the pre-Epic-16 resume, unchanged). */
+  private rebuildTour(snap: TourProgressSnapshot): Rebuilt {
+    const waypoints = TourBundleRepository.loadWaypoints(snap.tourId);
+    const manifest = TourBundleRepository.readManifest(snap.tourId);
+    if (!waypoints || !manifest) return { kind: 'discard', reason: 'the tour is no longer downloaded' };
+    const byId = new Map(waypoints.map((w) => [w.id, w]));
+    const active = snap.activeIds.map((id) => byId.get(id));
+    if (!active.every((w): w is Waypoint => w !== undefined)) {
+      return { kind: 'discard', reason: 'the downloaded tour no longer has every stop (updated since?)' };
+    }
+    // Epic 16: a catalogue session never runs an extension. A saved session
+    // naming one means the bundle was updated mid-walk and a stop became
+    // optional; replaying it would narrate a detour Discovery must not play.
+    const nowExtension = active.find((w) => w.stopRole !== 'core');
+    if (nowExtension) return { kind: 'discard', reason: `stop ${nowExtension.id} is now an extension (updated since?)` };
+    try {
+      const tour = engineTourFromManifest(manifest, snap.activeIds);
+      return { kind: 'ok', tour, active, chapters: chaptersOf(manifest), staticRouteTourId: snap.tourId, sourceTourIds: [snap.tourId] };
+    } catch (err) {
+      return { kind: 'discard', reason: `the downloaded tour cannot run (${err instanceof Error ? err.message : String(err)})` };
+    }
+  }
+
+  /**
+   * A plan checkpoint: the plan is re-read from the plan store (never from the
+   * checkpoint) and must be the SAME plan - still saved, same content_hash,
+   * same stops - against bundles that still fit it. Anything else is
+   * discarded with its reason: resuming a different plan than the one
+   * walked would replay progress against the wrong stops.
+   */
+  private rebuildPlan(snap: TourProgressSnapshot, source: Extract<SessionSource, { kind: 'plan' }>): Rebuilt {
+    const entry = savedPlans.get(source.planId);
+    if (entry === null) return { kind: 'discard', reason: `plan ${source.planId} was deleted` };
+    if (entry.status !== 'saved') return { kind: 'discard', reason: `plan ${source.planId} is not saved` };
+    if (entry.plan.content_hash !== source.contentHash) return { kind: 'discard', reason: `plan ${source.planId} changed since the walk started` };
+    let pieces: ReturnType<TourSessionController['planPieces']>;
+    try {
+      pieces = this.planPieces(entry.plan);
+    } catch (err) {
+      return { kind: 'discard', reason: `plan ${source.planId} cannot run (${err instanceof Error ? err.message : String(err)})` };
+    }
+    if (pieces.kind === 'not_runnable') return { kind: 'discard', reason: `plan ${source.planId} no longer fits the tours on this device (${pieces.reason})` };
+    const ids = pieces.active.map((w) => w.id);
+    if (ids.length !== snap.activeIds.length || ids.some((id, i) => id !== snap.activeIds[i])) {
+      return { kind: 'discard', reason: `plan ${source.planId} runs different stops than the saved walk` };
+    }
+    return { kind: 'ok', tour: pieces.tour, active: pieces.active, chapters: pieces.chapters, staticRouteTourId: null, sourceTourIds: entry.plan.sources.map((s) => s.tour_id) };
   }
 
   /**
@@ -966,6 +1195,13 @@ class TourSessionController {
   private async handleAppStateChange(next: AppStateStatus): Promise<void> {
     const service = this.location;
     if (!service) return;
+    // Epic 16: a restart the OS refused while the app was in the background
+    // (an optimistic handoff) left tracking OFF. Back in the foreground - the
+    // only place Android allows a start - start it again. Not while paused:
+    // the idle pause turned tracking off on purpose.
+    if (next === 'active' && service.trackingLost && useTourSession.getState().status === 'active') {
+      void this.serialTracking(() => this.recoverTracking());
+    }
     if (service.persistentTask) return;
     if (useTourSession.getState().status !== 'active') return;
 
@@ -980,6 +1216,19 @@ class TourSessionController {
       }
     } catch (err) {
       console.warn('[TourSession] app-state transition failed:', err);
+    }
+  }
+
+  /** Restart tracking a refused restart lost. Reported either way; retried on the next return. */
+  private async recoverTracking(): Promise<void> {
+    const service = this.location;
+    if (!service?.trackingLost) return;
+    try {
+      await service.recover();
+      console.warn('[TourSession] tracking restarted on return to the app, after a restart the OS had refused');
+      void telemetry.record('handoff_tracking_late', { meta: { outcome: 'recovered' } });
+    } catch (err) {
+      console.error('[TourSession] tracking could still not restart; it will be tried on the next return to the app:', err);
     }
   }
 
@@ -1050,6 +1299,8 @@ class TourSessionController {
     if (actor) await actor.dispose();
     else await this.audio.stop('audio_stopped');
     this.audio.setTelemetry(null);
+    // After the audio stop: a plan's last audio_stopped still carries its plan_id.
+    telemetry.setPlan(null);
 
     try {
       await dismissTourNotification('tour_suspended');

@@ -598,6 +598,39 @@ async function testResilience(): Promise<void> {
  * runnable on a fresh clone with neither.
  */
 // -----------------------------------------------------------------------------
+// 10c. Epic 16 - plan_id and handoff_tracking_late, gated on migration 20261009120000
+// -----------------------------------------------------------------------------
+
+async function testPlanFields(): Promise<void> {
+  heading('10c. plan_id / handoff_tracking_late are sent only once the migration is live');
+  const PLAN = '00000000-0000-4000-8000-000000000500';
+
+  resetStorage();
+  const dark = new ScriptedTransport();
+  const notLive = new TelemetryService(dark, { planFieldsLive: false });
+  notLive.setPlan(PLAN);
+  await notLive.record('audio_started', { tourId: 't1' });
+  await notLive.record('handoff_tracking_late', { meta: { outcome: 'late' } });
+  await notLive.flush();
+  const darkRows = dark.sent.flat();
+  assert('not live: the event is sent WITHOUT a plan_id key (not even null - the column may not exist)', darkRows.length === 1 && !('plan_id' in darkRows[0]!), JSON.stringify(darkRows));
+  assert('not live: handoff_tracking_late is never queued (its CHECK would fail the whole batch)', !darkRows.some((r) => r.event_type === 'handoff_tracking_late'));
+
+  resetStorage();
+  const lit = new ScriptedTransport();
+  const live = new TelemetryService(lit, { planFieldsLive: true });
+  live.setPlan(PLAN);
+  await live.record('audio_started', { tourId: 't1' });
+  await live.record('handoff_tracking_late', { meta: { outcome: 'lost', mode: 'driving' } });
+  live.setPlan(null);
+  await live.record('tour_started', { tourId: 't2' });
+  await live.flush();
+  const rows = lit.sent.flat();
+  assert('live: every event in a planned session carries plan_id', rows.filter((r) => r.plan_id === PLAN).map((r) => r.event_type).join() === 'audio_started,handoff_tracking_late', JSON.stringify(rows));
+  assert('live: after setPlan(null) no plan_id key at all', rows.length === 3 && !('plan_id' in rows[2]!));
+}
+
+// -----------------------------------------------------------------------------
 // 10b. Connectivity restored (TASK-605, Hybrid Offline-First)
 // -----------------------------------------------------------------------------
 
@@ -732,6 +765,7 @@ async function main(): Promise<void> {
   await testAudioLifecycle();
   await testResilience();
   await testReconnect();
+  await testPlanFields();
   if (process.argv.includes('--live')) await testLiveContract();
 
   heading('Result');

@@ -4,6 +4,7 @@ import { ActivityIndicator, Alert, Pressable, StyleSheet, Text, View } from 'rea
 import ChapterPanel from '../components/ChapterPanel';
 import TourMap from '../components/TourMap';
 import { SessionStartError, tourSession } from '../session/TourSessionController';
+import { planIdOfSessionKey } from '../session/sessionKey';
 import { useTourSession } from '../session/tourSessionStore';
 import type { ActiveTourScreenProps } from '../navigation/types';
 import type { RouteSource } from '../routing/routeDisplay';
@@ -54,8 +55,11 @@ export default function ActiveTourScreen({ route, navigation }: ActiveTourScreen
 
   // Requests a start; a no-op if this tour is already running. Safe under
   // StrictMode's mount/unmount/remount precisely because it is idempotent.
+  // `tourId` is a session key: plan:<planId> starts a planned session (Epic 16).
   useEffect(() => {
-    tourSession.startSession(tourId, title ?? 'Tour').catch((err: unknown) => {
+    const planId = planIdOfSessionKey(tourId);
+    const start = planId !== null ? tourSession.startPlannedSession(planId, title ?? 'Your plan') : tourSession.startSession(tourId, title ?? 'Tour');
+    start.catch((err: unknown) => {
       // Epic 13, Directive 2. A SessionStartError arrives AFTER the controller
       // tore down and put its message in the store, which renders the error
       // view below. Anything else is a controller bug: still never leave the

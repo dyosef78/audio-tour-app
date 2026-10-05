@@ -23,7 +23,14 @@ export type SessionStatus = 'idle' | 'starting' | 'active' | 'paused' | 'error';
 
 export interface TourSessionState {
   status: SessionStatus;
+  /** The SESSION KEY (sessionKey.ts): a tour id, or plan:<planId> for a planned session. Not always a tours.id. */
   tourId: string | null;
+  /**
+   * Every tour whose bundle this session plays from (Epic 16): [tourId] for a
+   * catalogue session, the plan's sources for a planned one. "Is this tour in
+   * use?" asks this, never tourId.
+   */
+  sourceTourIds: string[];
   tourTitle: string | null;
   transitMode: TransitMode | null;
   /**
@@ -89,7 +96,8 @@ export interface TourSessionState {
 }
 
 export interface TourSessionActions {
-  beginStart: (tourId: string, tourTitle: string) => void;
+  /** `sourceTourIds` defaults to [tourId] - a catalogue session. */
+  beginStart: (tourId: string, tourTitle: string, sourceTourIds?: string[]) => void;
   sessionStarted: (args: {
     waypoints: Waypoint[];
     transitMode: TransitMode;
@@ -142,6 +150,7 @@ export interface EngineView {
 const initial: TourSessionState = {
   status: 'idle',
   tourId: null,
+  sourceTourIds: [],
   tourTitle: null,
   transitMode: null,
   waypoints: [],
@@ -168,8 +177,8 @@ const initial: TourSessionState = {
 export const useTourSession = create<TourSessionState & TourSessionActions>((set) => ({
   ...initial,
 
-  beginStart: (tourId, tourTitle) =>
-    set({ ...initial, status: 'starting', tourId, tourTitle }),
+  beginStart: (tourId, tourTitle, sourceTourIds = [tourId]) =>
+    set({ ...initial, status: 'starting', tourId, tourTitle, sourceTourIds }),
 
   sessionStarted: ({ waypoints, transitMode, backgroundPermission, notificationPermission = true }) =>
     set({ status: 'active', waypoints, transitMode, backgroundPermission, notificationPermission, error: null }),
