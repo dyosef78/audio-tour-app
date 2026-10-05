@@ -15,8 +15,9 @@ export const IS_PLANNING_ENABLED = false;
 
 /**
  * Migration 20261009120000 (telemetry_events.plan_id + 'handoff_tracking_late')
- * is applied to production. Until then TelemetryService sends neither: one
+ * is applied to production. Until it was, TelemetryService sent neither: one
  * row the server refuses fails its whole batch (all-or-nothing PostgREST
- * insert). Flip to true only AFTER the push, then ship.
+ * insert). LIVE since 6 Oct 2026 - the migration is in production (supabase
+ * migration list) and its generated types match the production schema.
  */
-export const TELEMETRY_PLAN_FIELDS_LIVE = false;
+export const TELEMETRY_PLAN_FIELDS_LIVE = true;
