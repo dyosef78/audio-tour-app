@@ -378,6 +378,7 @@ export type Database = {
           id: number
           meta: Json | null
           occurred_at: string
+          plan_id: string | null
           platform: string | null
           position_seconds: number | null
           received_at: string
@@ -394,6 +395,7 @@ export type Database = {
           id?: never
           meta?: Json | null
           occurred_at: string
+          plan_id?: string | null
           platform?: string | null
           position_seconds?: number | null
           received_at?: string
@@ -410,6 +412,7 @@ export type Database = {
           id?: never
           meta?: Json | null
           occurred_at?: string
+          plan_id?: string | null
           platform?: string | null
           position_seconds?: number | null
           received_at?: string
