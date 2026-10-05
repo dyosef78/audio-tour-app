@@ -3,6 +3,7 @@ import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { useCallback, useEffect, useState } from 'react';
 
 import AudioPlayerSheet from '../components/AudioPlayerSheet';
+import { IS_PLANNING_ENABLED } from '../config/features';
 import { usePreferences, usePreferencesBoot } from '../personalization/preferencesStore';
 import ActiveTourScreen from '../screens/ActiveTourScreen';
 import DeleteAccountScreen from '../screens/DeleteAccountScreen';
@@ -111,8 +112,12 @@ export default function RootNavigator() {
           component={TourDetailScreen}
           options={({ route }) => ({ title: route.params.title })}
         />
-        <Stack.Screen name="Plan" component={PlanScreen} options={{ title: 'Plan my day' }} />
-        <Stack.Screen name="PlanPreview" component={PlanPreviewScreen} options={{ title: 'Your plan' }} />
+        {IS_PLANNING_ENABLED && (
+          <>
+            <Stack.Screen name="Plan" component={PlanScreen} options={{ title: 'Plan my day' }} />
+            <Stack.Screen name="PlanPreview" component={PlanPreviewScreen} options={{ title: 'Your plan' }} />
+          </>
+        )}
         <Stack.Screen name="Settings" component={SettingsScreen} options={{ title: 'Settings' }} />
         <Stack.Screen
           name="DeleteAccount"

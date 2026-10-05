@@ -20,6 +20,7 @@ import {
 import { refreshCities, useCityCatalogue } from '../personalization/cityCatalogue';
 import { catalogueCityId, resolveCity } from '../personalization/onboardingFlow';
 import { usePreferences } from '../personalization/preferencesStore';
+import { IS_PLANNING_ENABLED } from '../config/features';
 import { TourBundleRepository } from '../services/bundle/TourBundleRepository';
 import { formatDuration } from '../services/planner/planForm';
 import { useSavedPlans } from '../services/planner/planRepositoryFile';
@@ -257,7 +258,7 @@ export default function DiscoveryScreen({ navigation }: DiscoveryScreenProps) {
               </Text>
             </Pressable>
           ) : null}
-          {state.source === 'live' && !needsCity && (
+          {IS_PLANNING_ENABLED && state.source === 'live' && !needsCity && (
             <Pressable
               style={({ pressed }) => [styles.planCta, pressed && styles.cardPressed]}
               onPress={() => navigation.navigate('Plan')}
@@ -267,7 +268,7 @@ export default function DiscoveryScreen({ navigation }: DiscoveryScreenProps) {
               <Text style={styles.planCtaText}>The best of this city's tours for the time you have, from where you are.</Text>
             </Pressable>
           )}
-          {plans.length > 0 && (
+          {IS_PLANNING_ENABLED && plans.length > 0 && (
             <View style={styles.plans}>
               <Text style={styles.prefsEyebrow}>YOUR PLANS</Text>
               {plans.map((p) => (
