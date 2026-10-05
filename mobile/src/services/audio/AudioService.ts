@@ -104,6 +104,9 @@ export const FULL_VOLUME = 1.0;
 export const EXIT_FADE_MS = 2_000;
 
 export class AudioService {
+  /** The interruption mode last applied successfully; null = unknown (never set, or the last call threw). */
+  private appliedMode: SessionInterruptionMode | null = null;
+
   private player: AudioPlayer | null = null;
   private currentTrackId: string | null = null;
   private statusSub: { remove: () => void } | null = null;
@@ -188,11 +191,35 @@ export class AudioService {
    * 'doNotMix' everywhere for its lock-screen controls.
    */
   async configureSession(interruptionMode: SessionInterruptionMode = 'doNotMix'): Promise<void> {
+    // Forgotten first: if the native call throws, nothing is known to be applied.
+    this.appliedMode = null;
     await setAudioModeAsync({
       playsInSilentMode: true,
       shouldPlayInBackground: true,
       interruptionMode,
     });
+    this.appliedMode = interruptionMode;
+  }
+
+  /**
+   * configureSession() for a CHAPTER CHANGE: skipped when that mode is already
+   * applied (Epic 16).
+   *
+   * On iOS setAudioModeAsync reconfigures AVAudioSession (category, then
+   * activation) on the native main thread, and activation can stall while
+   * another app holds audio - which is exactly the moment a visitor comes back
+   * from Google Maps to start the next chapter. iOS is 'doNotMix' for every
+   * mode (sessionMode.ts), so every chapter-change call there was a no-op that
+   * could still stall: now it is not made at all. Android still switches when
+   * a driving chapter starts or ends ('duckOthers' <-> 'doNotMix').
+   *
+   * Session start and resume keep calling configureSession(): once per
+   * session, it re-asserts the mode whatever happened since the last tour.
+   */
+  async ensureSessionMode(interruptionMode: SessionInterruptionMode): Promise<'applied' | 'unchanged'> {
+    if (this.appliedMode === interruptionMode) return 'unchanged';
+    await this.configureSession(interruptionMode);
+    return 'applied';
   }
 
   /**

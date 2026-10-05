@@ -78,4 +78,17 @@ export function createAudioPlayer(source: { uri: string }): AudioPlayer {
   return player;
 }
 
-export async function setAudioModeAsync(_mode: unknown): Promise<void> {}
+/** Every setAudioModeAsync call, for the redundant-reset tests (Epic 16). */
+export const audioModeCalls: unknown[] = [];
+let failNextAudioMode = false;
+export function __failNextAudioMode(): void {
+  failNextAudioMode = true;
+}
+
+export async function setAudioModeAsync(mode: unknown): Promise<void> {
+  if (failNextAudioMode) {
+    failNextAudioMode = false;
+    throw new Error('AVAudioSession refused the category');
+  }
+  audioModeCalls.push(mode);
+}

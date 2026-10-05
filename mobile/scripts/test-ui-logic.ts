@@ -52,9 +52,9 @@ import { sessionStops } from '../src/routing/stopSelection.ts';
 import { LocationService, TrackingLostError } from '../src/services/location/LocationService.ts';
 import { connectivityOf } from '../src/services/network/connectivity.ts';
 import AsyncStorage, { __dump, __setFailReads } from './stubs/async-storage.ts';
-import { players } from './stubs/expo-audio.ts';
+import { __failNextAudioMode, audioModeCalls, players } from './stubs/expo-audio.ts';
 import { __afterNextBackgroundStop, __isAppForegrounded, __setAppForegrounded, calls as locationCalls, resetCalls as resetLocationCalls } from './stubs/expo-location.ts';
-import { samplingFor } from '../src/config/transitProfiles.ts';
+import { finestMode, samplingFor } from '../src/config/transitProfiles.ts';
 
 // -----------------------------------------------------------------------------
 // Tiny test harness
@@ -414,6 +414,28 @@ const track: AudioTrack = {
   sizeBytes: 960_000,
 };
 
+// Epic 16: chapter changes skip the audio-session reset when the mode is unchanged.
+{
+  const svc = new AudioService();
+  const at = audioModeCalls.length;
+  await svc.configureSession('doNotMix');
+  eq('session start always applies the mode', audioModeCalls.length - at, 1);
+  eq('a chapter change to the SAME mode makes no native call (every iOS change)', [await svc.ensureSessionMode('doNotMix'), audioModeCalls.length - at], ['unchanged', 1]);
+  eq('a chapter change to ANOTHER mode applies it (Android driving)', [await svc.ensureSessionMode('duckOthers'), audioModeCalls.length - at], ['applied', 2]);
+  eq('...and back', [await svc.ensureSessionMode('doNotMix'), audioModeCalls.length - at], ['applied', 3]);
+  await svc.configureSession('doNotMix');
+  eq('session start re-asserts even when unchanged (once per session)', audioModeCalls.length - at, 4);
+  __failNextAudioMode();
+  let threw = false;
+  try {
+    await svc.ensureSessionMode('duckOthers');
+  } catch {
+    threw = true;
+  }
+  assert('a refused mode change throws to the caller (reported there)', threw);
+  eq('...and is then UNKNOWN, so the next change retries rather than skipping', [await svc.ensureSessionMode('doNotMix'), audioModeCalls.length - at], ['applied', 5]);
+}
+
 const audio = new AudioService();
 let failure: PlaybackError | null = null;
 audio.setOnError((e) => {
@@ -626,6 +648,14 @@ const mislabelled = decodeRoute({ ...DIRECT_ROUTE, precision: 6 }, [JAFFA, WALL]
 assert('a precision-5 route labelled 6 is rejected', !mislabelled.ok, JSON.stringify(mislabelled));
 
 heading('LocationService: transport for the engine (Epic 13 rules kept)');
+// Epic 16: a plan pins tracking to the finest profile any of its chapters needs.
+eq('finestMode: a walking-only plan stays on walking', finestMode(['walking', 'walking']), 'walking');
+eq('finestMode: a driving plan pins driving, walking chapters included', finestMode(['driving', 'walking', 'driving', 'walking']), 'driving');
+eq('finestMode: biking beats walking', finestMode(['walking', 'biking']), 'biking');
+assert('finestMode really is the finest: driving samples at least as often as every other profile', (['walking', 'biking'] as const).every((m) => samplingFor('driving').timeInterval <= samplingFor(m).timeInterval));
+let noModes = false;
+try { finestMode([]); } catch { noModes = true; }
+assert('finestMode of nothing is a bug, loudly', noModes);
 
 {
   const ORIGIN_15 = { latitude: 32.08, longitude: 34.78 };

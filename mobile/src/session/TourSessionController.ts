@@ -10,6 +10,7 @@ import type { Effect, EngineState, EngineTour, Progress, TrackKind } from '../en
 import { AudioActor } from '../services/audio/AudioActor';
 import { AudioService } from '../services/audio/AudioService';
 import { interruptionModeFor } from '../services/audio/sessionMode';
+import { finestMode } from '../config/transitProfiles';
 import { TourBundleRepository } from '../services/bundle/TourBundleRepository';
 import { isGoogleMapsInstalled, openNavigationUrl } from '../services/handoff/navigationApps';
 import {
@@ -139,6 +140,12 @@ interface SessionMeta {
   tourId: string;
   /** Epic 16: a catalogue tour, or a saved plan (id + content hash). */
   source: SessionSource;
+  /**
+   * Epic 16: tracking sampling fixed for the whole session (a plan, at
+   * finestMode of its chapters). Chapter changes then never restart tracking;
+   * only the audio mode follows the chapter.
+   */
+  pinnedTracking: TransitMode | null;
   tourTitle: string;
   activeIds: string[];
   backgroundPermission: boolean;
@@ -418,7 +425,8 @@ class TourSessionController {
     const firstChapter = spec.tour.chapters[0];
     if (!firstChapter) return this.failStart('unexpected', new Error('the tour has no chapters'));
 
-    const service = new LocationService(firstChapter.transitMode, Platform.OS);
+    const pinnedTracking = spec.source.kind === 'plan' ? finestMode(spec.tour.chapters.map((c) => c.transitMode)) : null;
+    const service = new LocationService(pinnedTracking ?? firstChapter.transitMode, Platform.OS);
 
     // Each native stage is guarded (Epic 13, Directive 2): a bridge that throws
     // must end in failStart - teardown, an error the screen shows, a rethrow.
@@ -438,6 +446,7 @@ class TourSessionController {
     const meta: SessionMeta = {
       tourId: spec.key,
       source: spec.source,
+      pinnedTracking,
       tourTitle: spec.title,
       activeIds: spec.active.map((w) => w.id),
       backgroundPermission: permissions.background,
@@ -614,10 +623,14 @@ class TourSessionController {
   /** A chapter's mode: tracking sampling and the audio session. Reported, never thrown. */
   private async applyTransitMode(mode: TransitMode): Promise<void> {
     try {
-      await this.audio.configureSession(interruptionModeFor(Platform.OS, mode));
+      // Skipped when unchanged - always on iOS (AudioService.ensureSessionMode).
+      await this.audio.ensureSessionMode(interruptionModeFor(Platform.OS, mode));
     } catch (err) {
       console.error(`[TourSession] audio session not switched to ${mode}:`, err);
     }
+    // A plan's tracking is pinned (finestMode): no restart, so no race with
+    // the handoff and nothing the OS can refuse from the background.
+    if (this.session?.pinnedTracking) return;
     try {
       await this.location?.retune(mode);
     } catch (err) {
@@ -907,11 +920,13 @@ class TourSessionController {
     if (!chapter) return discard(`unknown chapter ${snap.progress.chapterId}`);
 
     useTourSession.getState().beginStart(snap.tourId, snap.tourTitle, sourceTourIds);
-    const service = new LocationService(chapter.transitMode, Platform.OS);
+    const pinnedTracking = snap.source.kind === 'plan' ? finestMode(tour.chapters.map((c) => c.transitMode)) : null;
+    const service = new LocationService(pinnedTracking ?? chapter.transitMode, Platform.OS);
     this.location = service;
     const meta: SessionMeta = {
       tourId: snap.tourId,
       source: snap.source,
+      pinnedTracking,
       tourTitle: snap.tourTitle,
       activeIds: snap.activeIds,
       backgroundPermission: snap.backgroundPermission,

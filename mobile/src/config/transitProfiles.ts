@@ -35,3 +35,22 @@ export const TRANSIT_SAMPLING: Readonly<Record<TransitMode, GpsSampling>> = {
 export function samplingFor(mode: TransitMode): GpsSampling {
   return TRANSIT_SAMPLING[mode];
 }
+
+/** Finest first: the order the profiles above refine in (interval down, accuracy up). */
+const FINENESS: readonly TransitMode[] = ['driving', 'biking', 'walking'];
+
+/**
+ * The finest sampling any of `modes` needs (Epic 16, PM 5 Oct 2026). A
+ * planned session is PINNED to it for its whole length, so no chapter change
+ * restarts tracking - on Android a restart stops and re-starts the location
+ * foreground service, which the OS only allows in the foreground, and a plan
+ * changes mode exactly when the visitor is about to leave for Google Maps.
+ * A walking-only plan stays on the walking profile; a driving plan samples
+ * at the driving rate on its walking chapters too (a battery cost the PM
+ * accepted - and while it drives, Maps holds the GPS on anyway).
+ */
+export function finestMode(modes: readonly TransitMode[]): TransitMode {
+  const found = FINENESS.find((m) => modes.includes(m));
+  if (found === undefined) throw new RangeError('finestMode: no transit modes');
+  return found;
+}
