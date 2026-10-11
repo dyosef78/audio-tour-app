@@ -15,6 +15,14 @@ export const GROUP_TYPE_IDS = ['solo', 'couple', 'friends', 'family_kids'] as co
 export const INTEREST_IDS = ['history', 'culinary', 'nature', 'architecture', 'art_culture'] as const;
 
 export type GroupType = (typeof GROUP_TYPE_IDS)[number];
+
+/**
+ * Epic 17 (PM, Option A): an optional refinement of group_type 'family_kids'
+ * for the plan request. A request field only - NOT a database tag: it is in
+ * no CHECK, no column and no vocabulary function, and only sets walking pace.
+ */
+export const KIDS_AGE_BANDS = ['toddlers', 'kids', 'teens'] as const;
+export type KidsAgeBand = (typeof KIDS_AGE_BANDS)[number];
 export type Interest = (typeof INTEREST_IDS)[number];
 
 /**

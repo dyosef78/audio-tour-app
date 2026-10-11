@@ -16,7 +16,7 @@ import type { ChapterSegment, PlanEstimate, PlanSegment, PlanTourRequest, Transf
 import type { Candidate, Pair, PlannerCandidates } from './candidates.ts';
 import { chapterOptions, coreIds, extensionIds, type ChapterModel } from './chapterOptions.ts';
 import { CostBook, missingCellKey, type MissingCell } from './costBook.ts';
-import { BASE_CHAPTER_VALUE, DEDUP_RADIUS_M, HIGH_VALUE_WEIGHT, MAX_FILL_CELLS, PLANNING_MARGIN, WALKING_PACE } from './constants.ts';
+import { BASE_CHAPTER_VALUE, DEDUP_RADIUS_M, HIGH_VALUE_WEIGHT, MAX_FILL_CELLS, PLANNING_MARGIN, walkingPaceFor } from './constants.ts';
 import { searchSequence, type PlannedChapter } from './sequence.ts';
 
 export interface PlanDraft {
@@ -38,7 +38,7 @@ export type PlanOutcome =
 export function planTour(request: PlanTourRequest, answer: PlannerCandidates, origin: Pair): PlanOutcome {
   const budgetS = request.available_minutes * 60;
   const capacityS = Math.floor(budgetS * (1 - PLANNING_MARGIN));
-  const pace = WALKING_PACE[request.group_type];
+  const pace = walkingPaceFor(request.group_type, request.kids_age_band);
   const book = new CostBook(answer, request.transit_mode);
 
   const models: ChapterModel[] = [];

@@ -8,7 +8,7 @@
  * ESTIMATE_SPEED_MPS is new with this implementation (see the handover).
  */
 
-import type { GroupType } from '../vocabulary.ts';
+import type { GroupType, KidsAgeBand } from '../vocabulary.ts';
 import type { TransitMode } from '../contracts/planTour.ts';
 
 /**
@@ -64,6 +64,24 @@ export const WALKING_PACE: Readonly<Record<GroupType, number>> = {
   friends: 1.0,
   family_kids: 1.3,
 };
+
+/**
+ * Epic 17 (PM, Option A): family_kids refined by the children's age. Without a
+ * band, family_kids keeps WALKING_PACE's 1.3 - every request an older build
+ * sends plans exactly as before, so PLANNER_VERSION stays v4 (the band is in
+ * request_hash, so a plan cached for one band is never served for another).
+ */
+export const FAMILY_WALKING_PACE: Readonly<Record<KidsAgeBand, number>> = {
+  toddlers: 1.5,
+  kids: 1.3,
+  teens: 1.0,
+};
+
+export function walkingPaceFor(groupType: GroupType, kidsAgeBand: KidsAgeBand | undefined): number {
+  if (kidsAgeBand === undefined) return WALKING_PACE[groupType];
+  if (groupType !== 'family_kids') throw new RangeError(`kids_age_band ${kidsAgeBand} without group_type family_kids`);
+  return FAMILY_WALKING_PACE[kidsAgeBand];
+}
 
 /** Chapter-sequence search bounds. Deterministic: same input, same cut-off. */
 export const MAX_SEARCH_NODES = 5_000;

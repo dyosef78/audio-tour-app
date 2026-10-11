@@ -13,7 +13,7 @@
 
 // test:cms pins these ids against interest_tag_vocabulary() and
 // audience_tag_vocabulary(); mobile's options.ts re-exports them.
-import type { GroupType, Interest } from '../vocabulary.ts';
+import type { GroupType, Interest, KidsAgeBand } from '../vocabulary.ts';
 
 export const PLAN_CONTRACT_VERSION = 1 as const;
 
@@ -52,6 +52,11 @@ export interface PlanTourRequest {
    */
   transit_mode: TransitMode;
   group_type: GroupType;
+  /**
+   * Epic 17. Optional; only with group_type 'family_kids' (refused otherwise).
+   * Sets walking pace (FAMILY_WALKING_PACE); absent = family_kids' 1.3 as before.
+   */
+  kids_age_band?: KidsAgeBand;
   /** A SET: order must not change the plan (same rule as route-stops). Non-empty. */
   interests: readonly Interest[];
   /** ISO 8601 WITH offset; time-of-day rules use the visitor's clock (SmartSorter contract 1). */

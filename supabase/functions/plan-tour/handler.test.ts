@@ -183,6 +183,30 @@ Deno.test('POST: request errors are 400 with a code, never a guess', async () =>
   assertEquals((await handlePlanTour(new Request('https://x/', { method: 'PUT' }), h.deps)).status, 405);
 });
 
+Deno.test('POST: unknown keys are refused, never dropped (Epic 17)', async () => {
+  const h = harness();
+  for (const b of [body({ kids_age: 'kids' }), body({ origin: { lon: 34.77, lat: 32.08, source: 'gps', label: 'Home' } })]) {
+    const res = await handlePlanTour(post(b), h.deps);
+    const e = await res.json() as PlanTourError;
+    assertEquals([res.status, e.code, e.retryable], [400, 'invalid_request', false]);
+  }
+  assertEquals(h.saved.length, 0);
+});
+
+Deno.test('POST: kids_age_band is planned with and stored in the request (Epic 17)', async () => {
+  const h = harness();
+  const ok = await handlePlanTour(post(body({ group_type: 'family_kids', kids_age_band: 'toddlers' })), h.deps);
+  assertEquals(ok.status, 200);
+  const plan = await ok.json() as PlanTourOk;
+  assertEquals(plan.estimate.pace_factor, 1.5);
+  assertEquals(h.saved.at(-1)?.request.kids_age_band, 'toddlers');
+  const solo = await (await handlePlanTour(post(body({ kids_age_band: 'kids' })), h.deps)).json() as PlanTourError;
+  assertEquals(solo.code, 'invalid_request');
+  // Without a band the stored request has no such key: rows look as before.
+  await handlePlanTour(post(body({ group_type: 'family_kids' })), h.deps);
+  assert(!('kids_age_band' in h.saved.at(-1)!.request), 'no band, no key');
+});
+
 Deno.test('POST: no survivors maps to the right 422 code', async () => {
   const empty = (pruned: Record<string, number>, min: number | null = null) =>
     harness({ candidates: () => Promise.resolve(answer({ candidates: [], legs: [], pruned, min_pruned_lower_bound_s: min })) });
