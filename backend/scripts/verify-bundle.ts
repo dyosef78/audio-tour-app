@@ -374,10 +374,26 @@ async function main(): Promise<void> {
   // p_exclude_chapter_ids resolves by default and no overload is ambiguous.
   section('Planner RPC is service_role only');
 
+  // TASK-1701: the shape checks below passed while no chapter anywhere was
+  // plannable, and the probe asked about Jerusalem from Tel Aviv (origin_too_far
+  // even if one had been). Chapters default to plannable = false, so the seed
+  // must opt one in, and the probe starts at its entry point.
+  const { data: plannable, error: plannableError } = await supabase
+    .from('tour_chapters')
+    .select('id, entry_point')
+    .eq('tour_id', tours[0]!.id)
+    .eq('plannable', true);
+  check(
+    'the seed tour has a plannable chapter with an entry point (anon)',
+    !plannableError && (plannable?.length ?? 0) > 0 && (plannable![0] as any).entry_point != null,
+    plannableError?.message ?? 'every chapter is plannable = false - the plan wizard would answer no_candidates',
+  );
+  const entry = (plannable?.[0] as any)?.entry_point?.coordinates as [number, number] | undefined;
+
   const plannerArgs = {
     p_city_id: tours[0]?.city_id,
-    p_origin_lon: 34.78,
-    p_origin_lat: 32.08,
+    p_origin_lon: entry?.[0],
+    p_origin_lat: entry?.[1],
     p_transit_mode: 'walking',
     p_group_type: 'solo',
     p_interests: ['history'],
@@ -400,6 +416,11 @@ async function main(): Promise<void> {
     Array.isArray(p?.candidates) && Array.isArray(p?.transfers) && Array.isArray(p?.legs)
       && typeof p?.considered === 'number' && typeof p?.pruned === 'object' && p?.transfer_profile === 'pedestrian',
     JSON.stringify(p)?.slice(0, 200),
+  );
+  check(
+    'the plannable seed chapter is a candidate from its own entry point',
+    Array.isArray(p?.candidates) && p.candidates.some((c: any) => c.chapter_id === (plannable?.[0] as any)?.id),
+    `considered ${p?.considered}, pruned ${JSON.stringify(p?.pruned)}`,
   );
 
   // --- Summary -------------------------------------------------------------

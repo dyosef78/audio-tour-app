@@ -213,3 +213,16 @@ INSERT INTO public.audio_tracks
      'deep_dive',
      'tours/aaaaaaaa-0000-4000-8000-000000000001/wp02_tower_of_david.deep_dive.m4a',
      'AAC', 2880000, 360, -16);
+
+-- --- Planner eligibility (Epic 16, TASK-1701) -----------------------------------
+-- 20261005120000 defaults every chapter to plannable = false, and
+-- get_planner_candidates reads plannable chapters only - so without this the
+-- local plan wizard answers no_candidates for Jerusalem, as production did for
+-- Tel Aviv. The default chapter's id is the tour id (default-chapter trigger).
+-- entry/exit = first/last core stop (the Cardo transition is core too, but it
+-- is not last). verify-bundle probes the planner from this entry point.
+UPDATE public.tour_chapters
+   SET plannable   = true,
+       entry_point = ST_SetSRID(ST_MakePoint(35.2279, 31.7766), 4326),
+       exit_point  = ST_SetSRID(ST_MakePoint(35.2344, 31.7767), 4326)
+ WHERE id = 'aaaaaaaa-0000-4000-8000-000000000001';

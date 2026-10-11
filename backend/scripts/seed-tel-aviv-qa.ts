@@ -593,6 +593,45 @@ async function assignCity(supabase: SupabaseClient, tourId: string): Promise<voi
 }
 
 /**
+ * Opt the tour's single chapter into the planner (Epic 16/17, TASK-1701).
+ *
+ * Chapters default to plannable = false, and get_planner_candidates reads only
+ * plannable ones, so without this the plan wizard answers no_candidates for
+ * Tel Aviv. Production was fixed once by migration 20261011120000; this keeps
+ * a FRESH run (new tour uuid) from reintroducing the bug.
+ *
+ * entry/exit = first/last stop: a pedestrian walk has no car park to arrive at.
+ * cms_replace_tour_chapters deletes chapters absent from the payload, so the
+ * existing chapter is passed by id; keys left out stay unchanged.
+ */
+async function makePlannable(supabase: SupabaseClient, tourId: string): Promise<void> {
+  const { data, error: lookupError } = await supabase
+    .from('tour_chapters')
+    .select('id, sort_order')
+    .eq('tour_id', tourId);
+  if (lookupError) throw new Error(`Could not look up the tour's chapters: ${lookupError.message}`);
+  const chapters = (data ?? []) as { id: string; sort_order: number }[];
+  if (chapters.length !== 1) {
+    throw new Error(`Tour ${tourId} has ${chapters.length} chapters; this seed writes exactly one.`);
+  }
+
+  const first = ROUTE[0]!;
+  const last = ROUTE[ROUTE.length - 1]!;
+  const { error } = await supabase.rpc('cms_replace_tour_chapters', {
+    p_tour_id: tourId,
+    p_chapters: [{
+      id: chapters[0]!.id,
+      sort_order: chapters[0]!.sort_order,
+      plannable: true,
+      entry_point: { lon: first.lng, lat: first.lat },
+      exit_point: { lon: last.lng, lat: last.lat },
+    }],
+  });
+  if (error) throw new Error(`cms_replace_tour_chapters failed: ${error.message}`);
+  console.log(`  chapter ${chapters[0]!.id} plannable`);
+}
+
+/**
  * Write all eight waypoints and their zones, then read the ids back.
  *
  * The read-back is not optional. cms_replace_tour_waypoints returns counts, not
@@ -846,6 +885,7 @@ async function main(): Promise<void> {
     console.log('Tour and waypoints');
     tourId = await upsertTour(supabase);
     waypoints = await replaceWaypoints(supabase, tourId);
+    await makePlannable(supabase, tourId);
   }
 
   console.log(
