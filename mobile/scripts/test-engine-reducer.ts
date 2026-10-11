@@ -571,6 +571,36 @@ heading('Idle timeout: 15 minutes still suspends the tour (battery)');
   assert('...15 min after the move, a bare TICK suspends (no fix needed)', r.effects.some((e) => e.type === 'SUSPEND_TRACKING'));
 }
 {
+  // Epic 17 (engine audit P3): fixes too coarse to resolve a zone still show
+  // MOVEMENT. Before, they were dropped before the stillness check, so a car
+  // that parked (good fixes), then drove under Google Maps delivering only
+  // coarse ones, was suspended 15 minutes later while moving.
+  const MIN = 60_000;
+  const suspends = (r: Run) => r.effects.filter((e) => e.type === 'SUSPEND_TRACKING').length;
+  const far = (id: string, ch: string) => stop(id, ch, 0, 900_000, 0, 200);
+
+  const drive: EngineTour = { chapters: [chapter('drive', 'driving')], stops: [far('d', 'drive')] };
+  let r = start(drive, 'drive');
+  for (let t = 0; t <= MIN; t += 30_000) r = feed(r, [fix(0, 0, T0 + t, { accuracyM: 8 })]); // parked
+  for (let t = MIN + 30_000; t <= 21 * MIN; t += 30_000) {
+    r = feed(r, [fix(((t - MIN) / 1000) * 15, 0, T0 + t, { accuracyM: 80, speedMps: 15 })]); // 54 km/h, 80 m > the 50 m ceiling
+  }
+  assert('driving 20 min on 80 m fixes (above the ceiling): never suspended', suspends(r) === 0, `${suspends(r)}`);
+  assert('...and the coarse fixes still fire nothing and are not swept from', Object.keys(r.state.progress.fired).length === 0);
+
+  const walk: EngineTour = { chapters: [chapter('walk', 'walking')], stops: [far('w', 'walk')] };
+  r = start(walk, 'walk');
+  r = feed(r, [fix(0, 0, T0, { accuracyM: 10 })]);
+  for (let t = 30_000; t <= 20 * MIN; t += 30_000) r = feed(r, [fix((t / 1000) * 1.4, 0, T0 + t, { accuracyM: 40 })]); // 40 m > 35 m
+  assert('walking 20 min on 40 m fixes: never suspended', suspends(r) === 0, `${suspends(r)}`);
+
+  // Battery is kept: coarse fixes that do NOT leave 2x their error are still.
+  r = start(drive, 'drive');
+  r = feed(r, [fix(0, 0, T0, { accuracyM: 8 })]);
+  for (let t = 30_000; t <= 16 * MIN; t += 30_000) r = feed(r, [fix(((t / 30_000) % 4) * 25, ((t / 30_000) % 3) * 25, T0 + t, { accuracyM: 80 })]);
+  assert('parked 16 min, coarse fixes wandering 75 m: suspended (2x80 m radius)', suspends(r) === 1, `${suspends(r)}`);
+}
+{
   // A narration actually playing is never cut for inactivity.
   const MIN = 60_000;
   const tour: EngineTour = { chapters: [chapter('walk', 'walking')], stops: [stop('a', 'walk', 0, 0, 0, 30)] };

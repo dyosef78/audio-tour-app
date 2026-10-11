@@ -270,10 +270,15 @@ function stepFix(state: EngineState, fix: GpsFix, now: number, effects: Effect[]
   const chapter = activeChapter(state);
   const mode = MODE_CONFIG[chapter.transitMode];
 
-  // A fix that cannot resolve a zone is not used at all - not even as the
-  // start of the next segment, which then sweeps from the last good fix.
-  if (fix.accuracyM !== null && fix.accuracyM > mode.accuracyCeilingM) return state;
+  // Stillness reads EVERY fix (Epic 17, engine audit P3). A fix too coarse to
+  // resolve a zone still proves movement once it lands beyond 2x its own error
+  // - the radius trackStillness already scales by. Gated, that evidence was
+  // lost: under Google Maps a moving phone can deliver only coarse fixes, and
+  // 15 minutes of them suspended a car on the road.
   state = trackStillness(state, fix, now);
+  // Otherwise a fix that cannot resolve a zone is not used at all - not even
+  // as the start of the next segment, which then sweeps from the last good fix.
+  if (fix.accuracyM !== null && fix.accuracyM > mode.accuracyCeilingM) return state;
   state = trackArrival(state, chapter, mode, fix, effects);
 
   const prev = state.lastFix;
