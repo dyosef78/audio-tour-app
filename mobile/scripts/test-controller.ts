@@ -29,6 +29,7 @@ import { planSessionKey } from '../src/session/sessionKey.ts';
 import type { GpsFix } from '../src/engine/types.ts';
 import type { TourProgressSnapshot } from '../src/session/progressRepository.ts';
 import { HEARTBEAT_MS } from '../src/session/EngineRunner.ts';
+import { telemetry } from '../src/services/telemetry/TelemetryService.ts';
 
 // --- reporting -----------------------------------------------------------------
 let checks = 0;
@@ -91,14 +92,28 @@ function kill(): void {
   for (const h of [...liveIntervals]) globalThis.clearInterval(h);
   rn.__resetAppState();
   useTourSession.getState().reset();
-  location.resetCalls();
+  // The OS-level location task OUTLIVES the process (Android restores it):
+  // only the call log is cleared, not whether the task runs.
+  location.calls.length = 0;
 }
 function freshWorld(): void {
   kill();
+  location.resetCalls();
+  rn.Platform.OS = 'ios';
   fs.__resetFs();
   notifications.__resetNotifications();
+  recorded.length = 0;
   now = T0;
 }
+
+// --- telemetry, as the controller records it ------------------------------------
+const recorded: { type: string; meta: Record<string, unknown> }[] = [];
+const realRecord = telemetry.record.bind(telemetry);
+telemetry.record = (async (type, context = {}) => {
+  recorded.push({ type, meta: (context.meta ?? {}) as Record<string, unknown> });
+  return realRecord(type, context);
+}) as typeof telemetry.record;
+const resumedWith = (reason: string) => recorded.filter((r) => r.type === 'tour_resumed' && r.meta.reason === reason);
 
 function checkpoint(): TourProgressSnapshot | null {
   const loaded = tourProgress.load();
@@ -382,6 +397,96 @@ heading('Planned session: re-entry while paused keeps the plan position');
   await settle();
   assert('re-entry keeps the walk and the pause', checkpoint()?.progress.chapterId === WALK && useTourSession.getState().status === 'paused', `${checkpoint()?.progress.chapterId} ${useTourSession.getState().status}`);
   assert('no tracker, one heartbeat', (await liveTrackers()) === 0 && liveIntervals.size === 1, `${await liveTrackers()}, ${liveIntervals.size}`);
+}
+
+// =============================================================================
+heading('Android P1 (Option A): a task the OS restored gets its foreground service back');
+// =============================================================================
+const fgsStarts = () => location.calls.filter((c) => c.kind === 'background-start' && c.options && 'foregroundService' in c.options).length;
+const taskStops = () => location.calls.filter((c) => c.kind === 'background-stop').length;
+/** Start on Android, reach chapter 2, then die mid-drive. The task survives. */
+async function androidKilledMidDrive(): Promise<void> {
+  freshWorld();
+  rn.Platform.OS = 'android';
+  seedBundle(bundle(TOUR, 'h1'));
+  const first = await newProcess();
+  await first.startSession(TOUR, 'Tour 1');
+  await settle();
+  first.startNextChapter();
+  await settle();
+  kill();
+}
+{
+  await androidKilledMidDrive();
+  assert('the native task outlives the process', await location.hasStartedLocationUpdatesAsync());
+
+  // Android restores the task headless, with the app in the background.
+  rn.__setCurrentAppState('background');
+  location.__setAppForegrounded(false);
+  const tour = await newProcess();
+  tour.onBackgroundFixes([fix()]);
+  await settle();
+  assert('the background-task resume rebuilds the session in chapter 2', useTourSession.getState().status === 'active' && checkpoint()?.progress.chapterId === WALK, `${useTourSession.getState().status} ${checkpoint()?.progress.chapterId}`);
+  assert('...adopting the task untouched: no start, no stop from the background', fgsStarts() === 0 && taskStops() === 0, `${fgsStarts()} starts, ${taskStops()} stops`);
+  assert('the restart is measured (tour_resumed reason process_restart, task adopted)', resumedWith('process_restart').some((r) => r.meta.origin === 'background_task' && r.meta.task_adopted === true));
+
+  // The visitor comes back to the app.
+  location.__setAppForegrounded(true);
+  rn.__emitAppState('active');
+  await settle();
+  assert('on return: the task is re-registered WITH its foreground service', fgsStarts() === 1, String(fgsStarts()));
+  assert('...without being stopped first (never lost)', taskStops() === 0 && (await liveTrackers()) === 1, `${taskStops()} stops, ${await liveTrackers()} live`);
+  assert('...reported as reacquired', resumedWith('foreground_service').some((r) => r.meta.outcome === 'reacquired'));
+  assert('...and chapter 2 is untouched', checkpoint()?.progress.chapterId === WALK);
+
+  rn.__emitAppState('background');
+  rn.__emitAppState('active');
+  await settle();
+  assert('later returns do nothing more (the service is no longer in doubt)', fgsStarts() === 1, String(fgsStarts()));
+}
+{
+  await androidKilledMidDrive();
+  rn.__setCurrentAppState('background');
+  location.__setAppForegrounded(false);
+  const tour = await newProcess();
+  tour.onBackgroundFixes([fix()]);
+  await settle();
+
+  // "active" reaches JS, but the OS still refuses (backgrounded again at once).
+  rn.__emitAppState('active');
+  await settle();
+  assert('a refused re-assert leaves the task running, untouched', (await location.hasStartedLocationUpdatesAsync()) && taskStops() === 0 && fgsStarts() === 0);
+  assert('...reported as refused', resumedWith('foreground_service').some((r) => r.meta.outcome === 'refused'));
+  location.__setAppForegrounded(true);
+  rn.__emitAppState('active');
+  await settle();
+  assert('...and the next return to the app re-acquires it', fgsStarts() === 1 && resumedWith('foreground_service').some((r) => r.meta.outcome === 'reacquired'), String(fgsStarts()));
+}
+{
+  // The visitor opens the app first: a cold start in the foreground adopts the
+  // restored task and re-acquires the service at once.
+  await androidKilledMidDrive();
+  const tour = await newProcess();
+  await tour.reconcileOnColdStart();
+  await settle();
+  assert('cold start in the foreground: resumed in chapter 2', useTourSession.getState().status === 'active' && checkpoint()?.progress.chapterId === WALK);
+  assert('...and the service is re-acquired immediately, no stop', fgsStarts() === 1 && taskStops() === 0, `${fgsStarts()} starts, ${taskStops()} stops`);
+  assert('...measured as a cold_start restart', resumedWith('process_restart').some((r) => r.meta.origin === 'cold_start' && r.meta.task_adopted === true));
+}
+{
+  // A tour killed while PAUSED: its task is stopped on resume, nothing to re-assert.
+  freshWorld();
+  rn.Platform.OS = 'android';
+  seedBundle(bundle(TOUR, 'h1'));
+  const first = await newProcess();
+  await driveThenPark(first);
+  kill();
+  const tour = await newProcess();
+  await tour.reconcileOnColdStart();
+  await settle();
+  rn.__emitAppState('active');
+  await settle();
+  assert('a paused tour after a kill: no task, no re-assert, still paused', useTourSession.getState().status === 'paused' && fgsStarts() === 0 && !(await location.hasStartedLocationUpdatesAsync()), `${useTourSession.getState().status} ${fgsStarts()}`);
 }
 
 // --- summary --------------------------------------------------------------------

@@ -75,6 +75,17 @@ export class LocationService {
   private lost = false;
 
   /**
+   * Android (Epic 17, engine audit P1): an ADOPTED task may be running without
+   * its location foreground service. expo-location 57 (LocationTaskConsumer.
+   * maybeStartForegroundService) skips the service when the OS restores the
+   * task with the app in the background, and never retries on resume - and
+   * without it Android throttles background fixes to a few an hour. JS cannot
+   * ask whether the service runs, so an adopted task is assumed to lack it
+   * until reassertForegroundService() succeeds.
+   */
+  private serviceUncertain = false;
+
+  /**
    * Android: the background task is the only transport, opened once by
    * start() (see the header). TourSessionController reads this to skip the
    * iOS app-state handoff.
@@ -196,10 +207,44 @@ export class LocationService {
   async resumeTracking(): Promise<void> {
     if (this.persistentTask && (await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME))) {
       this.trackingMode = 'background';
+      this.serviceUncertain = true;
       this.callbacks.onSamplingChange?.('fine', this.sampling);
       return;
     }
     await this.start();
+  }
+
+  /** True while an adopted Android task may be running without its foreground service. */
+  get foregroundServiceUncertain(): boolean {
+    return this.serviceUncertain;
+  }
+
+  /**
+   * Re-acquire the foreground service of an adopted task (Epic 17, Option A).
+   *
+   * Re-registers the RUNNING task with its own options - no stop first.
+   * expo-task-manager then calls the consumer's setOptions(), which restarts
+   * the location request and runs maybeStartForegroundService() again; in the
+   * foreground that starts the service. Not stopping is the point: refused
+   * (backgrounded meanwhile), the task is still running exactly as before -
+   * never lost - and the next return to the app tries again.
+   *
+   * Foreground only (Android 12+ forbids starting the service from the
+   * background); throws otherwise, loudly. Serialised with restarts. A task
+   * stopped meanwhile (idle pause, session end) leaves nothing to re-assert.
+   */
+  async reassertForegroundService(): Promise<void> {
+    const run = this.applying.then(async () => {
+      if (!this.serviceUncertain) return;
+      if (this.trackingMode !== 'background' || !(await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK_NAME))) {
+        this.serviceUncertain = false;
+        return;
+      }
+      this.assertCanRestartTask('reassertForegroundService()');
+      await this.openBackgroundUpdates();
+    });
+    this.applying = run.catch(() => undefined);
+    await run;
   }
 
   /**
@@ -231,11 +276,17 @@ export class LocationService {
       pausesUpdatesAutomatically: false,
       showsBackgroundLocationIndicator: true,
     });
+    // Succeeded, so the app was in the foreground (LocationModule throws
+    // ForegroundServiceStartNotAllowedException otherwise) and the consumer
+    // started the service: start(), retune() and recover() all re-acquire it.
+    this.serviceUncertain = false;
   }
 
   async stopBackground(): Promise<void> {
-    // Stopped on purpose (idle pause, session end): nothing is "lost" any more.
+    // Stopped on purpose (idle pause, session end): nothing is "lost" any more,
+    // and no adopted task is left to re-assert.
     this.lost = false;
+    this.serviceUncertain = false;
     // Same ordering as stop(): a late restart would leave a task running with
     // no session behind it - the battery drain stopOrphanedLocationUpdates()
     // exists to clean up on the next cold start.

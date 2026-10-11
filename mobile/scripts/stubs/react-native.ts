@@ -30,6 +30,8 @@ type AppStateListener = (status: string) => void;
 const listeners = new Set<AppStateListener>();
 
 export const AppState = {
+  /** What LocationService and the controller read as "in the foreground". */
+  currentState: 'active' as string,
   addEventListener: (_event: string, listener: AppStateListener) => {
     listeners.add(listener);
     return { remove: () => listeners.delete(listener) };
@@ -38,12 +40,19 @@ export const AppState = {
 
 /** Drive a foreground/background transition from a test. */
 export function __emitAppState(status: string): void {
+  AppState.currentState = status;
   for (const listener of [...listeners]) listener(status);
+}
+
+/** Set the state WITHOUT an event - a process that starts in the background. */
+export function __setCurrentAppState(status: string): void {
+  AppState.currentState = status;
 }
 
 /** A killed process takes its listeners with it (controller harness). */
 export function __resetAppState(): void {
   listeners.clear();
+  AppState.currentState = 'active';
 }
 
 export function __listenerCount(): number {

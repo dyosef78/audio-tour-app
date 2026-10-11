@@ -1039,6 +1039,21 @@ class TourSessionController {
     // SESSION_STARTED replays a restored queue - what fired but had not been heard.
     runner.start();
     this.persistNow();
+
+    // Epic 17: how often a process dies mid-tour (the PM's Maps-era OOM
+    // concern), per platform and origin. tour_resumed, not a new type: no
+    // migration; the engine's own idle resume carries no `reason`.
+    void telemetry.record('tour_resumed', {
+      tourId: engineEventTourId(snap.source, snap.tourId, undefined),
+      meta: { reason: 'process_restart', origin, suspended, task_adopted: service.foregroundServiceUncertain },
+    });
+    // Epic 17 (Option A): an adopted Android task may lack its foreground
+    // service. Re-acquired now if this resume runs in the foreground (a cold
+    // start, a Start); a background-task resume waits for the next return to
+    // the app (handleAppStateChange) - Android forbids it from the background.
+    if (service.foregroundServiceUncertain && AppState.currentState === 'active') {
+      void this.serialTracking(() => this.reassertForegroundService());
+    }
     console.warn(
       `[TourSession] resumed ${snap.tourId} (${origin}): ${Object.keys(snap.progress.played).length}/${snap.activeIds.length} stops heard, ${snap.progress.queue.length} waiting`,
     );
@@ -1275,6 +1290,11 @@ class TourSessionController {
     if (next === 'active' && service.trackingLost && useTourSession.getState().status === 'active') {
       void this.serialTracking(() => this.recoverTracking());
     }
+    // Epic 17: the first return to the app after a background-task resume is
+    // the first moment Android lets the adopted task get its service back.
+    if (next === 'active' && service.foregroundServiceUncertain) {
+      void this.serialTracking(() => this.reassertForegroundService());
+    }
     if (service.persistentTask) return;
     if (useTourSession.getState().status !== 'active') return;
 
@@ -1289,6 +1309,28 @@ class TourSessionController {
       }
     } catch (err) {
       console.warn('[TourSession] app-state transition failed:', err);
+    }
+  }
+
+  /**
+   * Epic 17 (Option A, engine audit P1): give an adopted Android task its
+   * location foreground service back. Without it Android throttles background
+   * fixes to a few an hour, and a plan (pinned tracking) never restarts its
+   * task to repair it. Reported either way; still uncertain after a refusal,
+   * so the next return to the app tries again.
+   */
+  private async reassertForegroundService(): Promise<void> {
+    const service = this.location;
+    const meta = this.session;
+    if (!service?.foregroundServiceUncertain || meta === null) return;
+    const tourId = engineEventTourId(meta.source, meta.tourId, undefined);
+    try {
+      await service.reassertForegroundService();
+      console.warn('[TourSession] location foreground service re-acquired for the task the OS restored');
+      void telemetry.record('tour_resumed', { tourId, meta: { reason: 'foreground_service', outcome: 'reacquired' } });
+    } catch (err) {
+      console.error('[TourSession] the location foreground service could NOT be re-acquired - background tracking stays throttled until the next return to the app:', err);
+      void telemetry.record('tour_resumed', { tourId, meta: { reason: 'foreground_service', outcome: 'refused' } });
     }
   }
 
