@@ -193,18 +193,20 @@ Deno.test('POST: unknown keys are refused, never dropped (Epic 17)', async () =>
   assertEquals(h.saved.length, 0);
 });
 
-Deno.test('POST: kids_age_band is planned with and stored in the request (Epic 17)', async () => {
+Deno.test('POST: kids_age_bands is planned with and stored in the request (Epic 17)', async () => {
   const h = harness();
-  const ok = await handlePlanTour(post(body({ group_type: 'family_kids', kids_age_band: 'toddlers' })), h.deps);
+  const ok = await handlePlanTour(post(body({ group_type: 'family_kids', kids_age_bands: ['teens', 'young_kids'] })), h.deps);
   assertEquals(ok.status, 200);
   const plan = await ok.json() as PlanTourOk;
   assertEquals(plan.estimate.pace_factor, 1.5);
-  assertEquals(h.saved.at(-1)?.request.kids_age_band, 'toddlers');
-  const solo = await (await handlePlanTour(post(body({ kids_age_band: 'kids' })), h.deps)).json() as PlanTourError;
+  assertEquals(h.saved.at(-1)?.request.kids_age_bands, ['young_kids', 'teens']);
+  const solo = await (await handlePlanTour(post(body({ kids_age_bands: ['kids'] })), h.deps)).json() as PlanTourError;
   assertEquals(solo.code, 'invalid_request');
-  // Without a band the stored request has no such key: rows look as before.
+  const singular = await (await handlePlanTour(post(body({ group_type: 'family_kids', kids_age_band: 'kids' })), h.deps)).json() as PlanTourError;
+  assertEquals(singular.code, 'invalid_request');
+  // Without bands the stored request has no such key: rows look as before.
   await handlePlanTour(post(body({ group_type: 'family_kids' })), h.deps);
-  assert(!('kids_age_band' in h.saved.at(-1)!.request), 'no band, no key');
+  assert(!('kids_age_bands' in h.saved.at(-1)!.request), 'no bands, no key');
 });
 
 Deno.test('POST: no survivors maps to the right 422 code', async () => {

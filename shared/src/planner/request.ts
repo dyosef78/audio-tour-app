@@ -19,7 +19,7 @@ const MODES: readonly TransitMode[] = ['walking', 'biking', 'driving'];
 /** Every key PlanTourRequest may carry, per object. Anything else is invalid_request. */
 const REQUEST_KEYS: ReadonlySet<string> = new Set([
   'contract_version', 'city_id', 'origin', 'available_minutes', 'transit_mode', 'group_type',
-  'kids_age_band', 'interests', 'context', 'include_deep_dives', 'exclude_chapter_ids',
+  'kids_age_bands', 'interests', 'context', 'include_deep_dives', 'exclude_chapter_ids',
 ]);
 const ORIGIN_KEYS: ReadonlySet<string> = new Set(['lon', 'lat', 'source']);
 const CONTEXT_KEYS: ReadonlySet<string> = new Set(['local_time']);
@@ -42,7 +42,7 @@ export function checkPlanRequest(body: unknown): RequestCheck {
     return { ok: false, code: 'unsupported_contract', detail: `contract_version must be ${PLAN_CONTRACT_VERSION}` };
   }
   // Strict (Epic 17, PM): an unknown key is refused, never dropped. Dropping
-  // is how a newer app's field (kids_age_band) would vanish against an older
+  // is how a newer app's field (kids_age_bands) would vanish against an older
   // deployment and come back as a plan for a request nobody made.
   const unknown = unknownKeys(b, REQUEST_KEYS);
   if (unknown !== null) return bad(`unknown field ${unknown}`);
@@ -65,10 +65,14 @@ export function checkPlanRequest(body: unknown): RequestCheck {
   }
   if (!MODES.includes(b.transit_mode as TransitMode)) return bad('transit_mode must be walking, biking or driving');
   if (!(GROUP_TYPE_IDS as readonly unknown[]).includes(b.group_type)) return bad('group_type is not in the vocabulary');
-  const band = b.kids_age_band;
-  if (band !== undefined) {
-    if (!(KIDS_AGE_BANDS as readonly unknown[]).includes(band)) return bad(`kids_age_band must be one of ${KIDS_AGE_BANDS.join(', ')}`);
-    if (b.group_type !== 'family_kids') return bad('kids_age_band is only valid with group_type family_kids');
+  const bands = b.kids_age_bands;
+  if (bands !== undefined) {
+    if (!Array.isArray(bands) || bands.length === 0
+        || !bands.every((x) => (KIDS_AGE_BANDS as readonly unknown[]).includes(x))) {
+      return bad(`kids_age_bands must be a non-empty list of ${KIDS_AGE_BANDS.join(', ')}`);
+    }
+    if (new Set(bands).size !== bands.length) return bad('kids_age_bands must not repeat');
+    if (b.group_type !== 'family_kids') return bad('kids_age_bands is only valid with group_type family_kids');
   }
 
   const interests = b.interests;
@@ -100,9 +104,10 @@ export function checkPlanRequest(body: unknown): RequestCheck {
       available_minutes: minutes,
       transit_mode: b.transit_mode as TransitMode,
       group_type: b.group_type as GroupType,
-      // Present only when sent: an absent band normalises to absent, so every
-      // request an older build sends hashes and stores exactly as before.
-      ...(band !== undefined ? { kids_age_band: band as KidsAgeBand } : {}),
+      // Present only when sent: absent normalises to absent, so every request
+      // an older build sends hashes and stores exactly as before. A set, so
+      // put in vocabulary order: the same range is the same request.
+      ...(bands !== undefined ? { kids_age_bands: KIDS_AGE_BANDS.filter((x) => (bands as unknown[]).includes(x)) as KidsAgeBand[] } : {}),
       interests: interests as Interest[],
       context: { local_time: ctx.local_time },
       include_deep_dives: b.include_deep_dives,

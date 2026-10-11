@@ -51,7 +51,8 @@ export async function requestHash(
     transit_mode: request.transit_mode,
     group_type: request.group_type,
     // Epic 17: hashed only when sent, so every existing key is unchanged.
-    ...(request.kids_age_band !== undefined ? { kids_age_band: request.kids_age_band } : {}),
+    // Already in vocabulary order (checkPlanRequest); sorted again, as interests.
+    ...(request.kids_age_bands !== undefined ? { kids_age_bands: [...request.kids_age_bands].sort() } : {}),
     interests: [...request.interests].sort(),
     available_minutes: request.available_minutes,
     include_deep_dives: request.include_deep_dives,

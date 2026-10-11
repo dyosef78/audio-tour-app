@@ -592,18 +592,26 @@ heading('Request, hashing, origin');
   eq('a wrong contract_version still says unsupported_contract, whatever else it carries', bad({ contract_version: 2, novel: true }), 'unsupported_contract');
   eq('what the app sends (buildPlanRequest keys + exclude_chapter_ids) passes', bad({ exclude_chapter_ids: [] }), 'ok');
 
-  // Epic 17 (PM, Option A): kids_age_band.
-  for (const band of ['toddlers', 'kids', 'teens']) {
-    const r = checkPlanRequest({ ...request(), group_type: 'family_kids', kids_age_band: band });
-    assert(`kids_age_band ${band} with family_kids passes and is kept`, r.ok && r.request.kids_age_band === band);
+  // Epic 17 (PM, Option A + 11 Oct): kids_age_bands, a family's age RANGE.
+  const famReq = (bands: unknown) => checkPlanRequest({ ...request(), group_type: 'family_kids', kids_age_bands: bands });
+  for (const bands of [['young_kids'], ['kids'], ['teens'], ['young_kids', 'teens']]) {
+    const r = famReq(bands);
+    assert(`kids_age_bands ${bands.join('+')} with family_kids passes and is kept`, r.ok && JSON.stringify(r.request.kids_age_bands) === JSON.stringify(bands));
   }
-  eq('kids_age_band with solo -> invalid', bad({ group_type: 'solo', kids_age_band: 'kids' }), 'invalid_request');
-  eq('unknown band -> invalid', bad({ group_type: 'family_kids', kids_age_band: 'babies' }), 'invalid_request');
-  eq('null band -> invalid (absent is the only "no band")', bad({ group_type: 'family_kids', kids_age_band: null }), 'invalid_request');
+  const reordered = famReq(['teens', 'young_kids']);
+  assert('a range is a set: normalised to vocabulary order (youngest first)', reordered.ok && JSON.stringify(reordered.request.kids_age_bands) === '["young_kids","teens"]');
+  eq('kids_age_bands with solo -> invalid', bad({ group_type: 'solo', kids_age_bands: ['kids'] }), 'invalid_request');
+  eq('unknown band -> invalid', bad({ group_type: 'family_kids', kids_age_bands: ['babies'] }), 'invalid_request');
+  eq('the retired id toddlers -> invalid', bad({ group_type: 'family_kids', kids_age_bands: ['toddlers'] }), 'invalid_request');
+  eq('empty list -> invalid (absent is the only "no bands")', bad({ group_type: 'family_kids', kids_age_bands: [] }), 'invalid_request');
+  eq('repeated band -> invalid', bad({ group_type: 'family_kids', kids_age_bands: ['kids', 'kids'] }), 'invalid_request');
+  eq('a bare string, not a list -> invalid', bad({ group_type: 'family_kids', kids_age_bands: 'kids' }), 'invalid_request');
+  eq('the singular kids_age_band (never shipped) is now an unknown key', detail({ group_type: 'family_kids', kids_age_band: 'kids' }), 'unknown field kids_age_band');
   const plain = checkPlanRequest(request({ group_type: 'family_kids' }));
-  assert('no band: the normalised request has no kids_age_band key at all', plain.ok && !('kids_age_band' in plain.request));
-  eq('pace: toddlers 1.5, kids 1.3, teens 1.0', (['toddlers', 'kids', 'teens'] as const).map((b) => walkingPaceFor('family_kids', b)), [1.5, 1.3, 1.0]);
-  eq('pace without a band is WALKING_PACE as before (family_kids 1.3, solo 1.0)', [walkingPaceFor('family_kids', undefined), walkingPaceFor('solo', undefined)], [1.3, 1.0]);
+  assert('no bands: the normalised request has no kids_age_bands key at all', plain.ok && !('kids_age_bands' in plain.request));
+  eq('pace: young_kids 1.5, kids 1.3, teens 1.0', (['young_kids', 'kids', 'teens'] as const).map((b) => walkingPaceFor('family_kids', [b])), [1.5, 1.3, 1.0]);
+  eq('a range walks at its slowest band', [walkingPaceFor('family_kids', ['young_kids', 'teens']), walkingPaceFor('family_kids', ['kids', 'teens'])], [1.5, 1.3]);
+  eq('pace without bands is WALKING_PACE as before (family_kids 1.3, solo 1.0)', [walkingPaceFor('family_kids', undefined), walkingPaceFor('solo', undefined)], [1.3, 1.0]);
 
   eq('origin rounded to 3 decimals', roundOrigin(34.781949, 32.085551), [34.782, 32.086]);
   eq('canonical JSON ignores key order', canonicalJson({ b: 1, a: [2, { d: 3, c: 4 }] }), canonicalJson({ a: [2, { c: 4, d: 3 }], b: 1 }));
@@ -615,15 +623,15 @@ heading('Request, hashing, origin');
   // Pinned from main before Epic 17: a request without kids_age_band must keep
   // its key, or every repeat request after the deploy would store a new plan.
   eq('request_hash unchanged by Epic 17 for a request without a band', h1, '7fc7613983af488162fe6e92c851b303938006cab2d5eecda6c42c024bfb8caf');
-  const fam = await requestHash(request({ group_type: 'family_kids' }), [34.78, 32.08], null, raw);
-  const famKids = await requestHash(request({ group_type: 'family_kids', kids_age_band: 'kids' }), [34.78, 32.08], null, raw);
-  const famTeens = await requestHash(request({ group_type: 'family_kids', kids_age_band: 'teens' }), [34.78, 32.08], null, raw);
-  assert('kids_age_band is in the key: no band, kids and teens are three plans', new Set([fam, famKids, famTeens]).size === 3);
+  const famHash = (bands?: string[]) => requestHash(request({ group_type: 'family_kids', ...(bands ? { kids_age_bands: bands as never } : {}) }), [34.78, 32.08], null, raw);
+  const keys = [await famHash(), await famHash(['kids']), await famHash(['teens']), await famHash(['kids', 'teens'])];
+  assert('kids_age_bands is in the key: none, kids, teens, kids+teens are four plans', new Set(keys).size === 4);
+  eq('...and the order of a range is not', await famHash(['teens', 'kids']), keys[3]!);
   const paceOf = (o: Partial<PlanTourRequest>) => {
     const out = planTour(request({ available_minutes: 240, ...o }), parseCandidates(raw), at(0, 0));
     return out.ok ? out.draft.estimate.pace_factor : null;
   };
-  eq('the planner walks at the band\'s pace (estimate.pace_factor)', [paceOf({ group_type: 'family_kids', kids_age_band: 'toddlers' }), paceOf({ group_type: 'family_kids' }), paceOf({ group_type: 'family_kids', kids_age_band: 'teens' })], [1.5, 1.3, 1.0]);
+  eq('the planner walks at the slowest pace of the range (estimate.pace_factor)', [paceOf({ group_type: 'family_kids', kids_age_bands: ['young_kids', 'teens'] }), paceOf({ group_type: 'family_kids' }), paceOf({ group_type: 'family_kids', kids_age_bands: ['teens'] })], [1.5, 1.3, 1.0]);
   const h3 = await requestHash(request(), [34.78, 32.08], uuid(77), raw);
   assert('a signed-in user never shares a plan row with anyone', h3 !== h1);
   const h4 = await requestHash(request(), [34.78, 32.08], null, rpc([{ ...tiny, exit: at(301, 0) }]));

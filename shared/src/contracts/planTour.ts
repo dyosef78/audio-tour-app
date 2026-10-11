@@ -54,9 +54,11 @@ export interface PlanTourRequest {
   group_type: GroupType;
   /**
    * Epic 17. Optional; only with group_type 'family_kids' (refused otherwise).
-   * Sets walking pace (FAMILY_WALKING_PACE); absent = family_kids' 1.3 as before.
+   * A SET of one or more bands - the family's age range, normalised to
+   * vocabulary order. Walking pace = the slowest band's (FAMILY_WALKING_PACE);
+   * absent = family_kids' 1.3 as before.
    */
-  kids_age_band?: KidsAgeBand;
+  kids_age_bands?: readonly KidsAgeBand[];
   /** A SET: order must not change the plan (same rule as route-stops). Non-empty. */
   interests: readonly Interest[];
   /** ISO 8601 WITH offset; time-of-day rules use the visitor's clock (SmartSorter contract 1). */

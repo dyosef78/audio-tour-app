@@ -38,7 +38,7 @@ export type PlanOutcome =
 export function planTour(request: PlanTourRequest, answer: PlannerCandidates, origin: Pair): PlanOutcome {
   const budgetS = request.available_minutes * 60;
   const capacityS = Math.floor(budgetS * (1 - PLANNING_MARGIN));
-  const pace = walkingPaceFor(request.group_type, request.kids_age_band);
+  const pace = walkingPaceFor(request.group_type, request.kids_age_bands);
   const book = new CostBook(answer, request.transit_mode);
 
   const models: ChapterModel[] = [];

@@ -308,7 +308,7 @@ function sanitisedRequest(req: PlanTourRequest): Record<string, unknown> {
     available_minutes: req.available_minutes,
     transit_mode: req.transit_mode,
     group_type: req.group_type,
-    ...(req.kids_age_band !== undefined ? { kids_age_band: req.kids_age_band } : {}),
+    ...(req.kids_age_bands !== undefined ? { kids_age_bands: [...req.kids_age_bands] } : {}),
     interests: [...req.interests].sort(),
     context: req.context,
     include_deep_dives: req.include_deep_dives,

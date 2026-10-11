@@ -66,21 +66,27 @@ export const WALKING_PACE: Readonly<Record<GroupType, number>> = {
 };
 
 /**
- * Epic 17 (PM, Option A): family_kids refined by the children's age. Without a
- * band, family_kids keeps WALKING_PACE's 1.3 - every request an older build
- * sends plans exactly as before, so PLANNER_VERSION stays v4 (the band is in
- * request_hash, so a plan cached for one band is never served for another).
+ * Epic 17 (PM, Option A): family_kids refined by the children's ages. Without
+ * bands, family_kids keeps WALKING_PACE's 1.3 - every request an older build
+ * sends plans exactly as before, so PLANNER_VERSION stays v4 (the bands are in
+ * request_hash, so a plan cached for one range is never served for another).
  */
 export const FAMILY_WALKING_PACE: Readonly<Record<KidsAgeBand, number>> = {
-  toddlers: 1.5,
+  young_kids: 1.5,
   kids: 1.3,
   teens: 1.0,
 };
 
-export function walkingPaceFor(groupType: GroupType, kidsAgeBand: KidsAgeBand | undefined): number {
-  if (kidsAgeBand === undefined) return WALKING_PACE[groupType];
-  if (groupType !== 'family_kids') throw new RangeError(`kids_age_band ${kidsAgeBand} without group_type family_kids`);
-  return FAMILY_WALKING_PACE[kidsAgeBand];
+/**
+ * A range walks at its SLOWEST band (PM 11 Oct): a family moves at the pace
+ * of its slowest member, and an optimistic pace plans a day that overruns
+ * the visitor's time - worse than a few minutes of slack.
+ */
+export function walkingPaceFor(groupType: GroupType, kidsAgeBands: readonly KidsAgeBand[] | undefined): number {
+  if (kidsAgeBands === undefined) return WALKING_PACE[groupType];
+  if (groupType !== 'family_kids') throw new RangeError(`kids_age_bands without group_type family_kids`);
+  if (kidsAgeBands.length === 0) throw new RangeError('kids_age_bands must not be empty');
+  return Math.max(...kidsAgeBands.map((b) => FAMILY_WALKING_PACE[b]));
 }
 
 /** Chapter-sequence search bounds. Deterministic: same input, same cut-off. */
