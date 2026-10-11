@@ -284,5 +284,3 @@ function isQueuedEvent(value: unknown): value is QueuedEvent {
     typeof record.attempts === 'number'
   );
 }
-
-export const TELEMETRY_QUEUE_INTERNALS = { QUEUE_KEY, MAX_QUEUED, MAX_ATTEMPTS, BATCH_SIZE };

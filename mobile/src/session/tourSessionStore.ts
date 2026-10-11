@@ -240,9 +240,3 @@ export const useTourSession = create<TourSessionState & TourSessionActions>((set
   setPaused: (paused) =>
     set((s) => (s.status === 'active' || s.status === 'paused' ? { status: paused ? 'paused' : 'active' } : {})),
 }));
-
-/** Selectors, so subscribers only re-render on the slice they actually read. */
-export const selectStatus = (s: TourSessionState): SessionStatus => s.status;
-export const selectFix = (s: TourSessionState): LatLng | null => s.currentFix;
-export const selectWaypoints = (s: TourSessionState): Waypoint[] => s.waypoints;
-export const selectActiveWaypointId = (s: TourSessionState): string | null => s.activeWaypointId;

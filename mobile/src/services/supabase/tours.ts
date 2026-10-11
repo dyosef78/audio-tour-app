@@ -54,14 +54,3 @@ export async function fetchTours(cityId: string | null = null): Promise<Tour[]> 
   if (error) throw new Error(error.message);
   return (data ?? []).map(mapTour);
 }
-
-export async function fetchTour(tourId: string): Promise<Tour | null> {
-  const { data, error } = await supabase
-    .from('tours')
-    .select(TOUR_COLUMNS)
-    .eq('id', tourId)
-    .maybeSingle();
-
-  if (error) throw new Error(error.message);
-  return data ? mapTour(data) : null;
-}

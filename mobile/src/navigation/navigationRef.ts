@@ -31,11 +31,6 @@ export function navigate<T extends keyof RootStackParamList>(
   }
 }
 
-/** Current route name, or undefined before the container is ready. */
-export function currentRouteName(): string | undefined {
-  return navigationRef.isReady() ? navigationRef.getCurrentRoute()?.name : undefined;
-}
-
 /**
  * Open the running tour's screen - from a notification tap (Epic 15). A tap
  * that cold-starts the app can arrive before the container is ready, where
