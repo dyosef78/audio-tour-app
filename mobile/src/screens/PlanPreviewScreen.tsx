@@ -11,7 +11,7 @@ import { savedPlans, useSavedPlans } from '../services/planner/planRepositoryFil
 import { planDownloads, usePlanDownload, usePlanReconciler } from '../services/planner/planRuntime';
 import { fetchTours } from '../services/supabase/tours';
 import { planSessionKey } from '../session/sessionKey';
-import { useTourSession } from '../session/tourSessionStore';
+import { isSessionLive, useTourSession } from '../session/tourSessionStore';
 import { colors, MIN_TOUCH } from '../ui/theme';
 
 /**
@@ -66,8 +66,8 @@ export default function PlanPreviewScreen({ route, navigation }: PlanPreviewScre
 
   // A running tour plays from its bundle directory: replacing it would silence it.
   // Every tour a running session plays from - a plan's sources included.
-  const runningTourIds = useTourSession((s) => (s.status === 'active' || s.status === 'starting' ? s.sourceTourIds : NO_TOURS));
-  const runningKey = useTourSession((s) => (s.status === 'active' || s.status === 'starting' || s.status === 'paused' ? s.tourId : null));
+  const runningTourIds = useTourSession((s) => (isSessionLive(s.status) ? s.sourceTourIds : NO_TOURS));
+  const runningKey = useTourSession((s) => (isSessionLive(s.status) ? s.tourId : null));
 
   const cityId = saved?.request.city_id ?? null;
   useEffect(() => {

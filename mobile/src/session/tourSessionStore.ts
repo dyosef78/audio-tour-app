@@ -21,6 +21,16 @@ import type { LatLng, TransitMode, Waypoint } from '../types/domain';
 /** 'paused': suspended for inactivity (Epic 15) - tracking off, resumable. */
 export type SessionStatus = 'idle' | 'starting' | 'active' | 'paused' | 'error';
 
+/**
+ * A session holds its bundles and can be returned to (Epic 17). The ONE place
+ * screens ask "is a tour running": four hand-written allow-lists left 'paused'
+ * out, hiding the mini-player and offering "Remove download" for a tour that
+ * still plays from that bundle.
+ */
+export function isSessionLive(status: SessionStatus): boolean {
+  return status === 'starting' || status === 'active' || status === 'paused';
+}
+
 export interface TourSessionState {
   status: SessionStatus;
   /** The SESSION KEY (sessionKey.ts): a tour id, or plan:<planId> for a planned session. Not always a tours.id. */

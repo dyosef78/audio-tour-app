@@ -5,7 +5,7 @@ import { TourBundleRepository } from '../services/bundle/TourBundleRepository';
 import type { BundleProgress } from '../services/bundle/types';
 import { PinnedBundleError, pinConflictCopy } from '../services/planner/planRepository';
 import { networkMonitor } from '../services/network/NetworkMonitor';
-import { useTourSession } from '../session/tourSessionStore';
+import { isSessionLive, useTourSession } from '../session/tourSessionStore';
 import type { TourDetailScreenProps } from '../navigation/types';
 
 /**
@@ -48,7 +48,7 @@ export default function TourDetailScreen({ route, navigation }: TourDetailScreen
 
   const tourRunning = useTourSession(
     // sourceTourIds, not tourId: a running PLAN plays from this tour's bundle too (Epic 16).
-    (s) => s.sourceTourIds.includes(tourId) && (s.status === 'active' || s.status === 'starting'),
+    (s) => s.sourceTourIds.includes(tourId) && isSessionLive(s.status),
   );
 
   /** Guards setState after unmount - a download outlives a fast back-press. */

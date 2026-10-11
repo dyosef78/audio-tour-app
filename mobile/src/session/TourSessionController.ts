@@ -117,7 +117,8 @@ export class SessionStartError extends Error {
 /** Fixes held while a session is being rebuilt; the oldest go first past this. */
 const MAX_PENDING_FIXES = 200;
 
-type ResumeOrigin = 'background_task' | 'cold_start';
+/** 'start': a Start for a tour this process does not hold but the disk does (Epic 17). */
+type ResumeOrigin = 'background_task' | 'cold_start' | 'start';
 
 /**
  * Stamped onto every telemetry event.
@@ -191,7 +192,7 @@ class TourSessionController {
   async reconcileOnColdStart(): Promise<void> {
     try {
       await this.enqueue(async () => {
-        if (this.location) return;
+        if (this.liveKey() !== null) return;
         if (await this.doResume('cold_start')) return;
         const stopped = await stopOrphanedLocationUpdates();
         if (stopped) {
@@ -257,18 +258,50 @@ class TourSessionController {
     return result;
   }
 
-  private async doStart(tourId: string, tourTitle: string): Promise<void> {
-    const store = useTourSession.getState();
-
-    // Already running this exact tour - nothing to do.
-    if (store.tourId === tourId && (store.status === 'active' || store.status === 'starting')) {
-      return;
+  /**
+   * The key of the session this controller holds, or null. Between
+   * transitions (all serialised by enqueue) the session, its runner and its
+   * tracker exist together or not at all; anything else is a controller bug,
+   * thrown rather than guessed around.
+   */
+  private liveKey(): string | null {
+    const held = [this.session !== null, this.runner !== null, this.location !== null];
+    if (held.some(Boolean) && !held.every(Boolean)) {
+      throw new Error(`controller half-holds a session (session ${held[0]}, runner ${held[1]}, tracker ${held[2]})`);
     }
+    return this.session?.tourId ?? null;
+  }
 
-    // Switching tours: tear the old one down first, or we leak a watcher.
-    if (store.tourId && store.tourId !== tourId) {
+  /**
+   * Every start goes through here first (Epic 17, TASK-1702). True when the
+   * session for `key` runs afterwards; false when the caller launches it fresh.
+   *
+   *   held, same key     re-entry - a notification tap, TourDetail's Start, a
+   *                      StrictMode remount. NOTHING changes: progress, the
+   *                      pause, tracking. A paused tour stays paused; only the
+   *                      Resume banner resumes it (PM: no auto-resume).
+   *   held, other key    the visitor chose another tour: end this one.
+   *   nothing held       a checkpoint for this key on disk is resumed, not
+   *                      overwritten - a screen's Start can run before App's
+   *                      cold-start reconcile.
+   *
+   * Ownership is the controller's own state, never the store's status: a
+   * status allow-list ('active' | 'starting') let 'paused' through, which
+   * relaunched the tour from scratch over the old runner and overwrote its
+   * checkpoint.
+   */
+  private async takeOverFor(key: string): Promise<boolean> {
+    const live = this.liveKey();
+    if (live === key) return true;
+    if (live !== null) {
       await this.doEnd();
+      return false;
     }
+    return this.doResume('start', key);
+  }
+
+  private async doStart(tourId: string, tourTitle: string): Promise<void> {
+    if (await this.takeOverFor(tourId)) return;
 
     useTourSession.getState().beginStart(tourId, tourTitle);
 
@@ -325,9 +358,7 @@ class TourSessionController {
 
   private async doStartPlan(planId: string, title: string): Promise<void> {
     const key = planSessionKey(planId);
-    const store = useTourSession.getState();
-    if (store.tourId === key && (store.status === 'active' || store.status === 'starting')) return;
-    if (store.tourId && store.tourId !== key) await this.doEnd();
+    if (await this.takeOverFor(key)) return;
 
     const entry = savedPlans.get(planId);
     useTourSession.getState().beginStart(key, title, entry?.plan.sources.map((s) => s.tour_id) ?? []);
@@ -423,6 +454,11 @@ class TourSessionController {
     /** The tour whose bundled route the map draws; null draws straight lines (a plan spans tours). */
     staticRouteTourId: string | null;
   }): Promise<void> {
+    // Fail loud (Epic 17): launching over a live session leaks its runner and
+    // tracker and overwrites its checkpoint. takeOverFor() makes it unreachable.
+    const live = this.liveKey();
+    if (live !== null) throw new Error(`launch() over a live session (${live}): every start must go through takeOverFor()`);
+
     const firstChapter = spec.tour.chapters[0];
     if (!firstChapter) return this.failStart('unexpected', new Error('the tour has no chapters'));
 
@@ -904,12 +940,21 @@ class TourSessionController {
    * A background-task resume that fails KEEPS the checkpoint, so opening the
    * app can try once more in the foreground; a cold-start resume that fails
    * deletes it, so a broken checkpoint cannot fail every launch.
+   *
+   * origin 'start' (Epic 17): only a checkpoint for `expectKey` is resumed -
+   * one for another tour is left for that tour's Start to overwrite. A
+   * hardware failure KEEPS the checkpoint and throws SessionStartError (store
+   * 'error'), so the visitor retries from the error instead of a fresh start
+   * silently replacing the walk. Unusable checkpoints are discarded as usual
+   * and false sends the caller to a fresh launch.
    */
-  private async doResume(origin: ResumeOrigin): Promise<boolean> {
-    if (this.location) return true;
+  private async doResume(origin: ResumeOrigin, expectKey?: string): Promise<boolean> {
+    const live = this.liveKey();
+    if (live !== null) throw new Error(`doResume(${origin}) over a live session (${live})`);
 
     const decision = decideSnapshotResume(tourProgress.load(), Date.now());
     if (decision.kind === 'nothing') return false;
+    if (decision.kind === 'resume' && expectKey !== undefined && decision.snapshot.tourId !== expectKey) return false;
     const discard = (reason: string): false => {
       console.warn(`[TourSession] saved tour not resumed (${origin}): ${reason}`);
       this.clearCheckpoint();
@@ -947,7 +992,12 @@ class TourSessionController {
 
     const fail = async (stage: 'audio' | 'location', err: unknown): Promise<false> => {
       console.error(`[TourSession] resume (${origin}) failed at ${stage}:`, err);
-      await this.doEnd({ keepCheckpoint: origin === 'background_task' });
+      await this.doEnd({ keepCheckpoint: origin !== 'cold_start' });
+      if (origin === 'start') {
+        const error = new SessionStartError(stage, err);
+        useTourSession.getState().sessionFailed(error.userMessage);
+        throw error;
+      }
       return false;
     };
     try {
@@ -1054,7 +1104,7 @@ class TourSessionController {
    * (and replayed here) or finds the session - never lost between the two.
    */
   private async resumeFromBackgroundTask(): Promise<void> {
-    let resumed = this.location !== null;
+    let resumed = this.liveKey() !== null;
     try {
       if (!resumed) resumed = await this.doResume('background_task');
       if (!resumed) {

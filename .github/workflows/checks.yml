@@ -90,6 +90,11 @@ jobs:
       - name: Plan simulation
         run: npm run sim:plan
 
+      # Epic 17: the REAL TourSessionController - re-entry while paused, kill
+      # and resume, checkpoint-aware start, leaks - over an in-memory disk.
+      - name: Controller tests
+        run: npm run test:controller
+
       - name: Auth storage tests
         run: npm run test:auth
 

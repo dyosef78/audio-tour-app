@@ -26,6 +26,10 @@ const STUBS = new Map([
   ['@react-native-async-storage/async-storage', './stubs/async-storage.ts'],
   ['expo-secure-store', './stubs/expo-secure-store.ts'],
   ['expo-crypto', './stubs/expo-crypto.ts'],
+  // Epic 17 (TASK-1702): the controller test loads the real repositories.
+  ['expo-file-system', './stubs/expo-file-system.ts'],
+  ['expo-notifications', './stubs/expo-notifications.ts'],
+  ['expo-network', './stubs/expo-network.ts'],
   // Imported for its side effect only; there is no URL to polyfill in Node.
   ['react-native-url-polyfill/auto', './stubs/noop.ts'],
 ]);

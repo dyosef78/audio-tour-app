@@ -13,7 +13,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { navigate } from '../navigation/navigationRef';
 import { tourSession } from '../session/TourSessionController';
-import { useTourSession } from '../session/tourSessionStore';
+import { isSessionLive, useTourSession } from '../session/tourSessionStore';
 import type { Waypoint } from '../types/domain';
 import { colors, MIN_TOUCH } from '../ui/theme';
 import { useReduceMotion } from '../ui/useReduceMotion';
@@ -61,7 +61,8 @@ export default function AudioPlayerSheet({ routeName }: { routeName?: string }) 
   const waypoints = useTourSession((s) => s.waypoints);
   const activeId = useTourSession((s) => s.activeWaypointId);
 
-  if (status !== 'active' || !tourId) return null;
+  // Paused too (Epic 17): the way back to a tour suspended for inactivity.
+  if (!isSessionLive(status) || status === 'starting' || !tourId) return null;
   // The onboarding footer button sits exactly where the sheet would.
   if (routeName?.startsWith('Onboarding')) return null;
 

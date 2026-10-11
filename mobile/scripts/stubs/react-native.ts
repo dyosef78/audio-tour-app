@@ -16,6 +16,15 @@ export const PermissionsAndroid = {
   request: async (_permission: string): Promise<string> => 'granted',
 };
 
+/** Navigation handoff (navigationApps.ts). Opened URLs are recorded. */
+export const openedUrls: string[] = [];
+export const Linking = {
+  canOpenURL: async (_url: string): Promise<boolean> => true,
+  openURL: async (url: string): Promise<void> => {
+    openedUrls.push(url);
+  },
+};
+
 type AppStateListener = (status: string) => void;
 
 const listeners = new Set<AppStateListener>();
@@ -30,6 +39,11 @@ export const AppState = {
 /** Drive a foreground/background transition from a test. */
 export function __emitAppState(status: string): void {
   for (const listener of [...listeners]) listener(status);
+}
+
+/** A killed process takes its listeners with it (controller harness). */
+export function __resetAppState(): void {
+  listeners.clear();
 }
 
 export function __listenerCount(): number {
